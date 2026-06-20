@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chan.py"
+version = "1.0.0"
+description = "Chan theory quantitative analysis framework with a vn.py plugin."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pandas",
+]
+
+[project.optional-dependencies]
+vnpy = [
+    "vnpy",
+    "vnpy_sqlite",
+]
+gui = [
+    "PySide6>=6.5",
+]
+
+[tool.setuptools.packages.find]
+include = [
+    "App*",
+    "Bi*",
+    "BuySellPoint*",
+    "ChanModel*",
+    "Combiner*",
+    "Common*",
+    "DataAPI*",
+    "KLine*",
+    "Math*",
+    "Plot*",
+    "Seg*",
+    "ZS*",
+    "chan_futures*",
+    "data_foundation*",
+    "vnpy_chan*",
+]
