@@ -1,0 +1,62 @@
+# RB 螺纹钢 15 分钟趋势追踪策略 — 已知最佳配置
+# 基于 2018-2025 回测的最优参数组合：
+#   Trail 500+50% 回吐：+3133 点 | 胜率 63% | 盈利因子 2.68 | 27 笔交易
+#
+# 执行: chan backtest --config configs/rb_15m_trend_ideal.yaml
+
+code: RB_MAIN
+kl_type: K_15M
+data_path: data/processed/RB_15m_continuous_raw.parquet
+allow_short: true
+
+chan:
+  trigger_step: true
+  bi_strict: true
+  divergence_rate: .inf       # 禁用背驰过滤（通过信号评分管线替代）
+  bsp2_follow_1: false
+  bsp3_follow_1: false
+  min_zs_cnt: 0
+  bs1_peak: false
+  macd_algo: peak
+  bs_type: "1,1p,2,2s,3a,3b"
+  print_warning: false
+
+grading:
+  min_grade: ideal            # 仅接受 IDEAL 级别信号
+
+entry:
+  accepted_bsp_types: ["1", "1p", "2"]
+  long_only: false
+
+exits:
+  - type: StructureStopRule
+    priority: 10
+    grade_tighten: true       # WEAK 信号止损收紧 50%
+
+  - type: FixedStopRule
+    priority: 20
+    stop_points: 180.0        # 固定止损 180 点（约 0.47%）
+    grade_adjust: true        # STANDARD=0.8x, WEAK=0.5x
+
+  - type: TrailingStopRule
+    priority: 30
+    trigger_points: 500.0     # 浮盈达 500 点激活跟踪
+    giveback_ratio: 0.5       # 允许回撤 MFE 的 50%
+
+  - type: TimeStopRule
+    priority: 50
+    max_bars: 192             # 最长持仓 192 根 K 线（约 2 个交易日）
+
+risk:
+  max_abs_position: 1
+  max_loss_points: null
+  daily_loss_limit: null
+  max_consecutive_losses: null
+
+sizing:
+  method: fixed
+  lots: 1
+
+execution:
+  fee_points: 1.0
+  slippage_points: 1.0

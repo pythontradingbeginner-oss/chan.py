@@ -4,7 +4,7 @@ import sqlite3
 
 import pandas as pd
 
-from data_foundation.data.loader import load_cleaned_1m, load_raw_from_vnpy
+from data_foundation.data.loader import load_cleaned_1m, load_continuous_1m, load_raw_from_vnpy
 
 
 def test_load_raw_from_vnpy_maps_fields_from_sqlite(tmp_path):
@@ -73,3 +73,13 @@ def test_parquet_round_trip_for_cleaned_loader(tmp_path):
     loaded = load_cleaned_1m(path)
 
     pd.testing.assert_frame_equal(loaded, expected)
+
+
+def test_continuous_loader_accepts_explicit_modes_and_paths(tmp_path):
+    raw_path = tmp_path / "raw.parquet"
+    adjusted_path = tmp_path / "adjusted.parquet"
+    pd.DataFrame({"close": [1.0]}).to_parquet(raw_path)
+    pd.DataFrame({"close": [2.0]}).to_parquet(adjusted_path)
+
+    assert load_continuous_1m("raw", path=raw_path).iloc[0]["close"] == 1.0
+    assert load_continuous_1m("adjusted", path=adjusted_path).iloc[0]["close"] == 2.0

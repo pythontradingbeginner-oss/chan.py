@@ -1,0 +1,60 @@
+# RB 螺纹钢 15 分钟趋势追踪策略 — 平衡版
+# 降低信号门槛（STANDARD），增加交易频率
+# 适合：观察更多交易的信号质量分布
+
+code: RB_MAIN
+kl_type: K_15M
+data_path: data/processed/RB_15m_continuous_raw.parquet
+allow_short: true
+
+chan:
+  trigger_step: true
+  bi_strict: true
+  divergence_rate: .inf
+  bsp2_follow_1: false
+  bsp3_follow_1: false
+  min_zs_cnt: 0
+  bs1_peak: false
+  macd_algo: peak
+  bs_type: "1,1p,2,2s,3a,3b"
+  print_warning: false
+
+grading:
+  min_grade: standard         # STANDARD 及以上即可
+
+entry:
+  accepted_bsp_types: ["1", "1p", "2"]
+  long_only: false
+
+exits:
+  - type: StructureStopRule
+    priority: 10
+    grade_tighten: true
+
+  - type: FixedStopRule
+    priority: 20
+    stop_points: 180.0
+    grade_adjust: true
+
+  - type: TrailingStopRule
+    priority: 30
+    trigger_points: 500.0
+    giveback_ratio: 0.5
+
+  - type: TimeStopRule
+    priority: 50
+    max_bars: 192
+
+risk:
+  max_abs_position: 1
+  max_loss_points: 600.0      # 累计亏损 600 点暂停
+  daily_loss_limit: null
+  max_consecutive_losses: 5   # 连续 5 笔亏损暂停
+
+sizing:
+  method: fixed
+  lots: 1
+
+execution:
+  fee_points: 1.0
+  slippage_points: 1.0

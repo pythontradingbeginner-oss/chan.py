@@ -19,10 +19,13 @@ def generate_quality_report(
     switch_log_df: pd.DataFrame,
     output_path: Path,
     format: Literal["html", "markdown"] = "html",
+    aggregation_audit_df: pd.DataFrame | None = None,
 ) -> Path:
     """Generate a markdown or HTML data quality report."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    sections = _build_sections(cleaning_log, cleaned_df, continuous_df, switch_log_df)
+    sections = _build_sections(
+        cleaning_log, cleaned_df, continuous_df, switch_log_df, aggregation_audit_df
+    )
 
     if format == "markdown":
         output_path.write_text("\n\n".join(sections.values()), encoding="utf-8")
@@ -61,19 +64,49 @@ def _build_sections(
     cleaned_df: pd.DataFrame,
     continuous_df: pd.DataFrame,
     switch_log_df: pd.DataFrame,
+    aggregation_audit_df: pd.DataFrame | None = None,
 ) -> dict[str, str]:
     overview = _overview(cleaning_log, cleaned_df, continuous_df, switch_log_df)
     completeness = _completeness(cleaning_log)
     anomalies = _anomalies(cleaned_df)
     limits = _limit_days(cleaned_df)
     switches = _switches(switch_log_df)
-    return {
+    sections = {
         "overview": overview,
         "completeness": completeness,
         "anomalies": anomalies,
         "limits": limits,
         "switches": switches,
     }
+    if aggregation_audit_df is not None:
+        sections["aggregation"] = _aggregation(aggregation_audit_df)
+    return sections
+
+
+def _aggregation(audit: pd.DataFrame) -> str:
+    if audit.empty:
+        return "# Aggregation Audit\n\nNo aggregation windows."
+    summary = (
+        audit.groupby(["frequency_minutes", "status", "reason"], dropna=False, as_index=False)
+        .size()
+        .rename(columns={"size": "windows"})
+    )
+    daily = (
+        audit[audit["status"] == "GENERATED"]
+        .groupby(["frequency_minutes", "trading_day"], as_index=False)
+        .size()
+        .rename(columns={"size": "generated_bars"})
+    )
+    return (
+        "# Aggregation Audit\n\n## Window outcomes\n\n"
+        + _dataframe_table(summary)
+        + "\n\n## Daily generated-bar range\n\n"
+        + _dataframe_table(
+            daily.groupby("frequency_minutes", as_index=False)["generated_bars"]
+            .agg(["min", "max", "mean"])
+            .reset_index()
+        )
+    )
 
 
 def _overview(
@@ -96,23 +129,25 @@ def _overview(
 
 
 def _completeness(cleaning_log: CleaningLog) -> str:
-    if not cleaning_log.missing_bars_per_day:
+    if cleaning_log.missing_details.empty:
         return "# Completeness\n\nNo missing expected RB minutes were detected."
 
-    frame = pd.DataFrame(
-        [
-            {"trading_day": day, "missing_bars": count}
-            for day, count in cleaning_log.missing_bars_per_day.items()
-        ]
-    )
+    frame = cleaning_log.missing_details.copy()
     frame["month"] = pd.to_datetime(frame["trading_day"]).dt.to_period("M").astype(str)
-    monthly = frame.groupby("month", as_index=False)["missing_bars"].sum()
-    top = frame.sort_values("missing_bars", ascending=False).head(10)
+    monthly = frame.groupby("month", as_index=False).size().rename(columns={"size": "expected_bars_absent"})
+    top = (
+        frame.groupby(["symbol", "trading_day", "session"], as_index=False)
+        .size()
+        .rename(columns={"size": "expected_bars_absent"})
+        .sort_values("expected_bars_absent", ascending=False)
+        .head(20)
+    )
     return (
         "# Completeness\n\n"
-        "## Missing bars by month\n\n"
+        "An absent expected bar can mean no trade or a source-data gap; minute bars alone cannot distinguish them.\n\n"
+        "## Expected bars absent by month\n\n"
         + _dataframe_table(monthly)
-        + "\n\n## Top 10 missing trading days\n\n"
+        + "\n\n## Top affected contract sessions\n\n"
         + _dataframe_table(top)
     )
 
@@ -144,10 +179,19 @@ def _limit_days(cleaned_df: pd.DataFrame) -> str:
     if cleaned_df.empty:
         return "# Limit Days\n\nNo data."
     mask = (cleaned_df["flags"].astype(int) & (LIMIT_UP | LIMIT_DOWN)) != 0
-    events = cleaned_df.loc[mask, ["trading_day", "symbol", "flags"]].drop_duplicates()
+    columns = [
+        "datetime", "trading_day", "symbol", "flags", "proxy_previous_close",
+        "limit_ratio", "estimated_limit_up", "estimated_limit_down", "limit_rule_source",
+    ]
+    columns = [column for column in columns if column in cleaned_df.columns]
+    events = cleaned_df.loc[mask, columns].drop_duplicates()
     if events.empty:
         return "# Limit Days\n\nNo limit-up or limit-down days were flagged."
-    return "# Limit Days\n\n" + _dataframe_table(events)
+    return (
+        "# Estimated Limit Touches\n\n"
+        "These are minute-level proxy touches, not official limits or evidence that orders were unfillable.\n\n"
+        + _dataframe_table(events)
+    )
 
 
 def _switches(switch_log_df: pd.DataFrame) -> str:

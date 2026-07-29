@@ -1,0 +1,201 @@
+"""统一策略配置 —— 一个 dataclass 驱动整个回测流程。
+
+替代过去散落在 6+ 个脚本中的分散配置。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import StrEnum
+from typing import Any, Literal
+
+
+# ═══════════════════════════════════════════
+# 嵌套参数 dataclass
+# ═══════════════════════════════════════════
+
+
+@dataclass(frozen=True, slots=True)
+class ChanParams:
+    """CChan / CChanConfig 参数（传给 CChan 构造函数）。"""
+
+    bi_strict: bool = True
+    divergence_rate: float = float("inf")
+    bsp2_follow_1: bool = False
+    bsp3_follow_1: bool = False
+    min_zs_cnt: int = 0
+    bs1_peak: bool = False
+    macd_algo: str = "peak"
+    bs_type: str = "1,1p,2,2s,3a,3b"
+    trigger_step: bool = True
+    print_warning: bool = False
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "trigger_step": self.trigger_step,
+            "bi_strict": self.bi_strict,
+            "divergence_rate": self.divergence_rate,
+            "bsp2_follow_1": self.bsp2_follow_1,
+            "bsp3_follow_1": self.bsp3_follow_1,
+            "min_zs_cnt": self.min_zs_cnt,
+            "bs1_peak": self.bs1_peak,
+            "macd_algo": self.macd_algo,
+            "bs_type": self.bs_type,
+            "print_warning": self.print_warning,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> ChanParams:
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+class ScoreGradeStr(StrEnum):
+    IDEAL = "ideal"
+    STANDARD = "standard"
+    WEAK = "weak"
+
+
+@dataclass(frozen=True, slots=True)
+class GradingParams:
+    """信号评分参数。"""
+
+    min_grade: ScoreGradeStr = ScoreGradeStr.STANDARD
+
+    def __post_init__(self) -> None:
+        # 容错：如果传入了普通字符串，自动转换为 ScoreGradeStr
+        if isinstance(self.min_grade, str) and not isinstance(self.min_grade, ScoreGradeStr):
+            object.__setattr__(self, "min_grade", ScoreGradeStr(self.min_grade))
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> GradingParams:
+        return cls(
+            min_grade=ScoreGradeStr(d.get("min_grade", "standard")),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RiskParams:
+    """风控参数。"""
+
+    max_abs_position: int = 1
+    max_loss_points: float | None = None
+    daily_loss_limit: float | None = None          # 日内累计亏损超限则暂停开仓
+    max_consecutive_losses: int | None = None       # 连续亏损笔数超限则暂停
+    max_drawdown_pct: float | None = None            # 从权益峰值回撤超限则暂停
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> RiskParams:
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass(frozen=True, slots=True)
+class SizingParams:
+    """仓位管理参数。"""
+
+    method: Literal["fixed", "atr", "fixed_fractional"] = "fixed"
+    lots: int = 1                                    # method=fixed 时的固定手数
+    capital: float = 100_000                          # 账户资金（元）
+    risk_pct: float = 0.02                            # method=fixed_fractional 时每笔风险比例
+    atr_multiplier: float = 2.0                       # method=atr 时的 ATR 倍数
+    atr_period: int = 20                              # ATR 计算周期
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> SizingParams:
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionParams:
+    """执行/费用参数。"""
+
+    fee_points: float = 1.0
+    slippage_points: float = 1.0
+    contract_multiplier: float = 10.0  # RB: 10 元/点/手
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> ExecutionParams:
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass(frozen=True, slots=True)
+class FilterParams:
+    """入场信号过滤参数 —— DC 结构 + OBV + 成交量确认。"""
+
+    enabled: bool = False                              # 是否启用过滤
+    dc_threshold_points: float = 30.0                   # DC 方向性变点阈值（点）
+    obv_window: int = 40                                # OBV 均线窗口
+    volume_window: int = 20                             # 成交量均线窗口
+    volume_strength: float = 1.0                        # 成交量放大倍数 (1.0 = 不低于均量)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> FilterParams:
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+# ═══════════════════════════════════════════
+# 出场规则规格
+# ═══════════════════════════════════════════
+
+
+@dataclass(frozen=True, slots=True)
+class ExitRuleSpec:
+    """出场规则的序列化规格。
+
+    通过注册表映射到具体的 ExitRule 子类。
+    """
+
+    type: str                                        # 类名，如 "TrailingStopRule"
+    priority: int = 50
+    params: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> ExitRuleSpec:
+        type_ = d.pop("type")
+        priority = d.pop("priority", 50)
+        return cls(type=type_, priority=priority, params=d)
+
+
+# ═══════════════════════════════════════════
+# 统一 StrategyConfig
+# ═══════════════════════════════════════════
+
+
+@dataclass(frozen=True, slots=True)
+class StrategyConfig:
+    """驱动一次完整回测的全部配置。
+
+    可从 YAML / JSON 加载，也可在代码中直接构造。
+    """
+
+    # ── 品种与数据 ──
+    code: str = "RB_MAIN"
+    kl_type: str = "K_15M"
+    data_path: str = "data/processed/RB_15m_continuous_raw.parquet"
+    allow_short: bool = True
+
+    # ── 子配置 ──
+    chan: ChanParams = field(default_factory=ChanParams)
+    grading: GradingParams = field(default_factory=GradingParams)
+    entry: dict[str, Any] = field(default_factory=dict)   # 传给 EntryPolicyConfig
+    exits: list[ExitRuleSpec] = field(default_factory=list)
+    risk: RiskParams = field(default_factory=RiskParams)
+    sizing: SizingParams = field(default_factory=SizingParams)
+    execution: ExecutionParams = field(default_factory=ExecutionParams)
+    filter: FilterParams = field(default_factory=FilterParams)  # 信号过滤
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> StrategyConfig:
+        return cls(
+            code=d.get("code", "RB_MAIN"),
+            kl_type=d.get("kl_type", "K_15M"),
+            data_path=d.get("data_path", "data/processed/RB_15m_continuous_raw.parquet"),
+            allow_short=d.get("allow_short", True),
+            chan=ChanParams.from_dict(d.get("chan", {})),
+            grading=GradingParams.from_dict(d.get("grading", {})),
+            entry=d.get("entry", {}),
+            exits=[ExitRuleSpec.from_dict(e) for e in d.get("exits", [])],
+            risk=RiskParams.from_dict(d.get("risk", {})),
+            sizing=SizingParams.from_dict(d.get("sizing", {})),
+            execution=ExecutionParams.from_dict(d.get("execution", {})),
+            filter=FilterParams.from_dict(d.get("filter", {})),
+        )

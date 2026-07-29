@@ -234,10 +234,11 @@ def test_returns_copy_and_does_not_mutate_input():
 
 
 def test_trend_macd_runs_on_aggregated_5m_15m_and_30m_bars():
+    session_start = datetime(2025, 1, 2, 9, 1)
     one_minute = pd.DataFrame(
         [
             {
-                "datetime": START + timedelta(minutes=index),
+                "datetime": session_start + timedelta(minutes=index),
                 "open": 100 + index,
                 "high": 101 + index,
                 "low": 99 + index,

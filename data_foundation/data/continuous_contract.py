@@ -15,7 +15,10 @@ def build_continuous_contract(
     volume_threshold: int = 100_000,
     cooldown_days: int = 5,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Build a one-minute RB main-contract continuous series.
+    """Build a causal one-minute RB main-contract continuous series.
+
+    A trading day's complete volume selects the contract effective on the
+    next available trading day. The first day is therefore not emitted.
 
     Args:
         cleaned_df: Cleaned multi-contract one-minute bars.
@@ -56,6 +59,45 @@ def build_continuous_contract(
     return adjusted, switch_log
 
 
+def build_continuous_products(
+    cleaned_df: pd.DataFrame,
+    *,
+    volume_threshold: int = 100_000,
+    cooldown_days: int = 5,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Select the main contract once and derive raw and adjusted products.
+
+    Returns raw bars, backward-adjusted bars, the shared switch log, and the
+    selected-day decision table.
+    """
+    _require_columns(cleaned_df)
+    source = _prepare_source(cleaned_df)
+    selected_days, excluded, rollovers = _select_main_contract_days(
+        source,
+        min_daily_main_volume=volume_threshold,
+        rollover_cooldown_trading_days=cooldown_days,
+    )
+    if selected_days.empty:
+        decisions = pd.DataFrame(excluded)
+        return _empty_continuous(), _empty_continuous(), _empty_switch_log(), decisions
+    selected = source.merge(
+        selected_days[["trading_day", "symbol"]],
+        on=["trading_day", "symbol"],
+        how="inner",
+    ).sort_values("datetime")
+    selected = selected.rename(columns={"symbol": "active_symbol"}).reset_index(drop=True)
+    raw, _ = _apply_adjustments_1m(selected, source, rollovers, adjust=False)
+    adjusted, switch_log = _apply_adjustments_1m(selected, source, rollovers, adjust=True)
+    _assert_product_alignment(raw, adjusted)
+    selected_audit = selected_days.copy()
+    selected_audit["status"] = "selected"
+    excluded_audit = pd.DataFrame(excluded)
+    if not excluded_audit.empty:
+        excluded_audit["status"] = "excluded"
+    decisions = pd.concat([selected_audit, excluded_audit], ignore_index=True, sort=False)
+    return raw, adjusted, switch_log, decisions
+
+
 def _prepare_source(df: pd.DataFrame) -> pd.DataFrame:
     result = df.copy()
     result["symbol"] = result["symbol"].astype(str).str.upper()
@@ -69,6 +111,25 @@ def _prepare_source(df: pd.DataFrame) -> pd.DataFrame:
     else:
         result["trading_day"] = pd.to_datetime(result["trading_day"]).dt.normalize()
     return result.sort_values(["datetime", "symbol"]).reset_index(drop=True)
+
+
+def _assert_product_alignment(raw: pd.DataFrame, adjusted: pd.DataFrame) -> None:
+    columns = [
+        "datetime",
+        "trading_day",
+        "volume",
+        "open_interest",
+        "active_symbol",
+        "flags",
+    ]
+    try:
+        pd.testing.assert_frame_equal(
+            raw[columns].reset_index(drop=True),
+            adjusted[columns].reset_index(drop=True),
+            check_dtype=True,
+        )
+    except AssertionError as exc:
+        raise ValueError("raw and adjusted continuous products are misaligned") from exc
 
 
 def _select_main_contract_days(
@@ -88,9 +149,18 @@ def _select_main_contract_days(
     )
     leader_indexes = daily.groupby("trading_day")["volume"].idxmax()
     leaders = daily.loc[leader_indexes].sort_values("trading_day")
+    trading_days = [pd.Timestamp(value) for value in leaders["trading_day"]]
+    leader_lookup = {
+        pd.Timestamp(row.trading_day): row
+        for row in leaders.itertuples()
+    }
     volume_lookup = {
-        (row.trading_day, row.symbol): float(row.volume)
+        (pd.Timestamp(row.trading_day), row.symbol): float(row.volume)
         for row in daily.itertuples()
+    }
+    symbols_by_day = {
+        pd.Timestamp(day): set(group["symbol"].astype(str))
+        for day, group in daily.groupby("trading_day")
     }
 
     current_contract: str | None = None
@@ -99,15 +169,29 @@ def _select_main_contract_days(
     excluded: list[dict[str, Any]] = []
     rollovers: list[dict[str, Any]] = []
 
-    for leader in leaders.itertuples():
-        trading_day = pd.Timestamp(leader.trading_day)
+    if trading_days:
+        excluded.append(
+            {
+                "trading_day": trading_days[0].date(),
+                "reason": "no_prior_decision_day",
+            }
+        )
+
+    for decision_day, trading_day in zip(trading_days, trading_days[1:]):
+        leader = leader_lookup[decision_day]
         candidate_contract = str(leader.symbol)
         candidate_volume = float(leader.volume)
         candidate_eligible = candidate_volume >= min_daily_main_volume
 
         if current_contract is None:
             if not candidate_eligible:
-                excluded.append({"trading_day": trading_day.date()})
+                excluded.append(
+                    {
+                        "trading_day": trading_day.date(),
+                        "decision_trading_day": decision_day.date(),
+                        "reason": "no_eligible_candidate",
+                    }
+                )
                 continue
             current_contract = candidate_contract
             cooldown_days_held = 1
@@ -115,7 +199,13 @@ def _select_main_contract_days(
             cooldown_days_held += 1
         elif not candidate_eligible:
             cooldown_days_held += 1
-            excluded.append({"trading_day": trading_day.date()})
+            excluded.append(
+                {
+                    "trading_day": trading_day.date(),
+                    "decision_trading_day": decision_day.date(),
+                    "reason": "no_eligible_candidate",
+                }
+            )
             continue
         elif candidate_contract != current_contract:
             previous_contract = current_contract
@@ -124,6 +214,7 @@ def _select_main_contract_days(
             rollovers.append(
                 {
                     "trading_day": trading_day,
+                    "decision_trading_day": decision_day,
                     "from_contract_id": previous_contract,
                     "to_contract_id": current_contract,
                 }
@@ -131,11 +222,32 @@ def _select_main_contract_days(
         else:
             cooldown_days_held += 1
 
-        current_volume = volume_lookup.get((trading_day, current_contract), 0.0)
+        current_volume = volume_lookup.get((decision_day, current_contract), 0.0)
         if current_volume < min_daily_main_volume:
-            excluded.append({"trading_day": trading_day.date()})
+            excluded.append(
+                {
+                    "trading_day": trading_day.date(),
+                    "decision_trading_day": decision_day.date(),
+                    "reason": "held_contract_below_min_volume",
+                }
+            )
             continue
-        selected.append({"trading_day": trading_day, "symbol": current_contract})
+        if current_contract not in symbols_by_day.get(trading_day, set()):
+            excluded.append(
+                {
+                    "trading_day": trading_day.date(),
+                    "decision_trading_day": decision_day.date(),
+                    "reason": "selected_contract_missing",
+                }
+            )
+            continue
+        selected.append(
+            {
+                "trading_day": trading_day,
+                "decision_trading_day": decision_day,
+                "symbol": current_contract,
+            }
+        )
 
     return pd.DataFrame(selected), excluded, rollovers
 
@@ -156,6 +268,7 @@ def _apply_adjustments_1m(
     cumulative_adjustment = 0.0
     for rollover in rollovers:
         roll_day = pd.Timestamp(rollover["trading_day"])
+        decision_day = pd.Timestamp(rollover["decision_trading_day"])
         old_symbol = str(rollover["from_contract_id"])
         new_symbol = str(rollover["to_contract_id"])
         old_close, new_close, basis_day = _latest_common_pre_roll_closes(
@@ -171,6 +284,7 @@ def _apply_adjustments_1m(
         switch_rows.append(
             {
                 "switch_date": roll_day.date(),
+                "decision_date": decision_day.date(),
                 "old_symbol": old_symbol,
                 "new_symbol": new_symbol,
                 "old_close": old_close,
@@ -286,6 +400,7 @@ def _empty_switch_log() -> pd.DataFrame:
     return pd.DataFrame(
         columns=[
             "switch_date",
+            "decision_date",
             "old_symbol",
             "new_symbol",
             "old_close",

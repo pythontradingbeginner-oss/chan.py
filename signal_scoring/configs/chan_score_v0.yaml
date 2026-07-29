@@ -1,0 +1,63 @@
+# 缠论 BSP 评分器配置 v0.1.0
+#
+# 每个 scorer 独立定义评分维度的权重和阈值。
+# 当前版本中权重逻辑仍在 Python 代码中实现,
+# 此文件为后续参数化搜索预留配置骨架。
+
+scorers:
+  chan_t1:
+    description: "一类买卖点 + 盘整背驰 评分器"
+    dimensions:
+      - name: divergence
+        label: "背驰度"
+        note: "divergence_rate ≤ 0.4 满分, >1.2 硬阻断"
+      - name: zs_cnt
+        label: "中枢数"
+        note: "≥2 满分, =0 且非盘背时降分"
+      - name: bi_confirmed
+        label: "笔确认"
+        note: "CONFIRMED 满分, CANDIDATE 0.3"
+      - name: bi_amp
+        label: "笔振幅"
+        note: "≥0.008 满分, <0.001 0.0"
+    thresholds:
+      ideal: 0.80
+      standard: 0.55
+
+  chan_t2:
+    description: "二类买卖点 + 类二买 评分器"
+    dimensions:
+      - name: retrace
+        label: "回撤幅度"
+        note: "0.15~0.382 满分, >0.80 0.2"
+      - name: bsp1_anchor
+        label: "一买锚点"
+        note: "未突破满分, 突破降分不阻断"
+      - name: bi_confirmed
+        label: "笔确认"
+        note: "CONFIRMED 满分, CANDIDATE 0.3"
+    thresholds:
+      ideal: 0.80
+      standard: 0.55
+
+  chan_t3:
+    description: "三类买卖点 评分器"
+    dimensions:
+      - name: zs_break
+        label: "中枢突破"
+        note: "离开≥3% 满分, <0.5% 0.3"
+      - name: return_strength
+        label: "回抽力度"
+        note: "bi_amp≥0.008 满分"
+      - name: restart_confirmed
+        label: "再启动确认"
+        note: "CONFIRMED 满分, CANDIDATE 0.4"
+    thresholds:
+      ideal: 0.80
+      standard: 0.55
+
+# 全局评分→分档映射
+grade_map:
+  ideal:    { min: 0.80, description: "形态标准, 关键指标达标" }
+  standard: { min: 0.55, description: "形态满足基本要求" }
+  weak:     { min: 0.0,  description: "形态勉强, 某指标边缘" }

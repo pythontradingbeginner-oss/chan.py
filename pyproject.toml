@@ -21,6 +21,10 @@ gui = [
     "PySide6>=6.5",
 ]
 
+[project.scripts]
+chan = "chan_futures.cli:main"
+chan-rb-plot-gui = "App.rb_chan_plot.ui:main"
+
 [tool.setuptools.packages.find]
 include = [
     "App*",
@@ -39,3 +43,6 @@ include = [
     "data_foundation*",
     "vnpy_chan*",
 ]
+
+[tool.setuptools.package-data]
+"data_foundation.data" = ["static/*.csv"]

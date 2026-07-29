@@ -3,7 +3,8 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
+import warnings
 
 import pandas as pd
 
@@ -11,6 +12,8 @@ import pandas as pd
 DEFAULT_DB_PATH = Path(r"C:\Users\Administrator\.vntrader\database.db")
 DEFAULT_CLEANED_PATH = Path("data/processed/RB_1m_raw_clean.parquet")
 DEFAULT_CONTINUOUS_PATH = Path("data/processed/RB_1m_continuous.parquet")
+DEFAULT_CONTINUOUS_RAW_PATH = Path("data/processed/RB_1m_continuous_raw.parquet")
+DEFAULT_CONTINUOUS_ADJUSTED_PATH = Path("data/processed/RB_1m_continuous_adjusted.parquet")
 DEFAULT_SWITCH_LOG_PATH = Path("data/processed/RB_main_switch_log.csv")
 
 
@@ -85,14 +88,46 @@ def load_cleaned_1m(
 
 
 def load_continuous_1m(
-    path: Path = DEFAULT_CONTINUOUS_PATH,
+    price_mode: Literal["raw", "adjusted"] | Path = "raw",
+    path: Path | None = None,
 ) -> pd.DataFrame:
-    """Load the adjusted one-minute RB continuous main-contract series."""
-    return pd.read_parquet(path)
+    """Load raw continuous prices by default, or the research-only adjusted series.
+
+    Passing a Path as the first positional argument remains supported during
+    migration and emits a FutureWarning.
+    """
+    if isinstance(price_mode, Path):
+        if path is not None:
+            raise ValueError("path specified twice")
+        warnings.warn(
+            "Passing path positionally is deprecated; use path=...",
+            FutureWarning,
+            stacklevel=2,
+        )
+        path = price_mode
+        price_mode = "raw"
+    if price_mode not in {"raw", "adjusted"}:
+        raise ValueError("price_mode must be 'raw' or 'adjusted'")
+    selected_path = path or (
+        DEFAULT_CONTINUOUS_RAW_PATH
+        if price_mode == "raw"
+        else DEFAULT_CONTINUOUS_ADJUSTED_PATH
+    )
+    if path is None and not selected_path.exists() and DEFAULT_CONTINUOUS_PATH.exists():
+        warnings.warn(
+            "Using legacy RB_1m_continuous.parquet; rebuild continuous products",
+            FutureWarning,
+            stacklevel=2,
+        )
+        selected_path = DEFAULT_CONTINUOUS_PATH
+    return pd.read_parquet(selected_path)
 
 
 def load_switch_log(
     path: Path = DEFAULT_SWITCH_LOG_PATH,
 ) -> pd.DataFrame:
     """Load the RB main-contract switch log."""
-    return pd.read_csv(path, parse_dates=["switch_date", "basis_date"])
+    return pd.read_csv(
+        path,
+        parse_dates=["switch_date", "decision_date", "basis_date"],
+    )

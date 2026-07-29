@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import json
@@ -8,8 +8,7 @@ from pathlib import Path
 import sys
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pandas as pd
 
@@ -42,6 +41,13 @@ def main() -> None:
     cleaned_path = args.output_dir / "RB_1m_raw_clean.parquet"
     cleaned.to_parquet(cleaned_path, compression="snappy", index=False)
 
+    missing_path = args.output_dir / "RB_missing_minutes.csv"
+    summary_path = args.output_dir / "RB_contract_session_completeness.csv"
+    out_of_session_path = args.output_dir / "RB_out_of_session_rows.csv"
+    log.missing_details.to_csv(missing_path, index=False)
+    log.contract_day_summary.to_csv(summary_path, index=False)
+    log.out_of_session_details.to_csv(out_of_session_path, index=False)
+
     stamp = date.today().strftime("%Y%m%d")
     log_path = args.output_dir / f"cleaning_log_{stamp}.json"
     log_path.write_text(
@@ -50,7 +56,7 @@ def main() -> None:
     )
 
     if args.report:
-        continuous_path = args.output_dir / "RB_1m_continuous.parquet"
+        continuous_path = args.output_dir / "RB_1m_continuous_raw.parquet"
         switch_log_path = args.output_dir / "RB_main_switch_log.csv"
         continuous = (
             pd.read_parquet(continuous_path)
@@ -78,7 +84,11 @@ def main() -> None:
     print(f"invalid OHLC removed: {log.invalid_ohlc_removed}")
     print(f"extreme moves flagged: {log.extreme_moves_flagged}")
     print(f"saved: {cleaned_path}")
+    print(f"missing detail: {missing_path}")
+    print(f"completeness summary: {summary_path}")
+    print(f"out-of-session detail: {out_of_session_path}")
 
 
 if __name__ == "__main__":
     main()
+

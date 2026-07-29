@@ -1,64 +1,522 @@
+"""实盘交易引擎 —— 从 vnpy bar 驱动完整策略管线。
+
+与回测 _run_loop 共享同一套:
+  - GradedChanStrategy (入场信号 + grade 过滤)
+  - ExitManager (出场规则)
+  - RiskManager (风控)
+  - SignalExtractor (信号提取)
+
+仅执行层不同: 回测用 SimulatedExecutionEngine, 实盘用 VnpyExecutionEngine。
+
+状态机:
+  idle → waiting_signal → pending_open → in_position → closing → idle
+
+用法:
+    engine = LiveTradingEngine(main_engine, event_engine)
+    engine.init_strategy(config)
+    engine.start()  # 订阅 EVENT_BAR
+"""
+
 from __future__ import annotations
+
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+from vnpy.event import Event, EventEngine
+from vnpy.trader.constant import Direction, Interval, Offset, OrderType
+from vnpy.trader.engine import BaseEngine, MainEngine
+from vnpy.trader.event import EVENT_BAR, EVENT_ORDER, EVENT_TRADE
+from vnpy.trader.object import BarData, OrderData, OrderRequest, TradeData, SubscribeRequest
 
 from Chan import CChan
 from ChanConfig import CChanConfig
-from Common.CEnum import AUTYPE, DATA_SRC
-from chan_futures.strategy import MinimalChanTrendStrategy
-from vnpy.event import Event, EventEngine
-from vnpy.trader.constant import Interval
-from vnpy.trader.engine import BaseEngine, MainEngine
-from vnpy.trader.event import EVENT_BAR
-from vnpy.trader.object import BarData
+from Common.CEnum import AUTYPE, KL_TYPE
+from signal_core import SignalExtractor, SignalEvent, SignalDirection
+from signal_core.lifecycle import SignalJournal, SignalLifecycleTracker
+from signal_scoring import assess_event
+from strategy_policy.exit_rules import (
+    ChanExitSnapshot,
+    ExitContext,
+    ExitManager,
+    ExitSignal,
+    SignalDirection as ExitSignalDirection,
+)
+from chan_futures.config import StrategyConfig
+from chan_futures.config_loader import load_config, make_exit_manager
+from chan_futures.strategy import StrategySignal
+from chan_futures.graded_strategy import GradedChanStrategy, GradeFilterConfig
+from chan_futures.risk import RiskConfig, RiskManager
 
 from .converter import bar_to_klu, window_to_kl_type
+from .snapshot import ChanSnapshotManager
 
 
-class ChanLiveEngine(BaseEngine):
-    """v2 placeholder: subscribe to vn.py bars and emit chan.py signal logs only."""
+# ════════════════════════════════════════════════════════════════
+# 引擎状态
+# ════════════════════════════════════════════════════════════════
+
+@dataclass
+class _PositionContext:
+    """活动持仓的快照 (入场信息 —— 驱动出场逻辑)。"""
+
+    direction: SignalDirection
+    entry_price: float
+    entry_time: datetime
+    entry_bar: int
+    entry_grade: str = "standard"
+    bi_begin_price: float | None = None
+    zs_high: float | None = None
+    zs_low: float | None = None
+    invalidation_price: float | None = None
+    initial_stop_price: float | None = None
+    signal_key: str = ""
+
+
+@dataclass
+class _SignalContext:
+    """待确认信号的追踪状态。"""
+
+    signal_key: str
+    first_seen: datetime
+    last_seen: datetime
+    direction: SignalDirection
+    primary_bsp: str
+    grade: str
+    structural_score: float
+    reference_price: float
+    bi_begin_price: float | None = None
+    zs_high: float | None = None
+    zs_low: float | None = None
+    bars_held: int = 0  # 自首次出现至今的 bar 数
+
+
+# ════════════════════════════════════════════
+# 主引擎
+# ════════════════════════════════════════════
+
+
+class LiveTradingEngine(BaseEngine):
+    """有状态的实盘缠论交易引擎。
+
+    每根 bar 的决策流程:
+      1. SnapshotManager 更新 CChan
+      2. 如有活动仓位 → ExitManager.check() → 出场？
+      3. 否则 → GradedChanStrategy.on_bar() → SignalExtractor → assess_event
+      4. 如果 (grade >= min_grade, 风控通过) → 发送开仓订单
+      5. 记录所有信号到 SignalJournal
+    """
 
     def __init__(self, main_engine: MainEngine, event_engine: EventEngine) -> None:
         super().__init__(main_engine, event_engine, "ChanLive")
-        self.window = 1
-        self.kl_type = window_to_kl_type(self.window)
-        self.chan: CChan | None = None
-        self.strategy = MinimalChanTrendStrategy()
-        self.register_event()
+        self._config: StrategyConfig | None = None
+        self._chan: CChan | None = None
+        self._snapshot: ChanSnapshotManager | None = None
+        self._wrapper: GradedChanStrategy | None = None
+        self._extractor: SignalExtractor | None = None
+        self._exit_manager: ExitManager | None = None
+        self._risk: RiskManager | None = None
+        self._journal: SignalJournal | None = None
+        self._tracker: SignalLifecycleTracker | None = None
 
-    def register_event(self) -> None:
-        self.event_engine.register(EVENT_BAR, self._on_bar)
+        # ── 状态 ──
+        self._position: _PositionContext | None = None
+        self._pending_signals: dict[str, _SignalContext] = {}
+        self._bar_count: int = 0
+        self._vt_symbol: str = ""
 
-    def init_chan(self, code: str, window: int = 1) -> None:
-        self.window = window
-        self.kl_type = window_to_kl_type(window)
-        self.chan = CChan(
-            code=code,
+        # ── 订单追踪 ──
+        self._pending_order_ids: set[str] = set()
+        self._current_order_ref: str = ""
+
+    # ════════════════════════════════════════
+    # 初始化
+    # ════════════════════════════════════════
+
+    def init_strategy(
+        self,
+        config: StrategyConfig | str,
+        *,
+        symbol: str = "RB99",
+        journal_dir: str | Path = "reports/live_signals",
+    ) -> None:
+        """加载策略配置并初始化所有组件。
+
+        Args:
+            config: StrategyConfig 或 YAML 路径
+            symbol: vnpy 的 vt_symbol (e.g. "RB99.SHFE")
+            journal_dir: 信号日志输出目录
+        """
+        if isinstance(config, str):
+            self._config = load_config(config)
+        else:
+            self._config = config
+
+        cfg = self._config
+        self._vt_symbol = symbol
+        kl_type = window_to_kl_type(15)  # FIXME: read from config.kl_type
+
+        # ── CChan ──
+        self._chan = CChan(
+            code=symbol,
             begin_time=None,
             end_time=None,
-            data_src=DATA_SRC.CSV,
-            lv_list=[self.kl_type],
-            config=CChanConfig({"trigger_step": True, "print_warning": False}),
+            data_src="csv",
+            lv_list=[kl_type],
+            config=CChanConfig(cfg.chan.to_dict()),
             autype=AUTYPE.NONE,
         )
 
-    def _on_bar(self, event: Event) -> None:
-        bar: BarData = event.data
-        if getattr(bar, "interval", Interval.MINUTE) != Interval.MINUTE:
-            return
-        if self.chan is None:
-            self.init_chan(getattr(bar, "vt_symbol", bar.symbol), self.window)
-
-        klu = bar_to_klu(bar, self.kl_type)
-        self.chan.trigger_load({self.kl_type: [klu]})
-        signal = self.strategy.on_bar(
-            chan=self.chan,
-            current_position=0,
-            price=bar.close_price,
-            timestamp=bar.datetime,
-            active_symbol=bar.symbol,
+        # ── SnapshotManager ──
+        self._snapshot = ChanSnapshotManager(
+            chan=self._chan,
+            lv_list=[kl_type],
         )
-        if signal:
-            self.main_engine.write_log(
-                f"ChanLive signal {signal.action} {signal.active_symbol} "
-                f"price={signal.price} bsp={signal.bsp_type}",
-                self.engine_name,
+
+        # ── Grade-filter 策略 ──
+        from chan_futures.config import _TYPE_STR_TO_BSP
+        accepted_bsp = [_TYPE_STR_TO_BSP[t] for t in cfg.entry.get("accepted_bsp_types", ["1", "1p", "2"])
+                        if t in _TYPE_STR_TO_BSP]
+        self._wrapper = GradedChanStrategy(GradeFilterConfig(
+            min_grade=cfg.grading.min_grade.value,
+            accepted_bsp_types=accepted_bsp,
+            allow_short=cfg.allow_short,
+            require_confirmed_bsp=True,
+        ))
+
+        # ── SignalExtractor ──
+        self._extractor = SignalExtractor(symbol="RB", timeframe="15m")
+
+        # ── ExitManager ──
+        self._exit_manager = make_exit_manager(cfg)
+
+        # ── RiskManager ──
+        self._risk = RiskManager(RiskConfig(
+            max_abs_position=cfg.risk.max_abs_position,
+            max_loss_points=cfg.risk.max_loss_points,
+            daily_loss_limit=cfg.risk.daily_loss_limit,
+            max_consecutive_losses=cfg.risk.max_consecutive_losses,
+            max_drawdown_pct=None,  # 实盘中由 vnpy 账户权益驱动
+        ))
+
+        # ── SignalJournal ──
+        self._journal = SignalJournal(journal_dir, format="csv")
+        self._tracker = SignalLifecycleTracker()
+
+        self._log_init(cfg)
+
+    def _log_init(self, cfg: StrategyConfig) -> None:
+        self.main_engine.write_log(
+            f"[ChanLive] 策略已初始化: {cfg.code} {cfg.kl_type} "
+            f"grade={cfg.grading.min_grade.value} "
+            f"exits={[e.type for e in cfg.exits]} "
+            f"risk={cfg.risk}",
+            self.engine_name,
+        )
+
+    # ════════════════════════════════════════
+    # 启动 / 停止
+    # ════════════════════════════════════════
+
+    def start(self, vt_symbol: str | None = None) -> None:
+        """注册事件并开始接收 bar。"""
+        if vt_symbol:
+            self._vt_symbol = vt_symbol
+        if not self._vt_symbol:
+            raise ValueError("必须先设置 vt_symbol")
+
+        self.event_engine.register(EVENT_BAR, self._on_bar)
+        self.event_engine.register(EVENT_ORDER, self._on_order)
+        self.event_engine.register(EVENT_TRADE, self._on_trade)
+        self.main_engine.write_log(
+            f"[ChanLive] 已启动, 监听 {self._vt_symbol}", self.engine_name
+        )
+
+    def stop(self) -> None:
+        self.event_engine.unregister(EVENT_BAR, self._on_bar)
+        self.event_engine.unregister(EVENT_ORDER, self._on_order)
+        self.event_engine.unregister(EVENT_TRADE, self._on_trade)
+        self.main_engine.write_log("[ChanLive] 已停止", self.engine_name)
+
+    # ════════════════════════════════════════
+    # 事件处理
+    # ════════════════════════════════════════
+
+    def _on_bar(self, event: Event) -> None:
+        """每根 bar 的主循环。"""
+        if self._config is None or self._chan is None or self._snapshot is None:
+            return
+
+        bar: BarData = event.data
+        vt_sym = getattr(bar, "vt_symbol", "")
+        if self._vt_symbol and vt_sym != self._vt_symbol:
+            return
+
+        self._bar_count += 1
+        klu = bar_to_klu(bar, kl_type=self._snapshot.lv_list[0])
+        self._snapshot.feed(klu)
+
+        price = float(bar.close_price)
+        timestamp = bar.datetime if isinstance(bar.datetime, datetime) else pd.Timestamp(bar.datetime)
+
+        # ── 1. 检查出场规则 (如果当前有持仓) ──
+        if self._position is not None and self._exit_manager is not None:
+            exit_signal = self._check_exit(
+                open=float(bar.open_price),
+                high=float(bar.high_price),
+                low=float(bar.low_price),
+                close=price,
+                bar_end_time=timestamp,
             )
+            if exit_signal is not None:
+                self._close_position(exit_signal.exit_price, exit_signal.reason_code, exit_signal.description)
+                return
+
+        # ── 2. 检查入场信号 ──
+        if self._position is None:
+            chan_snap = self._snapshot.current
+            if chan_snap is None:
+                return
+
+            graded = self._wrapper.on_bar(
+                chan=chan_snap,
+                current_position=0,
+                price=price,
+                timestamp=timestamp,
+                active_symbol=bar.symbol,
+                lv_idx=0,
+                extractor=self._extractor,
+            )
+            if graded is not None and graded.grade is not None:
+                sig = graded.signal
+                self._record_signal(graded, timestamp)
+
+                # 风控审批
+                if self._risk is not None:
+                    decision = self._risk.approve(sig)
+                    if not decision.approved:
+                        self._log(f"风控拒绝: {decision.reason}")
+                        return
+
+                # 发送开仓订单
+                self._open_position(sig.price, graded.bsp_type, graded.grade, graded.event_id)
+
+        # ── 3. 信号状态更新 (pending signals → confirmed/invalidated) ──
+        self._update_pending_signals(timestamp)
+
+    def _on_order(self, event: Event) -> None:
+        order: OrderData = event.data
+        if order.vt_orderid not in self._pending_order_ids:
+            return
+        self._log(f"订单状态: {order.vt_orderid} → {order.status.value}")
+
+    def _on_trade(self, event: Event) -> None:
+        trade: TradeData = event.data
+        if trade.vt_orderid not in self._pending_order_ids:
+            return
+
+        self._pending_order_ids.discard(trade.vt_orderid)
+        direction = SignalDirection.LONG if trade.direction == Direction.LONG else SignalDirection.SHORT
+
+        # ── 开仓成交 → 记录持仓 ──
+        if self._position is None:
+            self._position = _PositionContext(
+                direction=direction,
+                entry_price=float(trade.price),
+                entry_time=datetime.now(),
+                entry_bar=self._bar_count,
+                entry_grade=getattr(self, "_last_accepted_grade", "standard"),
+                signal_key=getattr(self, "_last_signal_key", ""),
+            )
+            self._exit_manager.on_entry(
+                direction=direction,
+                entry_price=float(trade.price),
+                entry_grade=self._position.entry_grade,
+            )
+            self._log(f"开仓成交: {direction.value} @ {trade.price}")
+
+        # ── 平仓成交 → 清理持仓 ──
+        else:
+            pnl = self._calc_pnl(float(trade.price))
+            self._risk.on_fill(pnl_points=pnl, fill_time=datetime.now())
+            self._log(
+                f"平仓成交: @ {trade.price} "
+                f"PnL={pnl:.0f} pts "
+                f"累计已实现={self._risk._realized_points:.0f} pts"
+            )
+            self._position = None
+            self._exit_manager.on_close()
+
+    # ════════════════════════════════════════
+    # 交易操作
+    # ════════════════════════════════════════
+
+    def _open_position(self, price: float, bsp_type: str, grade: str, event_id: str) -> None:
+        """向 vnpy 发送开仓订单。"""
+        direction = Direction.LONG  # FIXME: from signal
+        order_req = OrderRequest(
+            symbol=self._vt_symbol.split(".")[0] if "." in self._vt_symbol else self._vt_symbol,
+            exchange=getattr(self, "_exchange", None) or "SHFE",
+            direction=direction,
+            type=OrderType.LIMIT,
+            price=price,
+            volume=1,
+        )
+        vt_orderids = self.main_engine.send_order(order_req)
+        if vt_orderids:
+            self._pending_order_ids.update(vt_orderids)
+        self._last_accepted_grade = grade
+        self._log(f"发送开仓单: {direction.value} @ {price} grade={grade} bsp={bsp_type}")
+
+    def _close_position(self, price: float, reason: str, description: str) -> None:
+        """向 vnpy 发送平仓订单。"""
+        if self._position is None:
+            return
+        direction = Direction.SHORT if self._position.direction == SignalDirection.LONG else Direction.LONG
+        order_req = OrderRequest(
+            symbol=self._vt_symbol.split(".")[0] if "." in self._vt_symbol else self._vt_symbol,
+            exchange=getattr(self, "_exchange", None) or "SHFE",
+            direction=direction,
+            type=OrderType.LIMIT,
+            price=price,
+            volume=1,
+            offset=Offset.CLOSE,
+        )
+        vt_orderids = self.main_engine.send_order(order_req)
+        if vt_orderids:
+            self._pending_order_ids.update(vt_orderids)
+        self._log(f"发送平仓单: {direction.value} @ {price} ({reason}) {description}")
+
+    # ════════════════════════════════════════
+    # 出场规则检查
+    # ════════════════════════════════════════
+
+    def _check_exit(
+        self,
+        open: float,
+        high: float,
+        low: float,
+        close: float,
+        bar_end_time: datetime,
+    ) -> ExitSignal | None:
+        """使用 ExitManager 检查出场条件。"""
+        if self._position is None or self._exit_manager is None:
+            return None
+
+        exit_direction = ExitSignalDirection.LONG if self._position.direction == SignalDirection.LONG else ExitSignalDirection.SHORT
+        chan_snap = self._build_chan_exit_snapshot()
+
+        return self._exit_manager.check(
+            bar_end_time=bar_end_time,
+            open=open,
+            high=high,
+            low=low,
+            close=close,
+            opposite_signal_triggered=False,
+            chan_snapshot=chan_snap,
+        )
+
+    def _build_chan_exit_snapshot(self) -> ChanExitSnapshot | None:
+        """从当前 CChan 快照构建缠论结构快照。"""
+        chan = self._snapshot.current if self._snapshot else None
+        if chan is None:
+            return None
+
+        try:
+            kl_list = chan[0]
+            seg_list = kl_list.seg_list
+            last_seg = seg_list.lst[-1] if seg_list.lst else None
+            return ChanExitSnapshot(
+                available_at=datetime.now(),
+                segment_complete=last_seg is not None and last_seg.is_sure if last_seg else False,
+                segment_direction="up" if last_seg and last_seg.dir.value > 0 else "down" if last_seg else None,
+            )
+        except Exception:
+            return None
+
+    # ════════════════════════════════════════
+    # 信号追踪
+    # ════════════════════════════════════════
+
+    def _record_signal(self, graded, timestamp: datetime) -> None:
+        """记录信号到 Journal (忽略 GradedSignal 没有 SignalEvent 的情况)。"""
+        self._last_accepted_grade = graded.grade
+        self._last_signal_key = getattr(graded, "signal_key", str(uuid.uuid4())[:12])
+        self._log(
+            f"信号: {graded.bsp_type} grade={graded.grade} "
+            f"score={graded.structural_score:.2f} key={self._last_signal_key}"
+        )
+
+    def _update_pending_signals(self, timestamp: datetime) -> None:
+        """检查待确认信号 — candidate → confirmed/invalidated/expired。"""
+        if self._snapshot is None or self._extractor is None:
+            return
+        chan = self._snapshot.current
+        if chan is None:
+            return
+
+        # 遍历当前 BSP 状态, 与 pending_signals 做比对
+        for bsp in chan[0].bs_point_lst.bsp_iter():
+            event = self._extractor.extract(bsp, chan=chan, bar_end_time=timestamp, lv_idx=0)
+            if event is None or event.signal_key not in self._pending_signals:
+                continue
+            ctx = self._pending_signals[event.signal_key]
+            ctx.last_seen = timestamp
+            ctx.bars_held += 1
+
+            if event.state.value == "confirmed" and ctx.bars_held > 0:
+                self._log(f"信号确认: {ctx.signal_key} {ctx.primary_bsp} {ctx.grade}")
+            elif event.state.value == "invalidated":
+                self._log(f"信号失效: {ctx.signal_key}")
+                del self._pending_signals[event.signal_key]
+
+        # 清理超时未确认 (> 50 bars = ~12.5 hours for 15m)
+        expired = [k for k, v in self._pending_signals.items() if v.bars_held > 50]
+        for k in expired:
+            self._log(f"信号过期: {k}")
+            del self._pending_signals[k]
+
+    # ════════════════════════════════════════
+    # 工具
+    # ════════════════════════════════════════
+
+    def _calc_pnl(self, exit_price: float) -> float:
+        if self._position is None:
+            return 0
+        pnl = exit_price - self._position.entry_price
+        if self._position.direction == SignalDirection.SHORT:
+            pnl = -pnl
+        return pnl - 2.0  # fee_points × 2
+
+    def _log(self, msg: str) -> None:
+        self.main_engine.write_log(f"[ChanLive] {msg}", self.engine_name)
+
+    # ── 状态查询 (供 GUI 调用) ──
+
+    @property
+    def has_position(self) -> bool:
+        return self._position is not None
+
+    @property
+    def position_context(self) -> _PositionContext | None:
+        return self._position
+
+    def engine_status(self) -> dict[str, Any]:
+        """返回引擎状态的快照。"""
+        return {
+            "bar_count": self._bar_count,
+            "has_position": self.has_position,
+            "position": {
+                "direction": self._position.direction.value if self._position else None,
+                "entry_price": round(self._position.entry_price, 1) if self._position else None,
+                "entry_grade": self._position.entry_grade if self._position else None,
+                "entry_bar": self._position.entry_bar if self._position else None,
+                "bars_held": (self._bar_count - self._position.entry_bar) if self._position else 0,
+            },
+            "risk": self._risk.get_state() if self._risk else {},
+            "pending_signals": len(self._pending_signals),
+            "vt_symbol": self._vt_symbol,
+        }

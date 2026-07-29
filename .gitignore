@@ -1,11 +1,52 @@
-*.py[co]
-__pycache__
-*-checkpoint.ipynb
-*.vscode
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Build / install artifacts
+build/
+dist/
+*.egg-info/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs / databases
 *.log
 *.db
-reports/
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Local private configs
 config.yaml
 OpenConfig.yaml
 gotify_push.py
 cos_config.yaml
+.vntrader/
+
+# Generated research artifacts
+.ua/
+reports/
+data/raw/
+data/cache/
+data/processed/*
+!data/processed/.gitkeep
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+*-checkpoint.ipynb

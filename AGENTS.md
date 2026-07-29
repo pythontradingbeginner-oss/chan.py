@@ -64,4 +64,6 @@ pytest tests/test_chan_futures.py tests/test_loader.py tests/test_bar_aggregatio
 
 ## 运行产物
 
-不要提交 `.vntrader/`、数据库文件、日志、真实账号配置、行情数据、`reports/` 下的大型结果、`data/processed/` 生成物、notebook 大体积输出或环境缓存。
+不要提交 `.vntrader/`、`.ua/`、数据库文件、日志、真实账号配置、行情数据、`reports/` 下的大型结果、`data/processed/` 生成物、notebook 大体积输出或环境缓存。
+
+`.ua/` 是调用 Understand Anything skill 生成的项目知识图、指纹、配置和缓存目录；默认按运行产物处理，不作为业务代码提交。若确实需要共享 `knowledge-graph.json` 等分析结果，先与用户确认提交范围，并排除 `intermediate/`、`tmp/`、`.trash-*`、`.vite-cache/` 等缓存。

@@ -1,0 +1,68 @@
+# RB 螺纹钢 15 分钟趋势追踪 — 含 DC30 + OBV40 + Vol1 过滤
+# 基于 2018-2025 最优配置：DC30 结构过滤 + OBV40 资金流 + 成交量 >= 均量
+# Trail 500+50% 跟踪止损 + 固定 180 点止损 + 结构止损 + 时间止损
+
+code: RB_MAIN
+kl_type: K_15M
+data_path: data/processed/RB_15m_continuous_raw.parquet
+allow_short: true
+
+chan:
+  trigger_step: true
+  bi_strict: true
+  divergence_rate: .inf
+  bsp2_follow_1: false
+  bsp3_follow_1: false
+  min_zs_cnt: 0
+  bs1_peak: false
+  macd_algo: peak
+  bs_type: "1,1p,2,2s,3a,3b"
+  print_warning: false
+
+grading:
+  min_grade: ideal
+
+entry:
+  accepted_bsp_types: ["1", "1p", "2"]
+  long_only: false
+
+exits:
+  - type: StructureStopRule
+    priority: 10
+    grade_tighten: true
+
+  - type: FixedStopRule
+    priority: 20
+    stop_points: 180.0
+    grade_adjust: true
+
+  - type: TrailingStopRule
+    priority: 30
+    trigger_points: 500.0
+    giveback_ratio: 0.5
+
+  - type: TimeStopRule
+    priority: 50
+    max_bars: 192
+
+risk:
+  max_abs_position: 1
+  max_loss_points: null
+  daily_loss_limit: null
+  max_consecutive_losses: null
+
+sizing:
+  method: fixed
+  lots: 1
+
+execution:
+  fee_points: 1.0
+  slippage_points: 1.0
+
+# DC 结构方向 + OBV 资金流 + 成交量确认过滤
+filter:
+  enabled: true
+  dc_threshold_points: 30.0       # DC30 方向性变点阈值
+  obv_window: 40                   # OBV 均线窗口
+  volume_window: 20                # 成交量均线窗口
+  volume_strength: 1.0             # 成交量不低于均量

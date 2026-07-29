@@ -4,6 +4,7 @@ from zoneinfo import ZoneInfo
 from datetime import date, datetime
 
 import pandas as pd
+import pytest
 
 from data_foundation.data.cleaning import (
     EXTREME_MOVE,
@@ -13,6 +14,7 @@ from data_foundation.data.cleaning import (
     detect_missing_minutes,
     get_rb_standard_minutes,
 )
+from data_foundation.data.calendar import RBTradingCalendar
 
 
 def test_ohlc_logic_removes_high_below_low_sample():
@@ -91,7 +93,7 @@ def test_limit_down_day_is_flagged_from_previous_day_close():
     assert log.limit_down_flagged == 1
 
 
-def test_twenty_oclock_is_not_assigned_to_next_trading_day():
+def test_out_of_session_rows_are_removed_and_audited():
     frame = pd.DataFrame(
         [
             _row("RB2501", "2025-01-02 20:59", 100, 101, 99, 100),
@@ -101,8 +103,17 @@ def test_twenty_oclock_is_not_assigned_to_next_trading_day():
 
     cleaned, _ = clean_rb_1m_bars(frame)
 
-    assert cleaned.iloc[0]["trading_day"] == pd.Timestamp("2025-01-02")
-    assert cleaned.iloc[1]["trading_day"] == pd.Timestamp("2025-01-03")
+    assert cleaned.empty
+    assert _.out_of_session_removed == 2
+
+
+def test_friday_night_is_assigned_to_monday_trading_day():
+    cleaned, _ = clean_rb_1m_bars(
+        pd.DataFrame([_row("RB2501", "2025-01-03 21:01", 100, 101, 99, 100)])
+    )
+
+    assert cleaned.iloc[0]["trading_day"] == pd.Timestamp("2025-01-06")
+    assert cleaned.iloc[0]["session"] == "NIGHT"
 
 
 def test_datetime_values_use_zoneinfo_shanghai_timezone():
@@ -131,7 +142,8 @@ def test_missing_minutes_detects_expected_gap():
     cleaned, log = clean_rb_1m_bars(frame)
     missing = detect_missing_minutes(cleaned[cleaned["symbol"] == "RB2501"])
 
-    assert datetime(2025, 1, 2, 9, 2) in missing[date(2025, 1, 2)]
+    assert datetime(2025, 1, 2, 9, 2) in set(missing["missing_datetime"])
+    assert set(missing["symbol"]) == {"RB2501"}
     assert log.missing_bars_per_day[date(2025, 1, 2)] > 0
 
 
@@ -153,8 +165,56 @@ def test_cleaning_log_counts_are_consistent():
 
 
 def test_standard_minutes_count_matches_rb_sessions():
-    assert len(get_rb_standard_minutes(date(2025, 1, 2))) == 345
+    assert len(get_rb_standard_minutes(date(2025, 1, 3))) == 345
+    assert len(get_rb_standard_minutes(date(2025, 1, 2))) == 225
     assert get_rb_standard_minutes(date(2025, 1, 4)) == []
+
+
+def test_calendar_rejects_out_of_range_day():
+    calendar = RBTradingCalendar.load_default()
+    with pytest.raises(ValueError, match="outside calendar range"):
+        calendar.expected_minutes(date(2026, 1, 1))
+
+
+def test_calendar_models_covid_night_suspension_and_2024_exchange_closure():
+    calendar = RBTradingCalendar.load_default()
+
+    suspended = calendar.expected_minutes(date(2020, 4, 20))
+    resumed = calendar.expected_minutes(date(2020, 5, 7))
+    assert "NIGHT" not in set(suspended["session"])
+    assert "NIGHT" in set(resumed["session"])
+    assert calendar.expected_minutes(date(2024, 2, 9)).empty
+
+
+def test_missing_minutes_are_independent_per_contract():
+    frame = pd.DataFrame(
+        [
+            _row("RB2501", "2025-01-02 09:01", 100, 101, 99, 100),
+            _row("RB2501", "2025-01-02 09:03", 100, 101, 99, 100),
+            _row("RB2505", "2025-01-02 09:01", 100, 101, 99, 100),
+            _row("RB2505", "2025-01-02 09:02", 100, 101, 99, 100),
+            _row("RB2505", "2025-01-02 09:03", 100, 101, 99, 100),
+        ]
+    )
+    cleaned, _ = clean_rb_1m_bars(frame)
+    missing = detect_missing_minutes(cleaned)
+    target = missing[missing["missing_datetime"] == pd.Timestamp("2025-01-02 09:02")]
+
+    assert set(target["symbol"]) == {"RB2501"}
+
+
+def test_estimated_limit_flag_marks_only_touching_minute():
+    frame = pd.DataFrame(
+        [
+            _row("RB2501", "2025-01-02 14:59", 100, 100, 100, 100),
+            _row("RB2501", "2025-01-03 09:01", 105, 106, 104, 105),
+            _row("RB2501", "2025-01-03 09:02", 109, 111, 109, 110),
+        ]
+    )
+    cleaned, _ = clean_rb_1m_bars(frame, limit_ratio=0.10)
+
+    assert not int(cleaned.iloc[1]["flags"]) & LIMIT_UP
+    assert int(cleaned.iloc[2]["flags"]) & LIMIT_UP
 
 
 def _row(symbol: str, timestamp: str, open_: float, high: float, low: float, close: float) -> dict:

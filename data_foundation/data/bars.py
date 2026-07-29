@@ -5,6 +5,8 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
+from .calendar import RBTradingCalendar
+
 
 REQUIRED_COLUMNS = [
     "datetime",
@@ -17,91 +19,97 @@ REQUIRED_COLUMNS = [
     "active_symbol",
     "flags",
 ]
+BAR_COLUMNS = [
+    "datetime",
+    "trading_day",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "open_interest",
+    "active_symbol",
+    "flags",
+]
+AUDIT_COLUMNS = [
+    "frequency_minutes",
+    "trading_day",
+    "session",
+    "window_end",
+    "expected_count",
+    "actual_count",
+    "status",
+    "reason",
+]
 
 
-def aggregate_continuous_1m_to_5m(df_1m: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate one-minute continuous RB bars into complete five-minute bars.
-
-    Args:
-        df_1m: Continuous one-minute bars. If trading_day is missing, it is
-            inferred from Shanghai futures session timestamps.
-
-    Returns:
-        A new DataFrame containing complete five-minute bars only.
-    """
-    _require_columns(df_1m, REQUIRED_COLUMNS)
-    if df_1m.empty:
-        return _empty_5m_frame()
-
-    source = df_1m.copy()
-    source["datetime"] = pd.to_datetime(source["datetime"])
-    if "trading_day" not in source.columns:
-        source["trading_day"] = _infer_trading_day(source["datetime"])
-    else:
-        source["trading_day"] = pd.to_datetime(source["trading_day"]).dt.normalize()
-
-    source = source.sort_values(["trading_day", "datetime"]).reset_index(drop=True)
-    source["window_start"] = source["datetime"].dt.floor("5min")
-    grouped = (
-        source.groupby(["trading_day", "window_start"], sort=True)
-        .agg(
-            source_1m_count=("datetime", "size"),
-            datetime=("window_start", "first"),
-            open=("open", "first"),
-            high=("high", "max"),
-            low=("low", "min"),
-            close=("close", "last"),
-            volume=("volume", "sum"),
-            open_interest=("open_interest", "last"),
-            active_symbol=("active_symbol", "last"),
-            flags=("flags", _bitwise_or),
-        )
-        .reset_index()
+def aggregate_continuous_1m_to_5m(
+    df_1m: pd.DataFrame,
+    *,
+    calendar: RBTradingCalendar | None = None,
+    return_audit: bool = False,
+) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]:
+    return aggregate_continuous_1m_to_Nm(
+        df_1m,
+        5,
+        calendar=calendar,
+        return_audit=return_audit,
     )
-    complete = grouped[grouped["source_1m_count"] == 5].copy()
-    complete = complete.drop(columns=["source_1m_count"])
-    columns = [
-        "datetime",
-        "trading_day",
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "open_interest",
-        "active_symbol",
-        "flags",
-    ]
-    complete["trading_day"] = pd.to_datetime(complete["trading_day"]).dt.normalize()
-    return complete[columns].reset_index(drop=True)
 
 
 def aggregate_continuous_1m_to_Nm(
     df_1m: pd.DataFrame,
     freq_minutes: int,
-) -> pd.DataFrame:
-    """Aggregate one-minute continuous bars into complete N-minute bars."""
-    if freq_minutes <= 0:
-        raise ValueError("freq_minutes must be positive")
+    *,
+    calendar: RBTradingCalendar | None = None,
+    return_audit: bool = False,
+) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]:
+    """Aggregate end-labelled minutes within calendar sessions."""
+    if freq_minutes not in {5, 15, 30, 60}:
+        raise ValueError("freq_minutes must be one of 5, 15, 30, 60")
     _require_columns(df_1m, REQUIRED_COLUMNS)
     if df_1m.empty:
-        return _empty_5m_frame()
-
+        result = _empty_bar_frame()
+        audit = pd.DataFrame(columns=AUDIT_COLUMNS)
+        return (result, audit) if return_audit else result
+    calendar = calendar or RBTradingCalendar.load_default()
     source = df_1m.copy()
     source["datetime"] = pd.to_datetime(source["datetime"])
-    if "trading_day" not in source.columns:
-        source["trading_day"] = _infer_trading_day(source["datetime"])
-    else:
-        source["trading_day"] = pd.to_datetime(source["trading_day"]).dt.normalize()
+    original_tz = getattr(source["datetime"].dt, "tz", None)
+    mapped = calendar.map_datetimes(source["datetime"])
+    if mapped["trading_day"].isna().any():
+        bad = source.loc[mapped["trading_day"].isna(), "datetime"].iloc[0]
+        raise ValueError(f"out-of-session minute cannot be aggregated: {bad}")
+    source["trading_day"] = pd.to_datetime(mapped["trading_day"]).dt.normalize().to_numpy()
+    source["session"] = mapped["session"].to_numpy()
+    source["session_minute_index"] = mapped["session_minute_index"].astype(int).to_numpy()
+    source["window_id"] = (source["session_minute_index"] - 1) // freq_minutes
+    source["datetime_naive"] = source["datetime"]
+    if original_tz is not None:
+        source["datetime_naive"] = source["datetime"].dt.tz_localize(None)
 
-    source = source.sort_values(["trading_day", "datetime"]).reset_index(drop=True)
-    freq_str = f"{freq_minutes}min"
-    source["window_start"] = source["datetime"].dt.floor(freq_str)
-    grouped = (
-        source.groupby(["trading_day", "window_start"], sort=True)
+    expected = pd.concat(
+        [calendar.expected_minutes(pd.Timestamp(day)) for day in source["trading_day"].drop_duplicates()],
+        ignore_index=True,
+    )
+    expected["window_id"] = (
+        (expected["session_minute_index"].astype(int) - 1) // freq_minutes
+    )
+    keys = ["trading_day", "session", "window_id"]
+    window_plan = (
+        expected.groupby(keys, as_index=False)
         .agg(
-            source_1m_count=("datetime", "size"),
-            datetime=("window_start", "first"),
+            expected_count=("calendar_datetime", "size"),
+            window_end=("calendar_datetime", "max"),
+        )
+    )
+    grouped = (
+        source.sort_values(["trading_day", "session", "session_minute_index"])
+        .groupby(keys, as_index=False)
+        .agg(
+            actual_count=("datetime", "size"),
+            actual_unique_count=("datetime", "nunique"),
+            active_symbol_count=("active_symbol", lambda values: values.nunique(dropna=False)),
             open=("open", "first"),
             high=("high", "max"),
             low=("low", "min"),
@@ -111,60 +119,55 @@ def aggregate_continuous_1m_to_Nm(
             active_symbol=("active_symbol", "last"),
             flags=("flags", _bitwise_or),
         )
-        .reset_index()
     )
-    complete = grouped[grouped["source_1m_count"] == freq_minutes].copy()
-    complete = complete.drop(columns=["window_start", "source_1m_count"])
-    columns = [
-        "datetime",
-        "trading_day",
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "open_interest",
-        "active_symbol",
-        "flags",
-    ]
-    complete["trading_day"] = pd.to_datetime(complete["trading_day"]).dt.normalize()
-    return complete[columns].reset_index(drop=True)
+    windows = window_plan.merge(grouped, on=keys, how="left")
+    for column in ["actual_count", "actual_unique_count", "active_symbol_count"]:
+        windows[column] = windows[column].fillna(0).astype(int)
+    broken = windows[windows["active_symbol_count"] > 1]
+    if not broken.empty:
+        row = broken.iloc[0]
+        raise ValueError(
+            "ACTIVE_SYMBOL_INVARIANT_BROKEN: "
+            f"{pd.Timestamp(row.trading_day).date()} {row.session} ending {row.window_end}"
+        )
+    tail = windows["expected_count"] < freq_minutes
+    duplicate = windows["actual_count"] != windows["actual_unique_count"]
+    missing = (
+        (windows["actual_count"] != freq_minutes)
+        | (windows["actual_unique_count"] != freq_minutes)
+    )
+    windows["status"] = "GENERATED"
+    windows["reason"] = ""
+    windows.loc[missing, ["status", "reason"]] = ["DROPPED", "MISSING_MINUTE"]
+    windows.loc[duplicate, ["status", "reason"]] = ["DROPPED", "DUPLICATE_MINUTE"]
+    windows.loc[tail, ["status", "reason"]] = ["DROPPED", "SESSION_TAIL"]
+    complete = windows[windows["status"] == "GENERATED"].copy()
+    complete["datetime"] = complete["window_end"]
+    if original_tz is not None:
+        complete["datetime"] = complete["datetime"].dt.tz_localize(original_tz)
+    result = complete[BAR_COLUMNS].sort_values("datetime", kind="mergesort").reset_index(drop=True)
+    audit = windows.assign(frequency_minutes=freq_minutes)[AUDIT_COLUMNS].copy()
+    if original_tz is not None:
+        audit["window_end"] = audit["window_end"].dt.tz_localize(original_tz)
+    audit = audit.sort_values("window_end", kind="mergesort").reset_index(drop=True)
+    return (result, audit) if return_audit else result
 
 
 def _infer_trading_day(datetimes: pd.Series) -> pd.Series:
-    values = pd.to_datetime(datetimes)
-    if getattr(values.dt, "tz", None) is not None:
-        values = values.dt.tz_localize(None)
-    base = values.dt.normalize()
-    night = values.dt.hour >= 21
-    return base.where(~night, base + pd.Timedelta(days=1))
+    """Compatibility helper backed by the static calendar."""
+    calendar = RBTradingCalendar.load_default()
+    return pd.to_datetime(calendar.map_datetimes(datetimes)["trading_day"])
 
 
 def _bitwise_or(values: Iterable[object]) -> int:
     array = pd.Series(values).fillna(0).astype(int).to_numpy()
-    if len(array) == 0:
-        return 0
-    return int(np.bitwise_or.reduce(array))
+    return int(np.bitwise_or.reduce(array)) if len(array) else 0
 
 
 def _require_columns(df: pd.DataFrame, required: list[str]) -> None:
-    missing = sorted(set(required) - set(df.columns))
-    if missing:
+    if missing := sorted(set(required) - set(df.columns)):
         raise ValueError(f"missing required columns: {missing}")
 
 
-def _empty_5m_frame() -> pd.DataFrame:
-    return pd.DataFrame(
-        columns=[
-            "datetime",
-            "trading_day",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-            "open_interest",
-            "active_symbol",
-            "flags",
-        ]
-    )
+def _empty_bar_frame() -> pd.DataFrame:
+    return pd.DataFrame(columns=BAR_COLUMNS)
