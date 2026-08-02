@@ -1,3 +1,4 @@
+from collections import defaultdict
 from datetime import datetime
 
 import pandas as pd
@@ -78,6 +79,9 @@ def test_same_rb_bars_produce_identical_three_runtime_decision_traces() -> None:
                 positions[name] = intent.signal.target_position
 
     traces = {name: kernel.decision_trace for name, (_, kernel) in lanes.items()}
+    decomposition_traces = {
+        name: kernel.decomposition_transitions for name, (_, kernel) in lanes.items()
+    }
     report = compare_runtime_traces(traces)
     baseline = traces["backtest"]
 
@@ -97,4 +101,27 @@ def test_same_rb_bars_produce_identical_three_runtime_decision_traces() -> None:
         "live": report.trace_lengths["backtest"],
     }
     assert len(set(positions.values())) == 1
+    assert decomposition_traces["backtest"]
+    assert decomposition_traces["backtest"] == decomposition_traces["vnpy_cta"]
+    assert decomposition_traces["backtest"] == decomposition_traces["live"]
+    assert [transition.sequence for transition in decomposition_traces["backtest"]] == list(
+        range(len(decomposition_traces["backtest"]))
+    )
+    assert len({transition.transition_id for transition in decomposition_traces["backtest"]}) == len(
+        decomposition_traces["backtest"]
+    )
+    by_decomposition = defaultdict(list)
+    for transition in decomposition_traces["backtest"]:
+        by_decomposition[transition.decomposition_id].append(transition)
+    assert any(
+        transition.kind.value == "close"
+        for transition in decomposition_traces["backtest"]
+    )
+    for transitions in by_decomposition.values():
+        assert [transition.revision for transition in transitions] == list(
+            range(len(transitions))
+        )
+        if any(transition.kind.value == "close" for transition in transitions):
+            assert transitions[-1].kind.value == "close"
+    assert any(record.regime != "unclassified" for record in baseline)
     report.assert_consistent()

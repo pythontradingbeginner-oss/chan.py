@@ -132,6 +132,22 @@ class FilterParams:
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
 
+@dataclass(frozen=True, slots=True)
+class DecompositionParams:
+    """Qingpai strategy-side decomposition settings."""
+
+    enabled: bool = False
+    level: Literal["bi", "seg"] = "bi"
+
+    def __post_init__(self) -> None:
+        if self.level not in {"bi", "seg"}:
+            raise ValueError("decomposition.level must be 'bi' or 'seg'")
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> DecompositionParams:
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
 # ═══════════════════════════════════════════
 # 出场规则规格
 # ═══════════════════════════════════════════
@@ -182,6 +198,7 @@ class StrategyConfig:
     sizing: SizingParams = field(default_factory=SizingParams)
     execution: ExecutionParams = field(default_factory=ExecutionParams)
     filter: FilterParams = field(default_factory=FilterParams)  # 信号过滤
+    decomposition: DecompositionParams = field(default_factory=DecompositionParams)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> StrategyConfig:
@@ -198,4 +215,5 @@ class StrategyConfig:
             sizing=SizingParams.from_dict(d.get("sizing", {})),
             execution=ExecutionParams.from_dict(d.get("execution", {})),
             filter=FilterParams.from_dict(d.get("filter", {})),
+            decomposition=DecompositionParams.from_dict(d.get("decomposition", {})),
         )

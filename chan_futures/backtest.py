@@ -34,6 +34,7 @@ from .risk import RiskConfig, RiskManager
 from .strategy import StrategySignal
 from signal_core.models import SignalDecision, SignalDirection, SignalEvent
 from strategy_policy.position import PositionContext
+from strategy_policy.qingpai_decomposition import DecompositionTransition
 from strategy_policy.exit_rules import ExitManager, ExitSignal
 from strategy_policy.reporting import (
     StandardMetrics,
@@ -75,6 +76,7 @@ class BacktestResult:
     signal_events: list = field(default_factory=list)  # 全量 SignalEvent
     signal_decisions: list = field(default_factory=list)  # 含 rejected 的全量决策
     decision_trace: list[DecisionTraceRecord] = field(default_factory=list)
+    decomposition_transitions: list[DecompositionTransition] = field(default_factory=list)
 
     def save(self, output_dir: Path | str) -> None:
         """保存标准化报告。"""
@@ -107,6 +109,14 @@ class BacktestResult:
         if self.decision_trace:
             pd.DataFrame([record.to_dict() for record in self.decision_trace]).to_csv(
                 output_dir / "decision_trace.csv", index=False, encoding="utf-8-sig"
+            )
+        if self.decomposition_transitions:
+            pd.DataFrame(
+                [transition.to_dict() for transition in self.decomposition_transitions]
+            ).to_csv(
+                output_dir / "decomposition_transitions.csv",
+                index=False,
+                encoding="utf-8-sig",
             )
 
 
@@ -188,6 +198,7 @@ def run_backtest(
         signal_events,
         signal_decisions,
         decision_trace,
+        decomposition_transitions,
     ) = _run_loop(
         bars=bars,
         chan=chan,
@@ -215,6 +226,7 @@ def run_backtest(
         signal_events=signal_events,
         signal_decisions=signal_decisions,
         decision_trace=decision_trace,
+        decomposition_transitions=decomposition_transitions,
     )
 
 
@@ -243,6 +255,7 @@ def _run_loop(
     list[SignalEvent],
     list[SignalDecision],
     list[DecisionTraceRecord],
+    list[DecompositionTransition],
 ]:
     """每根 K 线的主循环。"""
 
@@ -307,6 +320,11 @@ def _run_loop(
             dt_timestamp = timestamp.to_pydatetime()
         else:
             dt_timestamp = timestamp
+        decomposition = decision_kernel.observe_structure(
+            chan=chan,
+            timestamp=timestamp,
+            lv_idx=0,
+        )
         active_symbol = row.get("active_symbol")
         active_symbol_str = str(active_symbol) if pd.notna(active_symbol) else None
 
@@ -426,6 +444,19 @@ def _run_loop(
             "realized_points": execution.state.realized_points,
             "equity_points": execution.mark_to_market(price),
             "exit_reason": exit_signal.reason_code if exit_signal else None,
+            "decomposition_id": (
+                decomposition.decomposition_id if decomposition else None
+            ),
+            "decomposition_revision": (
+                decomposition.revision if decomposition else None
+            ),
+            "qingpai_regime": decomposition.regime.value if decomposition else None,
+            "qingpai_direction": (
+                decomposition.direction.value if decomposition else None
+            ),
+            "decomposition_lifecycle": (
+                decomposition.lifecycle.value if decomposition else None
+            ),
         })
 
         # ── 4. 信号提取 + 持久化 (每 bar 都提取, 供后续信号分析) ──
@@ -486,6 +517,7 @@ def _run_loop(
         _bar_events,
         _decisions,
         list(decision_kernel.decision_trace),
+        list(decision_kernel.decomposition_transitions),
     )
 
 

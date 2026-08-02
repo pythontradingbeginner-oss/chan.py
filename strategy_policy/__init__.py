@@ -8,12 +8,42 @@
 
 from .entry_policy import EntryPolicy, EntryPolicyConfig, MultiPolicyEvaluator
 from .position import PositionContext
+from .qingpai_decomposition import (
+    CenterSnapshot,
+    DecompositionLifecycle,
+    DecompositionObservation,
+    DecompositionSnapshot,
+    DecompositionTransition,
+    QingpaiDecomposer,
+    QingpaiRegime,
+    QingpaiStateMachine,
+    RegimeClassification,
+    StrokeSnapshot,
+    StructureDirection,
+    TransitionKind,
+    classify_observation,
+    observation_from_chan,
+)
 
 __all__ = [
     "EntryPolicy",
     "EntryPolicyConfig",
     "MultiPolicyEvaluator",
     "PositionContext",
+    "CenterSnapshot",
+    "DecompositionLifecycle",
+    "DecompositionObservation",
+    "DecompositionSnapshot",
+    "DecompositionTransition",
+    "QingpaiDecomposer",
+    "QingpaiRegime",
+    "QingpaiStateMachine",
+    "RegimeClassification",
+    "StrokeSnapshot",
+    "StructureDirection",
+    "TransitionKind",
+    "classify_observation",
+    "observation_from_chan",
 ]
 
 # 子模块不在此处延迟导入 (用户按需 from strategy_policy.exit_rules import ...)

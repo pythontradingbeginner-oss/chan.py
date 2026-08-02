@@ -196,6 +196,11 @@ class ChanBspStrategy(CtaTemplate):
             if isinstance(bar.datetime, datetime)
             else pd.Timestamp(bar.datetime)
         )
+        self._decision_kernel.observe_structure(
+            chan=self._chan,
+            timestamp=timestamp,
+            lv_idx=0,
+        )
 
         # 2. Update GUI display
         self._update_gui_vars()
@@ -531,6 +536,18 @@ class ChanBspStrategy(CtaTemplate):
         if self._decision_kernel is None:
             return ()
         return self._decision_kernel.decision_trace
+
+    @property
+    def decomposition_state(self):
+        if self._decision_kernel is None:
+            return None
+        return self._decision_kernel.decomposition_state
+
+    @property
+    def decomposition_transitions(self):
+        if self._decision_kernel is None:
+            return ()
+        return self._decision_kernel.decomposition_transitions
 
     # ============================================================
     # GUI variable update

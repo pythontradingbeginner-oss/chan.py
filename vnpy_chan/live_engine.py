@@ -259,6 +259,14 @@ class LiveTradingEngine(BaseEngine):
         price = float(bar.close_price)
         atr = self._update_atr(bar)
         timestamp = bar.datetime if isinstance(bar.datetime, datetime) else pd.Timestamp(bar.datetime)
+        chan_snap = self._snapshot.current
+        if chan_snap is None:
+            return
+        self._decision_kernel.observe_structure(
+            chan=chan_snap,
+            timestamp=timestamp,
+            lv_idx=0,
+        )
 
         # ── 1. 检查出场规则 (如果当前有持仓) ──
         if self._position is not None and self._exit_manager is not None:
@@ -275,9 +283,6 @@ class LiveTradingEngine(BaseEngine):
                 return
 
         # ── 2. 无论空仓/持仓，都消费同一个 TradeIntent ──
-        chan_snap = self._snapshot.current
-        if chan_snap is None:
-            return
         current_position = 0
         if self._position is not None:
             sign = 1 if self._position.direction == SignalDirection.LONG else -1
@@ -619,11 +624,35 @@ class LiveTradingEngine(BaseEngine):
             return ()
         return self._decision_kernel.decision_trace
 
+    @property
+    def decomposition_state(self):
+        if self._decision_kernel is None:
+            return None
+        return self._decision_kernel.decomposition_state
+
+    @property
+    def decomposition_transitions(self):
+        if self._decision_kernel is None:
+            return ()
+        return self._decision_kernel.decomposition_transitions
+
     def engine_status(self) -> dict[str, Any]:
         """返回引擎状态的快照。"""
+        decomposition = self.decomposition_state
         return {
             "bar_count": self._bar_count,
             "has_position": self.has_position,
+            "decomposition": (
+                {
+                    "id": decomposition.decomposition_id,
+                    "revision": decomposition.revision,
+                    "regime": decomposition.regime.value,
+                    "direction": decomposition.direction.value,
+                    "lifecycle": decomposition.lifecycle.value,
+                }
+                if decomposition is not None
+                else None
+            ),
             "position": {
                 "direction": self._position.direction.value if self._position else None,
                 "entry_price": round(self._position.entry_price, 1) if self._position else None,

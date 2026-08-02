@@ -176,6 +176,20 @@
       "evidence": ["p0:event-sourcing-default"]
     },
     {
+      "id": "QP-DECOMP-003",
+      "name": "五类走势的确定性关系",
+      "status": "engineering_default",
+      "decision": "一个标准中枢为盘整；同一中枢超过三笔继续围绕原区间运行属于延伸；两个同向中枢核心区与波动区均不重叠属于趋势；核心区不重叠但波动区重叠属于扩张候选；第二中枢先回撤触及前中枢、且不破第二中枢进入起点时修订为扩展。九笔只标记升级候选，不改写同级别视图的级别。",
+      "evidence": ["transcript:473-489", "transcript:503-539", "transcript:549-605", "p4:deterministic-state-machine"]
+    },
+    {
+      "id": "QP-DECOMP-004",
+      "name": "同级别关闭与审计",
+      "status": "engineering_default",
+      "decision": "确认的反向中枢或进入起点失效关闭当前同级别分解；开放状态按新证据追加 revision，关闭快照永久归档，后续重算只能开启新的 decomposition_id。",
+      "evidence": ["transcript:437-439", "transcript:815-830", "transcript:1394-1418", "p0:event-sourcing-default"]
+    },
+    {
       "id": "QP-EXIT-001",
       "name": "出场优先级",
       "status": "engineering_default",
@@ -205,12 +219,6 @@
       "default_until_resolved": "不把仅有被动支撑的形态升级为严格入场"
     },
     {
-      "id": "OPEN-002",
-      "owner_phase": "P4",
-      "question": "扩张、扩展发生时当前未关闭走势的最优重分解规则",
-      "default_until_resolved": "只修订当前开放状态，不回写历史决策"
-    },
-    {
       "id": "OPEN-003",
       "owner_phase": "P5",
       "question": "父级别冲突和缺少次级别确认时，拒绝与减仓哪种更优",
@@ -221,6 +229,13 @@
       "owner_phase": "P6",
       "question": "保本止损、分批止盈和对立中枢目标位是否增加净收益",
       "default_until_resolved": "关闭"
+    }
+  ],
+  "resolved_decisions": [
+    {
+      "id": "OPEN-002",
+      "resolved_in": "P4",
+      "resolution": "扩张与扩展只修订当前开放状态；确认反向中枢或进入起点失效后关闭并归档，禁止回写。具体几何关系由 QP-DECOMP-003 和 QP-DECOMP-004 固化。"
     }
   ]
 }

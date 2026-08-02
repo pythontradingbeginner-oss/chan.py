@@ -8,6 +8,12 @@ from .strategy import MinimalChanTrendStrategy, StrategySignal
 from .trade_intent import DecisionTraceRecord, PendingEntry, TradeIntent
 from .runtime_kernel import RuntimeDecisionKernel
 from .parity import RuntimeParityReport, TraceMismatch, compare_runtime_traces
+from strategy_policy.qingpai_decomposition import (
+    DecompositionSnapshot,
+    DecompositionTransition,
+    QingpaiDecomposer,
+    QingpaiRegime,
+)
 
 __all__ = [
     "ChanBacktestConfig",
@@ -17,12 +23,16 @@ __all__ = [
     "DecisionPipeline",
     "DecisionPipelineConfig",
     "DecisionTraceRecord",
+    "DecompositionSnapshot",
+    "DecompositionTransition",
     "GradedChanStrategy",
     "GradeFilterConfig",
     "GradedSignal",
     "MinimalChanTrendStrategy",
     "PositionState",
     "PendingEntry",
+    "QingpaiDecomposer",
+    "QingpaiRegime",
     "RiskConfig",
     "RiskDecision",
     "RiskManager",

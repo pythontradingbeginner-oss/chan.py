@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 
 from signal_core.models import SignalAssessment, SignalDecision, SignalEvent
 from strategy_policy.position import PositionContext
+from strategy_policy.qingpai_decomposition import DecompositionSnapshot
 
 from .strategy import StrategySignal
 
@@ -27,6 +28,11 @@ class DecisionTraceRecord:
     setup_invalidation_price: float | None
     execution_stop_price: float | None
     bsp_type: str
+    decomposition_id: str = ""
+    decomposition_revision: int | None = None
+    regime: str = "unclassified"
+    regime_direction: str = ""
+    regime_lifecycle: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -43,6 +49,11 @@ class DecisionTraceRecord:
             "setup_invalidation_price": self.setup_invalidation_price,
             "execution_stop_price": self.execution_stop_price,
             "bsp_type": self.bsp_type,
+            "decomposition_id": self.decomposition_id,
+            "decomposition_revision": self.decomposition_revision,
+            "regime": self.regime,
+            "regime_direction": self.regime_direction,
+            "regime_lifecycle": self.regime_lifecycle,
         }
 
 
@@ -54,6 +65,7 @@ class TradeIntent:
     decision: SignalDecision
     event: SignalEvent | None = None
     assessment: SignalAssessment | None = None
+    decomposition: DecompositionSnapshot | None = None
 
     @property
     def accepted(self) -> bool:
@@ -110,6 +122,12 @@ class TradeIntent:
     def with_signal(self, signal: StrategySignal) -> TradeIntent:
         return replace(self, signal=signal)
 
+    def with_decomposition(
+        self,
+        decomposition: DecompositionSnapshot | None,
+    ) -> TradeIntent:
+        return replace(self, decomposition=decomposition)
+
     def to_trace_record(self) -> DecisionTraceRecord:
         if self.event is not None:
             direction = self.event.direction.value
@@ -141,6 +159,23 @@ class TradeIntent:
             setup_invalidation_price=setup,
             execution_stop_price=stop,
             bsp_type=self.bsp_type,
+            decomposition_id=(
+                self.decomposition.decomposition_id if self.decomposition else ""
+            ),
+            decomposition_revision=(
+                self.decomposition.revision if self.decomposition else None
+            ),
+            regime=(
+                self.decomposition.regime.value
+                if self.decomposition
+                else "unclassified"
+            ),
+            regime_direction=(
+                self.decomposition.direction.value if self.decomposition else ""
+            ),
+            regime_lifecycle=(
+                self.decomposition.lifecycle.value if self.decomposition else ""
+            ),
         )
 
 

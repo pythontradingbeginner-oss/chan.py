@@ -21,6 +21,10 @@ chan:
 grading:
   min_grade: standard
 
+decomposition:
+  enabled: true
+  level: bi
+
 entry:
   policy_id: rb_15m_qingpai_strict_v1
   policy_mode: qingpai_strict

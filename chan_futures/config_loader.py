@@ -178,6 +178,7 @@ def make_runtime_decision_kernel(
 ) -> RuntimeDecisionKernel:
     """Build the canonical decision entry shared by every runtime."""
     from signal_core import SignalExtractor
+    from strategy_policy.qingpai_decomposition import QingpaiDecomposer
 
     resolved_timeframe = timeframe or _timeframe_name(config.kl_type)
     return RuntimeDecisionKernel(
@@ -186,6 +187,11 @@ def make_runtime_decision_kernel(
             symbol=symbol,
             timeframe=resolved_timeframe,
             contract=contract,
+        ),
+        decomposer=(
+            QingpaiDecomposer(level=config.decomposition.level)
+            if config.decomposition.enabled
+            else None
         ),
     )
 
