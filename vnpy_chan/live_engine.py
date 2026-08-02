@@ -27,7 +27,7 @@ from typing import Any
 
 import pandas as pd
 from vnpy.event import Event, EventEngine
-from vnpy.trader.constant import Direction, Exchange, Offset, OrderType
+from vnpy.trader.constant import Direction, Exchange, Offset, OrderType, Status
 from vnpy.trader.engine import BaseEngine, MainEngine
 from vnpy.trader.event import EVENT_ORDER, EVENT_TRADE
 from vnpy.trader.object import BarData, OrderData, OrderRequest, TradeData
@@ -77,6 +77,7 @@ class _PositionContext:
     invalidation_price: float | None = None
     initial_stop_price: float | None = None
     signal_key: str = ""
+    volume: int = 1
 
 
 @dataclass
@@ -133,7 +134,10 @@ class LiveTradingEngine(BaseEngine):
 
         # ── 订单追踪 ──
         self._pending_order_ids: set[str] = set()
+        self._pending_entry_contexts: dict[str, dict[str, Any]] = {}
         self._current_order_ref: str = ""
+        self._previous_close: float | None = None
+        self._true_ranges: list[float] = []
 
     # ════════════════════════════════════════
     # 初始化
@@ -256,6 +260,7 @@ class LiveTradingEngine(BaseEngine):
         self._snapshot.feed(klu)
 
         price = float(bar.close_price)
+        atr = self._update_atr(bar)
         timestamp = bar.datetime if isinstance(bar.datetime, datetime) else pd.Timestamp(bar.datetime)
 
         # ── 1. 检查出场规则 (如果当前有持仓) ──
@@ -285,6 +290,8 @@ class LiveTradingEngine(BaseEngine):
                 active_symbol=bar.symbol,
                 lv_idx=0,
                 extractor=self._extractor,
+                account_equity=self._account_equity(),
+                atr=atr,
             )
             if graded is not None:
                 self._record_signal(graded, timestamp)
@@ -304,7 +311,15 @@ class LiveTradingEngine(BaseEngine):
                         return
 
                 # 发送开仓订单
-                self._open_position(sig, graded.bsp_type, graded.grade, graded.event_id)
+                self._open_position(
+                    sig,
+                    graded.bsp_type,
+                    graded.grade,
+                    graded.event_id,
+                    event=graded.event,
+                    decision=graded.decision,
+                    signal_key=graded.signal_key,
+                )
 
         # ── 3. 信号状态更新 (pending signals → confirmed/invalidated) ──
         self._update_pending_signals(timestamp)
@@ -314,43 +329,98 @@ class LiveTradingEngine(BaseEngine):
         if order.vt_orderid not in self._pending_order_ids:
             return
         self._log(f"订单状态: {order.vt_orderid} → {order.status.value}")
+        if order.status in {Status.CANCELLED, Status.REJECTED}:
+            self._pending_order_ids.discard(order.vt_orderid)
+            self._pending_entry_contexts.pop(order.vt_orderid, None)
 
     def _on_trade(self, event: Event) -> None:
         trade: TradeData = event.data
-        if trade.vt_orderid not in self._pending_order_ids:
+        if (
+            trade.vt_orderid not in self._pending_order_ids
+            and trade.vt_orderid not in self._pending_entry_contexts
+        ):
             return
 
-        self._pending_order_ids.discard(trade.vt_orderid)
-        direction = SignalDirection.LONG if trade.direction == Direction.LONG else SignalDirection.SHORT
-
         # ── 开仓成交 → 记录持仓 ──
-        if self._position is None:
+        if trade.offset == Offset.OPEN:
+            direction = (
+                SignalDirection.LONG
+                if trade.direction == Direction.LONG
+                else SignalDirection.SHORT
+            )
+            fill_volume = int(trade.volume)
+            pending = self._pending_entry_contexts.get(trade.vt_orderid, {})
+            event_snapshot = pending.get("event")
+            decision_snapshot = pending.get("decision")
+            if self._position is not None and self._position.direction == direction:
+                previous_volume = self._position.volume
+                total_volume = previous_volume + fill_volume
+                entry_price = (
+                    self._position.entry_price * previous_volume
+                    + float(trade.price) * fill_volume
+                ) / total_volume
+            else:
+                total_volume = fill_volume
+                entry_price = float(trade.price)
             self._position = _PositionContext(
                 direction=direction,
-                entry_price=float(trade.price),
+                entry_price=entry_price,
                 entry_time=datetime.now(),
                 entry_bar=self._bar_count,
-                entry_grade=getattr(self, "_last_accepted_grade", "standard"),
-                signal_key=getattr(self, "_last_signal_key", ""),
+                entry_grade=pending.get(
+                    "grade", getattr(self, "_last_accepted_grade", "standard")
+                ),
+                bi_begin_price=(
+                    event_snapshot.bi_begin_price if event_snapshot else None
+                ),
+                zs_high=event_snapshot.zs_high if event_snapshot else None,
+                zs_low=event_snapshot.zs_low if event_snapshot else None,
+                invalidation_price=(
+                    decision_snapshot.setup_invalidation_price
+                    if decision_snapshot else None
+                ),
+                initial_stop_price=(
+                    decision_snapshot.execution_stop_price
+                    if decision_snapshot else None
+                ),
+                signal_key=pending.get(
+                    "signal_key", getattr(self, "_last_signal_key", "")
+                ),
+                volume=total_volume,
             )
             self._exit_manager.on_entry(
                 direction=direction,
-                entry_price=float(trade.price),
+                entry_price=entry_price,
+                bi_begin_price=self._position.bi_begin_price,
+                zs_high=self._position.zs_high,
+                zs_low=self._position.zs_low,
+                initial_stop_price=self._position.initial_stop_price,
+                invalidation_price=self._position.invalidation_price,
                 entry_grade=self._position.entry_grade,
             )
-            self._log(f"开仓成交: {direction.value} @ {trade.price}")
+            self._log(
+                f"开仓成交: {direction.value} @ {trade.price} volume={fill_volume}"
+            )
+            pending["filled_volume"] = int(pending.get("filled_volume", 0)) + fill_volume
+            if pending["filled_volume"] >= int(pending.get("planned_volume", fill_volume)):
+                self._pending_order_ids.discard(trade.vt_orderid)
+                self._pending_entry_contexts.pop(trade.vt_orderid, None)
 
         # ── 平仓成交 → 清理持仓 ──
-        else:
-            pnl = self._calc_pnl(float(trade.price))
+        elif self._position is not None:
+            fill_volume = int(trade.volume)
+            pnl = self._calc_pnl(float(trade.price), volume=fill_volume)
             self._risk.on_fill(pnl_points=pnl, fill_time=datetime.now())
             self._log(
                 f"平仓成交: @ {trade.price} "
                 f"PnL={pnl:.0f} pts "
                 f"累计已实现={self._risk._realized_points:.0f} pts"
             )
-            self._position = None
-            self._exit_manager.on_close()
+            self._position.volume = max(0, self._position.volume - fill_volume)
+            if self._position.volume == 0:
+                self._position = None
+                self._exit_manager.on_close()
+                self._pending_order_ids.discard(trade.vt_orderid)
 
     # ════════════════════════════════════════
     # 交易操作
@@ -362,6 +432,10 @@ class LiveTradingEngine(BaseEngine):
         bsp_type: str,
         grade: str,
         event_id: str,
+        *,
+        event: Any | None = None,
+        decision: Any | None = None,
+        signal_key: str = "",
     ) -> None:
         """向 vnpy 发送开仓订单。"""
         direction = _vnpy_direction_from_target(signal.target_position)
@@ -377,6 +451,17 @@ class LiveTradingEngine(BaseEngine):
         vt_orderid = self._send_order(order_req)
         if vt_orderid:
             self._pending_order_ids.add(vt_orderid)
+            contexts = getattr(self, "_pending_entry_contexts", None)
+            if contexts is None:
+                self._pending_entry_contexts = {}
+            self._pending_entry_contexts[vt_orderid] = {
+                "event": event,
+                "decision": decision,
+                "grade": grade,
+                "signal_key": signal_key,
+                "planned_volume": abs(signal.target_position),
+                "filled_volume": 0,
+            }
         self._last_accepted_grade = grade
         self._last_event_id = event_id
         self._log(
@@ -395,7 +480,7 @@ class LiveTradingEngine(BaseEngine):
             direction=direction,
             type=OrderType.LIMIT,
             price=price,
-            volume=1,
+            volume=self._position.volume,
             offset=Offset.CLOSE,
         )
         vt_orderid = self._send_order(order_req)
@@ -513,13 +598,41 @@ class LiveTradingEngine(BaseEngine):
     # 工具
     # ════════════════════════════════════════
 
-    def _calc_pnl(self, exit_price: float) -> float:
+    def _calc_pnl(self, exit_price: float, *, volume: int | None = None) -> float:
         if self._position is None:
             return 0
         pnl = exit_price - self._position.entry_price
         if self._position.direction == SignalDirection.SHORT:
             pnl = -pnl
-        return pnl - 2.0  # fee_points × 2
+        fee = self._config.execution.fee_points if self._config else 1.0
+        lots = self._position.volume if volume is None else volume
+        return (pnl - fee * 2) * lots
+
+    def _account_equity(self) -> float | None:
+        fallback = self._config.sizing.capital if self._config else None
+        try:
+            oms = self.main_engine.get_engine("oms")
+            accounts = oms.get_all_accounts() if oms is not None else []
+            balances = [float(account.balance) for account in accounts]
+            return sum(balances) if balances else fallback
+        except Exception:
+            return fallback
+
+    def _update_atr(self, bar: BarData) -> float | None:
+        high = float(bar.high_price)
+        low = float(bar.low_price)
+        close = float(bar.close_price)
+        tr = high - low
+        if self._previous_close is not None:
+            tr = max(tr, abs(high - self._previous_close), abs(low - self._previous_close))
+        self._previous_close = close
+        self._true_ranges.append(tr)
+        period = self._config.sizing.atr_period if self._config else 20
+        if len(self._true_ranges) > period:
+            self._true_ranges = self._true_ranges[-period:]
+        if len(self._true_ranges) < period:
+            return None
+        return sum(self._true_ranges) / period
 
     def _log(self, msg: str) -> None:
         self.main_engine.write_log(f"[ChanLive] {msg}", self.engine_name)

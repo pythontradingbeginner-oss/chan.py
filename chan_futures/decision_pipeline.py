@@ -21,6 +21,7 @@ from signal_core.models import (
 )
 from strategy_policy.entry_policy import EntryPolicy, EntryPolicyConfig
 
+from .sizing import Sizer
 from .strategy import StrategySignal
 
 
@@ -41,19 +42,28 @@ class DecisionPipelineConfig:
     )
     allow_short: bool = True
     require_confirmed: bool = True
+    max_abs_position: int | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.mode, str) and not isinstance(self.mode, DecisionMode):
             object.__setattr__(self, "mode", DecisionMode(self.mode))
         if isinstance(self.min_grade, str) and not isinstance(self.min_grade, ScoreGrade):
             object.__setattr__(self, "min_grade", ScoreGrade(self.min_grade))
+        if self.max_abs_position is not None and self.max_abs_position < 1:
+            raise ValueError("max_abs_position must be >= 1")
 
 
 class DecisionPipeline:
     """Make the final strategy decision from signal, event and assessment."""
 
-    def __init__(self, config: DecisionPipelineConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: DecisionPipelineConfig | None = None,
+        *,
+        sizer: Sizer | None = None,
+    ) -> None:
         self.config = config or DecisionPipelineConfig()
+        self._sizer = sizer
         strict = self.config.mode == DecisionMode.QINGPAI_STRICT
         self._policy = EntryPolicy(
             EntryPolicyConfig(
@@ -63,6 +73,7 @@ class DecisionPipeline:
                 accepted_bsp_types=self.config.accepted_bsp_types,
                 long_only=not self.config.allow_short,
                 reject_hard_blockers=strict,
+                structure_stop_mode=("qingpai_strict" if strict else "legacy"),
             )
         )
 
@@ -71,6 +82,9 @@ class DecisionPipeline:
         signal: StrategySignal,
         event: SignalEvent | None,
         assessment: SignalAssessment | None,
+        *,
+        account_equity: float | None = None,
+        atr: float | None = None,
     ) -> SignalDecision:
         """Return an accepted or rejected decision without executing anything."""
         if event is None or assessment is None:
@@ -102,17 +116,87 @@ class DecisionPipeline:
 
         decision = self._policy.evaluate(event, assessment)
         invariant_failures = self._check_invariants(signal, event, assessment)
-        if not invariant_failures:
+        if invariant_failures:
+            return replace(
+                decision,
+                accepted=False,
+                reason_codes=decision.reason_codes + tuple(invariant_failures),
+                entry_price_hint=None,
+                invalidation_price=None,
+                initial_stop_price=None,
+                position_size_hint=None,
+                setup_invalidation_price=None,
+                execution_stop_price=None,
+            )
+        return self._size_decision(
+            decision,
+            signal=signal,
+            account_equity=account_equity,
+            atr=atr,
+        )
+
+    def _size_decision(
+        self,
+        decision: SignalDecision,
+        *,
+        signal: StrategySignal,
+        account_equity: float | None,
+        atr: float | None,
+    ) -> SignalDecision:
+        if not decision.accepted or signal.target_position == 0 or self._sizer is None:
             return decision
 
+        stop = decision.execution_stop_price
+        if stop is None:
+            stop = decision.initial_stop_price
+        entry = float(signal.price)
+        if stop is None:
+            return replace(
+                decision,
+                accepted=False,
+                reason_codes=decision.reason_codes + ("execution_stop_unavailable",),
+                entry_price_hint=None,
+                position_size_hint=None,
+            )
+
+        if self.config.mode == DecisionMode.QINGPAI_STRICT:
+            setup = decision.setup_invalidation_price
+            wrong_side: list[str] = []
+            if not _is_protective_side(signal.target_position, entry, float(stop)):
+                wrong_side.append("execution_stop_wrong_side_at_entry")
+            if setup is not None and not _is_protective_side(
+                signal.target_position, entry, float(setup)
+            ):
+                wrong_side.append("setup_invalidation_wrong_side_at_entry")
+            if wrong_side:
+                return replace(
+                    decision,
+                    accepted=False,
+                    reason_codes=decision.reason_codes + tuple(wrong_side),
+                    entry_price_hint=None,
+                    position_size_hint=None,
+                )
+
+        lots = self._sizer.calculate(
+            initial_stop_price=float(stop),
+            entry_price=entry,
+            atr=atr,
+            account_equity=account_equity,
+        )
+        if self.config.max_abs_position is not None:
+            lots = min(lots, self.config.max_abs_position)
+        if lots < 1:
+            return replace(
+                decision,
+                accepted=False,
+                reason_codes=decision.reason_codes + ("risk_budget_below_one_lot",),
+                entry_price_hint=None,
+                position_size_hint=0.0,
+            )
         return replace(
             decision,
-            accepted=False,
-            reason_codes=decision.reason_codes + tuple(invariant_failures),
-            entry_price_hint=None,
-            invalidation_price=None,
-            initial_stop_price=None,
-            position_size_hint=None,
+            entry_price_hint=entry,
+            position_size_hint=float(lots),
         )
 
     @staticmethod
@@ -163,6 +247,8 @@ def _build_decision(
         initial_stop_price=None,
         position_size_hint=1.0 if accepted else None,
         decided_at=datetime.now(),
+        setup_invalidation_price=None,
+        execution_stop_price=None,
     )
 
 
@@ -182,3 +268,13 @@ def _is_available(available_at: datetime, decision_time: datetime) -> bool:
     except TypeError:
         # Compare wall-clock values when one side is timezone-aware and the other is not.
         return available_at.replace(tzinfo=None) <= decision_time.replace(tzinfo=None)
+
+
+def _is_protective_side(
+    target_position: int,
+    entry_price: float,
+    stop_price: float,
+) -> bool:
+    if target_position > 0:
+        return stop_price < entry_price
+    return stop_price > entry_price

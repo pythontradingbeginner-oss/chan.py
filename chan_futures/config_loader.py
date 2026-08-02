@@ -32,6 +32,7 @@ from strategy_policy.exit_rules import (
 from .config import ExitRuleSpec, StrategyConfig
 from .decision_pipeline import DecisionMode, DecisionPipeline, DecisionPipelineConfig
 from .graded_strategy import GradeFilterConfig, GradedChanStrategy
+from .sizing import make_sizer
 
 
 _TYPE_STR_TO_BSP: dict[str, BSP_TYPE] = {
@@ -138,7 +139,12 @@ def make_decision_pipeline(config: StrategyConfig) -> DecisionPipeline:
             accepted_bsp_types=accepted,
             allow_short=allow_short,
             require_confirmed=bool(entry.get("require_confirmed_bsp", True)),
-        )
+            max_abs_position=config.risk.max_abs_position,
+        ),
+        sizer=make_sizer(
+            config.sizing,
+            contract_multiplier=config.execution.contract_multiplier,
+        ),
     )
 
 

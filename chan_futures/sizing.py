@@ -9,8 +9,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-
-import numpy as np
+from math import floor, isfinite
 
 
 # ═══════════════════════════════════════════
@@ -28,6 +27,7 @@ class Sizer(ABC):
         initial_stop_price: float,
         entry_price: float,
         atr: float | None = None,
+        account_equity: float | None = None,
     ) -> int:
         """返回应开仓的手数（整数）。
 
@@ -35,6 +35,7 @@ class Sizer(ABC):
             initial_stop_price: 入场计划的初始止损价
             entry_price: 计划入场价
             atr: 当前 ATR 值（method=atr 时必传）
+            account_equity: 决策时账户总权益；不传则使用配置资金
         """
         ...
 
@@ -80,6 +81,8 @@ class FixedFractionalSizer(Sizer):
             raise ValueError("capital must be positive")
         if not 0 < risk_pct < 1:
             raise ValueError("risk_pct must be between 0 and 1")
+        if contract_multiplier <= 0:
+            raise ValueError("contract_multiplier must be positive")
         self.capital = float(capital)
         self.risk_pct = float(risk_pct)
         self.multiplier = float(contract_multiplier)
@@ -89,15 +92,17 @@ class FixedFractionalSizer(Sizer):
         *,
         initial_stop_price: float,
         entry_price: float,
+        account_equity: float | None = None,
         **kwargs: object,
     ) -> int:
         stop_distance = abs(entry_price - initial_stop_price)
-        if stop_distance <= 0:
-            return 1  # 止损价位无效时回退到 1 手
+        equity = self.capital if account_equity is None else float(account_equity)
+        if stop_distance <= 0 or equity <= 0 or not isfinite(stop_distance + equity):
+            return 0
 
-        risk_amount = self.capital * self.risk_pct
+        risk_amount = equity * self.risk_pct
         lots = risk_amount / (stop_distance * self.multiplier)
-        return max(1, int(np.floor(lots)))
+        return max(0, floor(lots))
 
 
 # ═══════════════════════════════════════════
@@ -129,6 +134,8 @@ class ATRSizer(Sizer):
             raise ValueError("risk_pct must be between 0 and 1")
         if atr_multiplier <= 0:
             raise ValueError("atr_multiplier must be positive")
+        if contract_multiplier <= 0:
+            raise ValueError("contract_multiplier must be positive")
         self.capital = float(capital)
         self.risk_pct = float(risk_pct)
         self.atr_multiplier = float(atr_multiplier)
@@ -138,19 +145,28 @@ class ATRSizer(Sizer):
     def calculate(
         self,
         *,
+        initial_stop_price: float,
+        entry_price: float,
         atr: float | None = None,
+        account_equity: float | None = None,
         **kwargs: object,
     ) -> int:
         if atr is None or atr <= 0:
             if self.min_atr is not None:
                 atr = self.min_atr
             else:
-                return 1  # ATR 不可用时回退到 1 手
+                return 0
 
-        stop_distance = atr * self.atr_multiplier
-        risk_amount = self.capital * self.risk_pct
+        structural_distance = abs(entry_price - initial_stop_price)
+        if structural_distance <= 0:
+            return 0
+        stop_distance = max(structural_distance, atr * self.atr_multiplier)
+        equity = self.capital if account_equity is None else float(account_equity)
+        if equity <= 0 or not isfinite(stop_distance + equity):
+            return 0
+        risk_amount = equity * self.risk_pct
         lots = risk_amount / (stop_distance * self.multiplier)
-        return max(1, int(np.floor(lots)))
+        return max(0, floor(lots))
 
 
 # ═══════════════════════════════════════════
@@ -158,7 +174,7 @@ class ATRSizer(Sizer):
 # ═══════════════════════════════════════════
 
 
-def make_sizer(config) -> Sizer:
+def make_sizer(config, *, contract_multiplier: float = 10.0) -> Sizer:
     """从 StrategyConfig.sizing 构建 Sizer 实例。"""
     method = config.method
     if method == "fixed":
@@ -168,13 +184,13 @@ def make_sizer(config) -> Sizer:
             capital=config.capital,
             risk_pct=config.risk_pct,
             atr_multiplier=config.atr_multiplier,
-            contract_multiplier=config.contract_multiplier,
+            contract_multiplier=contract_multiplier,
         )
     elif method == "fixed_fractional":
         return FixedFractionalSizer(
             capital=config.capital,
             risk_pct=config.risk_pct,
-            contract_multiplier=config.contract_multiplier,
+            contract_multiplier=contract_multiplier,
         )
     else:
         raise ValueError(f"未知仓位方法: {method}，可用: fixed/atr/fixed_fractional")

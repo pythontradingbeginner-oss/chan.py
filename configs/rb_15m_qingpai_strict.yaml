@@ -1,5 +1,5 @@
 # RB 15m Qingpai strict entry profile.
-# P1 only changes the shared decision gate; structure-stop sizing is added in P2.
+# P2: strict double anchors, structure protection stop and equity-based sizing.
 
 code: RB_MAIN
 kl_type: K_15M
@@ -29,10 +29,9 @@ entry:
   long_only: false
 
 exits:
-  - type: FixedStopRule
-    priority: 20
-    stop_points: 180.0
-    grade_adjust: true
+  - type: StructureStopRule
+    priority: 10
+    grade_tighten: false
   - type: TrailingStopRule
     priority: 30
     trigger_points: 500.0
@@ -48,8 +47,9 @@ risk:
   max_consecutive_losses: 5
 
 sizing:
-  method: fixed
-  lots: 1
+  method: fixed_fractional
+  capital: 100000.0
+  risk_pct: 0.01
 
 execution:
   fee_points: 1.0

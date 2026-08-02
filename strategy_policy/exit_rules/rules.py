@@ -32,10 +32,10 @@ from signal_core.models import SignalDirection
 class StructureStopRule(ExitRule):
     """基于入场信号结构锚点的止损。
 
-    止损价位来源 (优先级从高到低):
-      1. ctx.invalidation_price  (SignalDecision 计算)
-      2. ctx.bi_begin_price      (笔起始分型极值)
-      3. ctx.zs_low / ctx.zs_high  (最近中枢边界)
+    P2 后优先执行 ctx.initial_stop_price（订单保护止损）。
+    ctx.invalidation_price 是整套分析的失效位，不参与该订单止损择优。
+    旧调用方没有 initial_stop_price 时，才按旧语义回退到
+    invalidation_price/笔起点/中枢边界。
 
     逻辑:
       LONG:  跌破上述价位 → 出场
@@ -62,28 +62,38 @@ class StructureStopRule(ExitRule):
         if not triggered:
             return None
 
+        exit_price = self._executable_stop_price(ctx, stop_price)
+        gap = exit_price != stop_price
         return ExitSignal(
             rule_id=self.rule_id,
             reason_code="structure_stop",
-            exit_price=stop_price,
-            description=f"结构止损触发 @ {stop_price:.1f}",
+            exit_price=exit_price,
+            description=(
+                f"结构止损跳空触发 @ {exit_price:.1f} (计划 {stop_price:.1f})"
+                if gap
+                else f"结构止损触发 @ {stop_price:.1f}"
+            ),
         )
 
     def _resolve_stop(self, ctx: ExitContext) -> float | None:
         """按优先级解析有效的止损价位。"""
         is_long = ctx.is_long
 
+        if ctx.initial_stop_price is not None:
+            explicit = float(ctx.initial_stop_price)
+            if (is_long and explicit < ctx.entry_price) or (
+                not is_long and explicit > ctx.entry_price
+            ):
+                return explicit
+
         candidates: list[float] = []
 
-        # 1. 信号失效价
+        # 旧入口没有订单止损计划时的兼容回退。
         if ctx.invalidation_price is not None:
             candidates.append(float(ctx.invalidation_price))
-
-        # 2. 笔起始价
         if ctx.bi_begin_price is not None:
             candidates.append(float(ctx.bi_begin_price))
 
-        # 3. 中枢边界
         if is_long and ctx.zs_low is not None:
             candidates.append(float(ctx.zs_low))
         elif not is_long and ctx.zs_high is not None:
@@ -104,6 +114,15 @@ class StructureStopRule(ExitRule):
             stop = self._tighten(ctx.entry_price, stop, is_long)
 
         return stop
+
+    @staticmethod
+    def _executable_stop_price(ctx: ExitContext, stop_price: float) -> float:
+        """跳空穿越保护位时，只能按该 bar 首个可成交价执行。"""
+        if ctx.is_long and ctx.open < stop_price:
+            return float(ctx.open)
+        if not ctx.is_long and ctx.open > stop_price:
+            return float(ctx.open)
+        return stop_price
 
     @staticmethod
     def _tighten(entry_price: float, raw_stop: float, is_long: bool) -> float:

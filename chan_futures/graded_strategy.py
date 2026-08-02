@@ -9,7 +9,7 @@ as a transparent layer between strategy.on_bar and risk/execution.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Iterable
 
@@ -108,6 +108,8 @@ class GradedChanStrategy:
         active_symbol: str | None = None,
         lv_idx: int = 0,
         extractor=None,   # SignalExtractor — required for grading
+        account_equity: float | None = None,
+        atr: float | None = None,
     ) -> GradedSignal | None:
         """Preserve the old API: return only accepted decisions."""
         evaluated = self.evaluate_bar(
@@ -118,6 +120,8 @@ class GradedChanStrategy:
             active_symbol=active_symbol,
             lv_idx=lv_idx,
             extractor=extractor,
+            account_equity=account_equity,
+            atr=atr,
         )
         if evaluated is None or not evaluated.accepted:
             return None
@@ -133,6 +137,8 @@ class GradedChanStrategy:
         active_symbol: str | None = None,
         lv_idx: int = 0,
         extractor=None,
+        account_equity: float | None = None,
+        atr: float | None = None,
     ) -> GradedSignal | None:
         """Return the full accepted/rejected decision for runtime auditing."""
         inner_sig = self._inner.on_bar(
@@ -146,9 +152,19 @@ class GradedChanStrategy:
         if inner_sig is None:
             return None
         if extractor is None:
-            return self._build_result(inner_sig, None, None)
+            return self._build_result(
+                inner_sig, None, None, account_equity=account_equity, atr=atr
+            )
 
-        return self._grade(inner_sig, chan, extractor, timestamp, lv_idx)
+        return self._grade(
+            inner_sig,
+            chan,
+            extractor,
+            timestamp,
+            lv_idx,
+            account_equity=account_equity,
+            atr=atr,
+        )
 
     def _grade(
         self,
@@ -157,12 +173,17 @@ class GradedChanStrategy:
         extractor,
         timestamp,
         lv_idx: int,
+        *,
+        account_equity: float | None = None,
+        atr: float | None = None,
     ) -> GradedSignal:
         """Extract and assess the exact BSP backing the strategy signal."""
         try:
             bsp_list = chan[lv_idx].bs_point_lst
         except Exception:
-            return self._build_result(sig, None, None)
+            return self._build_result(
+                sig, None, None, account_equity=account_equity, atr=atr
+            )
 
         # Match the exact source identity; substring matching confuses e.g. 1 and 1p.
         matched_bsp = None
@@ -176,7 +197,9 @@ class GradedChanStrategy:
                 break
 
         if matched_bsp is None:
-            return self._build_result(sig, None, None)
+            return self._build_result(
+                sig, None, None, account_equity=account_equity, atr=atr
+            )
 
         # resolve bar_end_time from timestamp
         bar_end_time = timestamp
@@ -191,22 +214,40 @@ class GradedChanStrategy:
             if callable(get_current):
                 event = get_current(matched_bsp)
         if event is None:
-            return self._build_result(sig, None, None)
+            return self._build_result(
+                sig, None, None, account_equity=account_equity, atr=atr
+            )
 
         assessment = assess_event(event)
-        return self._build_result(sig, event, assessment)
+        return self._build_result(
+            sig, event, assessment, account_equity=account_equity, atr=atr
+        )
 
     def _build_result(
         self,
         sig: StrategySignal,
         event: SignalEvent | None,
         assessment: SignalAssessment | None,
+        *,
+        account_equity: float | None = None,
+        atr: float | None = None,
     ) -> GradedSignal:
-        decision = self._decision_pipeline.evaluate(sig, event, assessment)
+        decision = self._decision_pipeline.evaluate(
+            sig,
+            event,
+            assessment,
+            account_equity=account_equity,
+            atr=atr,
+        )
         if not decision.accepted and "signal_not_confirmed" in decision.reason_codes:
             self._inner.release_signal(sig)
+        executable_signal = sig
+        if decision.accepted and sig.target_position != 0:
+            lots = int(decision.position_size_hint or 0)
+            signed_target = lots if sig.target_position > 0 else -lots
+            executable_signal = replace(sig, target_position=signed_target)
         return GradedSignal(
-            signal=sig,
+            signal=executable_signal,
             bsp_type=sig.bsp_type,
             grade=assessment.grade.value if assessment is not None else "standard",
             structural_score=(assessment.structural_score or 0.0) if assessment is not None else 0.0,

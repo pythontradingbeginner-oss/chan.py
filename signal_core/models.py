@@ -132,6 +132,12 @@ class SignalEvent:
     chan_version: str           # chan.py 版本标识
     data_run_id:  str           # 数据管线批次标识
     structural_price: float | None = None  # 笔端极值，不等同于确认 K 线收盘价
+    related_bsp1_bi_idx: int | None = None
+    related_bsp1_price: float | None = None
+    zs_idx: int | None = None
+    zs_begin_bi_idx: int | None = None
+    zs_end_bi_idx: int | None = None
+    zs_is_sure: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """转为 JSON 友好的 dict (用于 DataFrame 或持久化)。"""
@@ -160,6 +166,12 @@ class SignalEvent:
             "chan_version":   self.chan_version,
             "data_run_id":    self.data_run_id,
             "structural_price": self.structural_price,
+            "related_bsp1_bi_idx": self.related_bsp1_bi_idx,
+            "related_bsp1_price": self.related_bsp1_price,
+            "zs_idx": self.zs_idx,
+            "zs_begin_bi_idx": self.zs_begin_bi_idx,
+            "zs_end_bi_idx": self.zs_end_bi_idx,
+            "zs_is_sure": self.zs_is_sure,
         }
 
 
@@ -233,6 +245,10 @@ class SignalDecision:
     position_size_hint:  float | None
 
     decided_at:  datetime
+    # P2 明确区分分析前提失效位与本次订单保护止损。
+    # 上面的旧字段继续作为兼容别名写入相同值。
+    setup_invalidation_price: float | None = None
+    execution_stop_price: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -246,6 +262,8 @@ class SignalDecision:
             "initial_stop_price": self.initial_stop_price,
             "position_size_hint": self.position_size_hint,
             "decided_at":         self.decided_at.isoformat(),
+            "setup_invalidation_price": self.setup_invalidation_price,
+            "execution_stop_price": self.execution_stop_price,
         }
 
 

@@ -239,6 +239,7 @@ def _run_loop(
     exit_events: list[dict] = []
     trades: list[dict] = []
     current_trade: dict | None = None
+    atr_values = _calculate_atr(bars, config.sizing.atr_period)
     _bar_events: list[SignalEvent] = []
     _event_ids: set[str] = set()
     _decisions: list[SignalDecision] = []
@@ -250,10 +251,11 @@ def _run_loop(
         nonlocal current_trade
         if current_trade is None:
             return
+        lots = int(current_trade.get("lots", 1))
         pnl = exit_price - current_trade["entry_price"]
         if current_trade.get("direction") == "short":
             pnl = -pnl
-        pnl -= fee_points * 2  # entry + exit
+        pnl = (pnl - fee_points * 2) * lots
         current_trade.update({
             "exit_bar": exit_bar, "exit_price": exit_price,
             "exit_time": exit_time,
@@ -293,29 +295,31 @@ def _run_loop(
                 close=price,
             )
             if exit_signal is not None and execution.state.position != 0:
-                _close_trade(
-                    exit_bar=row_number,
-                    exit_price=exit_signal.exit_price,
-                    exit_time=timestamp,
-                    reason=exit_signal.reason_code,
-                    rule_id=exit_signal.rule_id,
-                )
                 # 强制平仓
                 target = 0
                 action = "close_long" if execution.state.position > 0 else "close_short"
                 sig = StrategySignal(
                     timestamp=timestamp, action=action, target_position=target,
-                    price=price, reason=exit_signal.reason_code,
+                    price=exit_signal.exit_price, reason=exit_signal.reason_code,
                     bsp_type="exit", bsp_bi_idx=-1, bsp_klu_idx=-1,
                     active_symbol=active_symbol_str,
                 )
-                execution.execute(sig)
+                fill = execution.execute(sig)
+                executed_exit = fill.fill_price if fill is not None else exit_signal.exit_price
+                _close_trade(
+                    exit_bar=row_number,
+                    exit_price=executed_exit,
+                    exit_time=timestamp,
+                    reason=exit_signal.reason_code,
+                    rule_id=exit_signal.rule_id,
+                )
                 exit_manager.on_close()
                 exit_events.append({
                     "row_number": row_number, "datetime": timestamp,
                     "rule_id": exit_signal.rule_id,
                     "reason_code": exit_signal.reason_code,
                     "trigger_price": exit_signal.exit_price,
+                    "fill_price": executed_exit,
                     "description": exit_signal.description,
                 })
 
@@ -327,6 +331,12 @@ def _run_loop(
                 price=price, timestamp=timestamp,
                 active_symbol=active_symbol_str,
                 lv_idx=0, extractor=extractor,
+                account_equity=(
+                    config.sizing.capital
+                    + execution.mark_to_market(price)
+                    * config.execution.contract_multiplier
+                ),
+                atr=_finite_or_none(atr_values.iloc[row_number]),
             )
             if evaluated is not None:
                 _decisions.append(evaluated.decision)
@@ -354,41 +364,51 @@ def _run_loop(
                             signal = None  # 过滤掉做空信号
 
                 if signal is not None:
-                    has_pos = execution.state.position != 0
-                    # 如果有仓位且信号是平仓/反转 → 先通过策略反转平仓
-                    if has_pos and signal.action in (
-                        "close_long", "close_short",
-                        "reverse_long_to_short", "reverse_short_to_long",
-                    ):
-                        _close_trade(
-                            exit_bar=row_number, exit_price=price,
-                            exit_time=timestamp, reason="strategy_reverse",
-                            rule_id="strategy_reversal",
-                        )
-                        exit_manager.on_close()
-
                     # 风控审批 + 执行
                     decision = risk.approve(
                         signal,
                         current_equity=execution.mark_to_market(price),
                     )
                     if decision.approved:
+                        previous_position = execution.state.position
                         fill = execution.execute(signal)
+                        closed_existing = previous_position != 0 and signal.action in (
+                            "close_long", "close_short",
+                            "reverse_long_to_short", "reverse_short_to_long",
+                        )
+                        if fill is not None and closed_existing:
+                            _close_trade(
+                                exit_bar=row_number, exit_price=fill.fill_price,
+                                exit_time=timestamp, reason="strategy_reverse",
+                                rule_id="strategy_reversal",
+                            )
+                            exit_manager.on_close()
                         if fill is not None and fill.target_position != 0:
                             direction = "long" if fill.target_position > 0 else "short"
+                            lots = abs(fill.target_position)
+                            event = graded.event
+                            signal_decision = graded.decision
                             current_trade = {
                                 "entry_bar": row_number,
-                                "entry_price": fill.fill_price - fee_points,
+                                "entry_price": fill.fill_price,
                                 "entry_time": timestamp,
                                 "direction": direction,
+                                "lots": lots,
                                 "grade": grade_info["grade"] if grade_info else "unknown",
                                 "active_symbol": active_symbol_str or "",
+                                "setup_invalidation_price": signal_decision.setup_invalidation_price,
+                                "execution_stop_price": signal_decision.execution_stop_price,
                             }
                             dir_enum = SignalDirection.LONG if direction == "long" else SignalDirection.SHORT
                             eg = grade_info["grade"] if grade_info else None
                             exit_manager.on_entry(
                                 direction=dir_enum,
                                 entry_price=fill.fill_price,
+                                bi_begin_price=event.bi_begin_price if event else None,
+                                zs_high=event.zs_high if event else None,
+                                zs_low=event.zs_low if event else None,
+                                initial_stop_price=signal_decision.execution_stop_price,
+                                invalidation_price=signal_decision.setup_invalidation_price,
                                 entry_grade=eg,
                             )
 
@@ -458,6 +478,26 @@ def _timeframe_minutes(kl_type_str: str) -> int:
     return mapping.get(kl_type_str, 15)
 
 
+def _calculate_atr(bars: pd.DataFrame, period: int) -> pd.Series:
+    """只使用当前及历史已收盘 K 线计算简单 ATR。"""
+    previous_close = bars["close"].shift(1)
+    true_range = pd.concat(
+        [
+            bars["high"] - bars["low"],
+            (bars["high"] - previous_close).abs(),
+            (bars["low"] - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return true_range.rolling(window=period, min_periods=period).mean()
+
+
+def _finite_or_none(value: object) -> float | None:
+    if pd.isna(value):
+        return None
+    return float(value)
+
+
 def _close_trade_at_end(
     trades: list[dict],
     bars: pd.DataFrame,
@@ -478,6 +518,7 @@ def _close_trade_at_end(
         "exit_reason": "end_of_data",
         "exit_rule": "end_of_data",
         "direction": "long" if execution.state.position > 0 else "short",
+        "lots": abs(execution.state.position),
         "pnl_points": 0.0,
         "hold_bars": 0,
         "grade": "unknown",

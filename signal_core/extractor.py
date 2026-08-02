@@ -117,7 +117,10 @@ class SignalExtractor:
         ref_price = float(bsp.klu.close)
         structural_price = _safe_bi_end(bsp)
         bi_begin = _safe_bi_begin(bsp)
-        zs_high, zs_low = _nearest_zs_range(bsp)
+        zs_idx, zs = _relevant_zs_snapshot(bsp, chan, lv_idx, primary, direction)
+        zs_high = float(zs.high) if zs is not None else None
+        zs_low = float(zs.low) if zs is not None else None
+        related_bsp1_bi_idx, related_bsp1_price = _related_bsp1_snapshot(bsp)
         features = _extract_features(bsp)
         try:
             features.setdefault("bi_amp", float(bsp.bi.amp()))
@@ -152,6 +155,12 @@ class SignalExtractor:
             chan_version=self.chan_version,
             data_run_id=self.data_run_id,
             structural_price=structural_price,
+            related_bsp1_bi_idx=related_bsp1_bi_idx,
+            related_bsp1_price=related_bsp1_price,
+            zs_idx=zs_idx,
+            zs_begin_bi_idx=_zs_bi_idx(zs, "begin_bi"),
+            zs_end_bi_idx=_zs_bi_idx(zs, "end_bi"),
+            zs_is_sure=_zs_is_sure(zs),
         )
         self._current_events[dedup_key] = event
         return event
@@ -253,17 +262,79 @@ def _safe_bi_end(bsp) -> float | None:
         return None
 
 
-def _nearest_zs_range(bsp) -> tuple[float | None, float | None]:
+def _nearest_parent_zs(bsp):
     seg = getattr(bsp.bi, "parent_seg", None)
     if seg is None:
-        return None, None
+        return None
     zs_lst = getattr(seg, "zs_lst", [])
     if not zs_lst:
-        return None, None
+        return None
     for zs in reversed(zs_lst):
         if hasattr(zs, "is_one_bi_zs") and not zs.is_one_bi_zs():
-            return float(zs.high), float(zs.low)
+            return zs
+    return None
+
+
+def _relevant_zs_snapshot(bsp, chan, lv_idx, primary, direction):
+    """冻结本次 BSP 使用的中枢，而不是只保存一对无来源边界。"""
+    all_zs = []
+    try:
+        all_zs = list(chan[lv_idx].zs_list.zs_lst)
+    except Exception:
+        pass
+
+    if primary in {"3a", "3b"} and all_zs:
+        bi_idx = int(bsp.bi.idx)
+        structural_price = _safe_bi_end(bsp)
+        prior = [zs for zs in all_zs if _zs_bi_idx(zs, "end_bi") < bi_idx]
+        if structural_price is not None:
+            if direction == SignalDirection.LONG:
+                valid = [zs for zs in prior if structural_price > float(zs.high)]
+            else:
+                valid = [zs for zs in prior if structural_price < float(zs.low)]
+            if valid:
+                selected = valid[-1]
+                return all_zs.index(selected), selected
+        if prior:
+            selected = prior[-1]
+            return all_zs.index(selected), selected
+
+    selected = _nearest_parent_zs(bsp)
+    if selected is not None:
+        try:
+            return all_zs.index(selected), selected
+        except ValueError:
+            return None, selected
     return None, None
+
+
+def _related_bsp1_snapshot(bsp) -> tuple[int | None, float | None]:
+    try:
+        related = bsp.relate_bsp1
+        if related is None:
+            return None, None
+        return int(related.bi.idx), float(related.bi.get_end_val())
+    except Exception:
+        return None, None
+
+
+def _zs_bi_idx(zs, attribute: str) -> int | None:
+    if zs is None:
+        return None
+    try:
+        return int(getattr(zs, attribute).idx)
+    except Exception:
+        return None
+
+
+def _zs_is_sure(zs) -> bool | None:
+    if zs is None:
+        return None
+    try:
+        value = zs.is_sure
+        return bool(value() if callable(value) else value)
+    except Exception:
+        return None
 
 
 def _extract_features(bsp) -> dict[str, Any]:

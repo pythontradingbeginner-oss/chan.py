@@ -51,6 +51,7 @@ class EntryPolicyConfig:
     default_stop_ratio: float         = 0.02    # 默认止损比例 2%
     default_size:       float         = 1.0
     reject_hard_blockers: bool        = True
+    structure_stop_mode: str          = "legacy"
 
 
 class EntryPolicy:
@@ -104,13 +105,22 @@ class EntryPolicy:
             except Exception:
                 reasons.append("extra_condition_error")
 
-        # ── 判定 ──
-        accepted = len(reasons) == 0
+        if self.cfg.structure_stop_mode == "qingpai_strict":
+            setup_invalidation, execution_stop = _calc_qingpai_levels(event)
+            reasons.extend(
+                _validate_qingpai_levels(
+                    event,
+                    setup_invalidation=setup_invalidation,
+                    execution_stop=execution_stop,
+                )
+            )
+        else:
+            setup_invalidation = _calc_invalidation(event)
+            execution_stop = _calc_initial_stop(event, self.cfg.default_stop_ratio)
 
-        # ── 入场计划 ──
+        # ── 判定与入场计划 ──
+        accepted = len(reasons) == 0
         entry_price_hint = event.reference_price if accepted else None
-        invalidation_price = _calc_invalidation(event) if accepted else None
-        initial_stop = _calc_initial_stop(event, self.cfg.default_stop_ratio) if accepted else None
 
         return SignalDecision(
             decision_id=str(uuid.uuid4())[:12],
@@ -119,10 +129,12 @@ class EntryPolicy:
             accepted=accepted,
             reason_codes=tuple(reasons),
             entry_price_hint=entry_price_hint,
-            invalidation_price=invalidation_price,
-            initial_stop_price=initial_stop,
+            invalidation_price=setup_invalidation,
+            initial_stop_price=execution_stop,
             position_size_hint=self.cfg.default_size if accepted else None,
             decided_at=datetime.now(),
+            setup_invalidation_price=setup_invalidation,
+            execution_stop_price=execution_stop,
         )
 
 
@@ -164,6 +176,62 @@ def _calc_initial_stop(
         if event.bi_begin_price is not None and event.bi_begin_price > ref:
             return float(event.bi_begin_price)
         return ref * (1 + default_ratio)
+
+
+def _calc_qingpai_levels(event: SignalEvent) -> tuple[float | None, float | None]:
+    """按 P0 冻结规则生成分析失效位与订单止损位。"""
+    execution_stop = (
+        float(event.structural_price)
+        if event.structural_price is not None
+        else None
+    )
+    setup_invalidation: float | None = None
+
+    if event.primary_bsp in {"1", "1p"}:
+        setup_invalidation = execution_stop
+    elif event.primary_bsp in {"2", "2s"}:
+        if event.related_bsp1_price is not None:
+            setup_invalidation = float(event.related_bsp1_price)
+    elif event.primary_bsp in {"3a", "3b"}:
+        boundary = event.zs_high if event.direction == SignalDirection.LONG else event.zs_low
+        if boundary is not None:
+            setup_invalidation = float(boundary)
+
+    return setup_invalidation, execution_stop
+
+
+def _validate_qingpai_levels(
+    event: SignalEvent,
+    *,
+    setup_invalidation: float | None,
+    execution_stop: float | None,
+) -> list[str]:
+    reasons: list[str] = []
+    if setup_invalidation is None:
+        reasons.append("setup_invalidation_unavailable")
+    if execution_stop is None:
+        reasons.append("execution_stop_unavailable")
+
+    entry = float(event.reference_price)
+    if execution_stop is not None and not _is_valid_stop_side(
+        event.direction, entry, execution_stop
+    ):
+        reasons.append("execution_stop_wrong_side")
+    if setup_invalidation is not None and not _is_valid_stop_side(
+        event.direction, entry, setup_invalidation
+    ):
+        reasons.append("setup_invalidation_wrong_side")
+    return reasons
+
+
+def _is_valid_stop_side(
+    direction: SignalDirection,
+    entry_price: float,
+    stop_price: float,
+) -> bool:
+    if direction == SignalDirection.LONG:
+        return stop_price < entry_price
+    return stop_price > entry_price
 
 
 # ═══════════════════════════════════════════

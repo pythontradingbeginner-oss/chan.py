@@ -18,7 +18,6 @@ Ensure chan.py project is in PYTHONPATH.
 from __future__ import annotations
 
 import sys
-from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -132,7 +131,11 @@ class ChanBspStrategy(CtaTemplate):
         self._entry_grade = ""
         self._entry_direction_str = ""
         self._entry_bar = 0
+        self._entry_volume = 0
         self._trade_pnl_batch: list[float] = []
+        self._pending_entry_context = None
+        self._previous_close: float | None = None
+        self._true_ranges: list[float] = []
 
     # ============================================================
     # vnpy Lifecycle
@@ -190,6 +193,7 @@ class ChanBspStrategy(CtaTemplate):
         self._chan.trigger_load({klu.kl_type: [klu]})
 
         price = float(bar.close_price)
+        atr = self._update_atr(bar)
         timestamp = (
             bar.datetime
             if isinstance(bar.datetime, datetime)
@@ -204,7 +208,9 @@ class ChanBspStrategy(CtaTemplate):
             exit_sig = self._check_exit(bar, price, timestamp)
             if exit_sig is not None:
                 self.exit_reason = exit_sig.reason_code
-                self._close_existing(bar, exit_sig.reason_code)
+                self._close_existing(
+                    bar, exit_sig.reason_code, price=exit_sig.exit_price
+                )
                 self.put_event()
                 return
 
@@ -218,6 +224,8 @@ class ChanBspStrategy(CtaTemplate):
                 active_symbol=bar.symbol,
                 lv_idx=0,
                 extractor=self._extractor,
+                account_equity=self._account_equity(),
+                atr=atr,
             )
             if graded is not None:
                 self.last_signal_grade = graded.grade
@@ -227,13 +235,12 @@ class ChanBspStrategy(CtaTemplate):
                     self.put_event()
                     return
 
-                planned_size = int(self.fixed_size)
+                planned_signal = graded.signal
+                planned_size = abs(planned_signal.target_position)
                 if planned_size <= 0:
-                    self.write_log("Decision rejected: fixed_size_non_positive")
+                    self.write_log("Decision rejected: position_size_zero")
                     self.put_event()
                     return
-                signed_target = planned_size if graded.signal.target_position > 0 else -planned_size
-                planned_signal = replace(graded.signal, target_position=signed_target)
 
                 # Risk check
                 if self._risk is not None:
@@ -245,15 +252,20 @@ class ChanBspStrategy(CtaTemplate):
 
                 # Determine direction
                 direction_str = self._get_signal_direction(planned_signal)
-                self._entry_price = price
                 self._entry_grade = graded.grade
                 self._entry_direction_str = direction_str
                 self._entry_bar = self.bars_processed
+                self._pending_entry_context = graded
 
                 if direction_str == "long":
-                    self.buy(price, planned_size)
+                    order_ids = self.buy(price, planned_size)
                 elif direction_str == "short":
-                    self.short(price, planned_size)
+                    order_ids = self.short(price, planned_size)
+                else:
+                    order_ids = []
+
+                if not order_ids:
+                    self._pending_entry_context = None
 
                 self.write_log(
                     f"ENTRY: {graded.bsp_type} grade={graded.grade} "
@@ -275,12 +287,56 @@ class ChanBspStrategy(CtaTemplate):
 
     def on_trade(self, trade: TradeData):
         """Track PnL on close."""
+        if trade.offset == Offset.OPEN:
+            previous_volume = self._entry_volume
+            fill_volume = int(trade.volume)
+            total_volume = previous_volume + fill_volume
+            if total_volume > 0:
+                self._entry_price = (
+                    self._entry_price * previous_volume + float(trade.price) * fill_volume
+                ) / total_volume
+            self._entry_volume = total_volume
+
+            graded = self._pending_entry_context
+            event = graded.event if graded is not None else None
+            decision = graded.decision if graded is not None else None
+            if self._exit_manager is not None:
+                from signal_core.models import SignalDirection
+
+                direction = (
+                    SignalDirection.LONG
+                    if self._entry_direction_str == "long"
+                    else SignalDirection.SHORT
+                )
+                self._exit_manager.on_entry(
+                    direction=direction,
+                    entry_price=self._entry_price,
+                    bi_begin_price=event.bi_begin_price if event else None,
+                    zs_high=event.zs_high if event else None,
+                    zs_low=event.zs_low if event else None,
+                    initial_stop_price=(
+                        decision.execution_stop_price if decision else None
+                    ),
+                    invalidation_price=(
+                        decision.setup_invalidation_price if decision else None
+                    ),
+                    entry_grade=self._entry_grade,
+                )
+            self.write_log(
+                f"OPEN FILLED: @ {trade.price:.1f} volume={fill_volume}"
+            )
+            self.put_event()
+            return
+
         if self._entry_price > 0 and trade.offset == Offset.CLOSE:
             mult = 1 if self._entry_direction_str == "long" else -1
-            pnl = mult * (trade.price - self._entry_price) - 2.0  # 2pt fee
+            fill_volume = int(trade.volume)
+            fee = self._config.execution.fee_points if self._config else 1.0
+            pnl = (mult * (trade.price - self._entry_price) - fee * 2) * fill_volume
             self.total_pnl += pnl
             self.total_trades += 1
             self._trade_pnl_batch.append(pnl)
+            self._entry_volume = max(0, self._entry_volume - fill_volume)
 
             if self._risk is not None:
                 self._risk.on_fill(pnl_points=pnl, fill_time=datetime.now())
@@ -289,10 +345,14 @@ class ChanBspStrategy(CtaTemplate):
                 f"CLOSE: @ {trade.price:.1f} PnL={pnl:.0f}pts "
                 f"cumulative={self.total_pnl:.0f}pts trades={self.total_trades}"
             )
-            self._entry_price = 0.0
-            self._entry_grade = ""
-            self._entry_direction_str = ""
-            self.exit_reason = ""
+            if self._entry_volume == 0:
+                self._entry_price = 0.0
+                self._entry_grade = ""
+                self._entry_direction_str = ""
+                self._pending_entry_context = None
+                self.exit_reason = ""
+                if self._exit_manager is not None:
+                    self._exit_manager.on_close()
 
         self.put_event()
 
@@ -430,12 +490,44 @@ class ChanBspStrategy(CtaTemplate):
             chan_snapshot=None,
         )
 
-    def _close_existing(self, bar: BarData, reason: str):
+    def _close_existing(
+        self, bar: BarData, reason: str, *, price: float | None = None
+    ):
         """Close current position."""
+        order_price = float(bar.close_price) if price is None else float(price)
         if self.pos > 0:
-            self.sell(bar.close_price, abs(self.pos))
+            self.sell(order_price, abs(self.pos))
         elif self.pos < 0:
-            self.cover(bar.close_price, abs(self.pos))
+            self.cover(order_price, abs(self.pos))
+
+    def _account_equity(self) -> float | None:
+        fallback = self._config.sizing.capital if self._config else None
+        main_engine = getattr(self.cta_engine, "main_engine", None)
+        if main_engine is None:
+            return fallback
+        try:
+            oms = main_engine.get_engine("oms")
+            accounts = oms.get_all_accounts() if oms is not None else []
+            balances = [float(account.balance) for account in accounts]
+            return sum(balances) if balances else fallback
+        except Exception:
+            return fallback
+
+    def _update_atr(self, bar: BarData) -> float | None:
+        high = float(bar.high_price)
+        low = float(bar.low_price)
+        close = float(bar.close_price)
+        tr = high - low
+        if self._previous_close is not None:
+            tr = max(tr, abs(high - self._previous_close), abs(low - self._previous_close))
+        self._previous_close = close
+        self._true_ranges.append(tr)
+        period = self._config.sizing.atr_period if self._config else 20
+        if len(self._true_ranges) > period:
+            self._true_ranges = self._true_ranges[-period:]
+        if len(self._true_ranges) < period:
+            return None
+        return sum(self._true_ranges) / period
 
     def _detect_opposite_signal(self) -> bool:
         """Check if latest BSP signals a strategy reversal."""
