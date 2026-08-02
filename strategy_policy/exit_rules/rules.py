@@ -46,6 +46,9 @@ class StructureStopRule(ExitRule):
         (止损幅度减半, 即亏损限制更紧)
     """
 
+    category = "risk"
+    priority = 1
+
     def __init__(self, grade_tighten: bool = True) -> None:
         self.grade_tighten = grade_tighten
 
@@ -137,6 +140,40 @@ class StructureStopRule(ExitRule):
             return entry_price + abs(entry_price - raw_stop) * 0.5
 
 
+class StructureInvalidationExitRule(ExitRule):
+    """Close after the analysis premise is invalidated on a completed bar.
+
+    The setup invalidation level is deliberately separate from the protective
+    order stop.  A wick can execute the protective stop intrabar; structural
+    invalidation requires the completed bar close to cross the premise level.
+    """
+
+    category = "chan_structure"
+    priority = 1
+
+    @property
+    def rule_id(self) -> str:
+        return "StructureInvalidationExitRule"
+
+    def check(self, ctx: ExitContext) -> ExitSignal | None:
+        level = ctx.invalidation_price
+        if level is None:
+            return None
+        invalidated = (
+            ctx.close <= float(level)
+            if ctx.is_long
+            else ctx.close >= float(level)
+        )
+        if not invalidated:
+            return None
+        return ExitSignal(
+            rule_id=self.rule_id,
+            reason_code="structure_invalidated",
+            exit_price=ctx.close,
+            description=f"结构前提失效 @ {ctx.close:.1f}",
+        )
+
+
 # ═══════════════════════════════════════════
 # FixedStopRule — 固定点数止损
 # ═══════════════════════════════════════════
@@ -152,6 +189,9 @@ class FixedStopRule(ExitRule):
 
     注意: 点数单位与品种单位一致。RB 为例, 1 point = 1 元/吨, 180 点 ≈ 0.47%。
     """
+
+    category = "risk"
+    priority = 10
 
     def __init__(
         self,
@@ -216,6 +256,9 @@ class TrailingStopRule(ExitRule):
     (但 close-based 在 bar-level 回测中已经足够, 并且避免了未来函数风险)。
     """
 
+    category = "profit"
+    priority = 30
+
     def __init__(
         self,
         trigger_points: float = 500.0,
@@ -265,6 +308,9 @@ class TimeStopRule(ExitRule):
         例如 max_bars=192, 15m 周期 ≈ 48 小时 = 12 个交易 session
     """
 
+    category = "time"
+    priority = 50
+
     def __init__(self, max_bars: int = 192) -> None:
         if max_bars <= 0:
             raise ValueError("max_bars must be positive")
@@ -305,6 +351,9 @@ class OppositeSignalRule(ExitRule):
         此处 always 只是信号检测, 实际反手逻辑在策略层。
       only_high_grade: True 时仅 IDEAL 级别的反向信号才算
     """
+
+    category = "signal"
+    priority = 1
 
     def __init__(self, mode: str = "flat", *, only_high_grade: bool = False) -> None:
         if mode not in ("flat", "reverse"):
@@ -405,8 +454,8 @@ class ChanDivergenceExitRule(ExitRule):
       min_bars_for_compare: 每段走势至少包含多少根 bar。
     """
 
-    category = "chan_structure"
-    priority = 10
+    category = "momentum"
+    priority = 1
 
     def __init__(
         self,
@@ -481,6 +530,8 @@ class ChanDivergenceExitRule(ExitRule):
             )
 
     def _check_divergence(self, chan: ChanExitSnapshot, is_long: bool) -> bool:
+        if chan.momentum_status is not None:
+            return chan.momentum_confirmed
         areas: list[float] = chan.macd_areas  # type: ignore[assignment]
         if len(areas) < 2:
             return False

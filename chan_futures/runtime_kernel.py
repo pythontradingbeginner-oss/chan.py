@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from signal_core import SignalExtractor
 from strategy_policy.qingpai_decomposition import (
     DecompositionSnapshot,
@@ -10,7 +12,9 @@ from strategy_policy.qingpai_decomposition import (
 )
 
 from .graded_strategy import GradedChanStrategy
+from .exit_snapshot import ChanExitSnapshotBuilder
 from .multi_level import MultiLevelDecisionContext, MultiLevelDecisionEngine
+from .qingpai_momentum import QingpaiMomentumAnalyzer
 from .trade_intent import DecisionTraceRecord, TradeIntent
 
 
@@ -23,12 +27,16 @@ class RuntimeDecisionKernel:
         extractor: SignalExtractor,
         decomposer: QingpaiDecomposer | None = None,
         multi_level: MultiLevelDecisionEngine | None = None,
+        momentum: QingpaiMomentumAnalyzer | None = None,
     ) -> None:
         self.strategy = strategy
         self.extractor = extractor
         self.decomposer = decomposer
         self.multi_level = multi_level
+        self.momentum = momentum
+        self.exit_snapshot_builder = ChanExitSnapshotBuilder(momentum)
         self._decision_trace: list[DecisionTraceRecord] = []
+        self._decomposition_transition_archive: list[DecompositionTransition] = []
 
     def observe_structure(
         self,
@@ -55,7 +63,9 @@ class RuntimeDecisionKernel:
         active_symbol: str | None = None,
         lv_idx: int = 0,
         account_equity: float | None = None,
+        available_funds: float | None = None,
         atr: float | None = None,
+        price_adjustment: float = 0.0,
     ) -> TradeIntent | None:
         if self.multi_level is not None:
             self.multi_level.advance_to(timestamp)
@@ -73,7 +83,9 @@ class RuntimeDecisionKernel:
             lv_idx=lv_idx,
             extractor=self.extractor,
             account_equity=account_equity,
+            available_funds=available_funds,
             atr=atr,
+            price_adjustment=price_adjustment,
         )
         if intent is not None:
             intent = intent.with_decomposition(decomposition)
@@ -84,6 +96,16 @@ class RuntimeDecisionKernel:
                     decision_time=timestamp,
                     lv_idx=lv_idx,
                 )
+            if self.momentum is not None:
+                was_accepted = intent.accepted
+                intent = self.momentum.apply(
+                    intent,
+                    chan=chan,
+                    decision_time=timestamp,
+                    lv_idx=lv_idx,
+                )
+                if was_accepted and not intent.accepted:
+                    self.strategy.release_signal(intent.signal)
             self._decision_trace.append(intent.to_trace_record())
         return intent
 
@@ -105,8 +127,39 @@ class RuntimeDecisionKernel:
 
     @property
     def decomposition_transitions(self) -> tuple[DecompositionTransition, ...]:
-        return self.decomposer.transitions if self.decomposer is not None else ()
+        current = self.decomposer.transitions if self.decomposer is not None else ()
+        combined = (*self._decomposition_transition_archive, *current)
+        return tuple(
+            replace(transition, sequence=index)
+            for index, transition in enumerate(combined)
+        )
 
     @property
     def multi_level_audit(self) -> tuple[MultiLevelDecisionContext, ...]:
         return self.multi_level.audit if self.multi_level is not None else ()
+
+    def reset_contract_state(
+        self,
+        *,
+        start_time: object | None = None,
+        active_symbol: str | None = None,
+    ) -> None:
+        """Clear identities that cannot cross an actual-contract rollover."""
+        self.strategy.reset()
+        reset = getattr(self.extractor, "reset", None)
+        if callable(reset):
+            reset()
+        self.exit_snapshot_builder.reset()
+        if self.decomposer is not None:
+            self._decomposition_transition_archive.extend(
+                self.decomposer.transitions
+            )
+            self.decomposer = QingpaiDecomposer(level=self.decomposer.level)
+        if self.multi_level is not None:
+            self.multi_level.reset_contract_state(
+                start_time=start_time,
+                active_symbol=active_symbol,
+            )
+
+    def build_exit_snapshot(self, chan, **kwargs):
+        return self.exit_snapshot_builder.build(chan, **kwargs)

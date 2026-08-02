@@ -33,7 +33,12 @@ from .multi_level import MultiLevelDecisionContext
 from .runtime_kernel import RuntimeDecisionKernel
 from .risk import RiskConfig, RiskManager
 from .strategy import StrategySignal
-from signal_core.models import SignalDecision, SignalDirection, SignalEvent
+from signal_core.models import (
+    SignalDecision,
+    SignalDirection,
+    SignalEvent,
+    SignalState,
+)
 from strategy_policy.position import PositionContext
 from strategy_policy.qingpai_decomposition import DecompositionTransition
 from strategy_policy.exit_rules import ExitManager, ExitSignal
@@ -140,6 +145,10 @@ def run_backtest(
     *,
     limit: int | None = None,
     frame: pd.DataFrame | None = None,
+    parent_frame: pd.DataFrame | None = None,
+    child_frame: pd.DataFrame | None = None,
+    decision_start: object | None = None,
+    decision_end: object | None = None,
 ) -> BacktestResult:
     """根据 StrategyConfig 运行一次完整回测。
 
@@ -152,6 +161,16 @@ def run_backtest(
         BacktestResult: 包含 bars、fills、trades、exit_events、exit_manager。
     """
     # ── 加载数据 ──
+    if frame is None and config.production.enabled:
+        from .production import load_rb_production_frames
+
+        production_frames = load_rb_production_frames(config)
+        frame = production_frames.current
+        if parent_frame is None:
+            parent_frame = production_frames.parent
+        if child_frame is None:
+            child_frame = production_frames.child
+
     if frame is not None:
         bars = prepare_ohlc_frame(frame)
     else:
@@ -170,12 +189,20 @@ def run_backtest(
         config,
         symbol="RB",
         timeframe=timeframe_str,
-        parent_frame=_load_level_frame(config.multi_level.parent_data_path)
-        if config.multi_level.enabled
-        else None,
-        child_frame=_load_level_frame(config.multi_level.child_data_path)
-        if config.multi_level.enabled
-        else None,
+        parent_frame=(
+            prepare_ohlc_frame(parent_frame)
+            if parent_frame is not None
+            else _load_level_frame(config.multi_level.parent_data_path)
+            if config.multi_level.enabled
+            else None
+        ),
+        child_frame=(
+            prepare_ohlc_frame(child_frame)
+            if child_frame is not None
+            else _load_level_frame(config.multi_level.child_data_path)
+            if config.multi_level.enabled
+            else None
+        ),
     )
 
     # ── 出场规则 ──
@@ -190,6 +217,7 @@ def run_backtest(
     execution = SimulatedExecutionEngine(
         fee_points=config.execution.fee_points,
         slippage_points=config.execution.slippage_points,
+        price_tick=config.execution.price_tick,
     )
 
     # ── 过滤器 (DC 结构 + OBV + 成交量) ──
@@ -227,6 +255,8 @@ def run_backtest(
         execution=execution,
         config=config,
         filter_ctx=filter_ctx,
+        decision_start=decision_start,
+        decision_end=decision_end,
     )
 
     equity = pd.DataFrame(records)
@@ -265,6 +295,8 @@ def _run_loop(
     execution: SimulatedExecutionEngine,
     config: StrategyConfig,
     filter_ctx: object | None = None,
+    decision_start: object | None = None,
+    decision_end: object | None = None,
 ) -> tuple[
     list[dict],
     pd.DataFrame,
@@ -285,10 +317,15 @@ def _run_loop(
     trades: list[dict] = []
     position_context: PositionContext | None = None
     atr_values = _calculate_atr(bars, config.sizing.atr_period)
+    amplitude_values = (bars["high"] - bars["low"]).abs().rolling(
+        window=20,
+        min_periods=5,
+    ).mean()
     _bar_events: list[SignalEvent] = []
     _event_ids: set[str] = set()
     _decisions: list[SignalDecision] = []
     extractor = decision_kernel.extractor
+    previous_active_symbol: str | None = None
 
     def _close_trade(
         exit_bar: int, exit_price: float, exit_time,
@@ -331,31 +368,171 @@ def _run_loop(
         position_context = None
 
     for row_number, row in bars.iterrows():
-        klu = row_to_klu(row, kl_type=kl_type)
-        chan.trigger_load({kl_type: [klu]})
-        price = float(row["close"])
         timestamp = row["datetime"]
         if isinstance(timestamp, pd.Timestamp):
             dt_timestamp = timestamp.to_pydatetime()
         else:
             dt_timestamp = timestamp
+        active_symbol = row.get("active_symbol")
+        active_symbol_str = str(active_symbol) if pd.notna(active_symbol) else None
+        exit_signal: ExitSignal | None = None
+
+        rollover = (
+            config.production.enabled
+            and previous_active_symbol is not None
+            and active_symbol_str is not None
+            and active_symbol_str != previous_active_symbol
+        )
+        if rollover:
+            if (
+                config.production.close_on_rollover
+                and position_context is not None
+                and execution.state.position != 0
+            ):
+                previous_row = bars.iloc[row_number - 1]
+                rollover_price = _execution_ohlc(previous_row, config)[3]
+                rollover_time = previous_row["datetime"]
+                rollover_signal = StrategySignal(
+                    timestamp=rollover_time,
+                    action=(
+                        "close_long"
+                        if execution.state.position > 0
+                        else "close_short"
+                    ),
+                    target_position=0,
+                    price=rollover_price,
+                    reason="contract_rollover",
+                    bsp_type="exit",
+                    bsp_bi_idx=-1,
+                    bsp_klu_idx=-1,
+                    active_symbol=previous_active_symbol,
+                )
+                fill = execution.execute(rollover_signal)
+                executed_exit = (
+                    fill.fill_price if fill is not None else rollover_price
+                )
+                _close_trade(
+                    exit_bar=row_number - 1,
+                    exit_price=executed_exit,
+                    exit_time=rollover_time,
+                    reason="contract_rollover",
+                    rule_id="contract_rollover",
+                )
+                exit_manager.on_close()
+                exit_events.append(
+                    {
+                        "row_number": row_number - 1,
+                        "datetime": rollover_time,
+                        "rule_id": "contract_rollover",
+                        "reason_code": "contract_rollover",
+                        "trigger_price": rollover_price,
+                        "fill_price": executed_exit,
+                        "description": (
+                            f"{previous_active_symbol} -> {active_symbol_str} 换月平仓"
+                        ),
+                    }
+                )
+                if records:
+                    records[-1].update(
+                        {
+                            "position": 0,
+                            "avg_price": None,
+                            "realized_points": execution.state.realized_points,
+                            "equity_points": execution.mark_to_market(rollover_price),
+                            "exit_reason": "contract_rollover",
+                        }
+                    )
+            if config.production.reset_structure_on_rollover:
+                chan = _new_chan(config, kl_type)
+                decision_kernel.reset_contract_state(
+                    start_time=timestamp,
+                    active_symbol=active_symbol_str,
+                )
+
+        if config.production.enabled and active_symbol_str is not None:
+            extractor.contract = active_symbol_str
+
+        klu = row_to_klu(row, kl_type=kl_type)
+        chan.trigger_load({kl_type: [klu]})
+        adjusted_price = float(row["close"])
+        exec_open, exec_high, exec_low, price = _execution_ohlc(row, config)
+        price_adjustment = _price_adjustment(row, config)
         decomposition = decision_kernel.observe_structure(
             chan=chan,
             timestamp=timestamp,
             lv_idx=0,
         )
-        active_symbol = row.get("active_symbol")
-        active_symbol_str = str(active_symbol) if pd.notna(active_symbol) else None
 
-        # ── 1. 检查出场规则 ──
-        exit_signal: ExitSignal | None = None
+        equity_cash = (
+            config.sizing.capital
+            + execution.mark_to_market(price)
+            * config.execution.contract_multiplier
+        )
+        used_margin = (
+            abs(execution.state.position)
+            * price
+            * config.execution.contract_multiplier
+            * config.execution.margin_rate
+        )
+        available_funds = max(0.0, equity_cash - used_margin)
+        in_decision_window = _in_decision_window(
+            timestamp,
+            start=decision_start,
+            end=decision_end,
+        )
+
+        evaluated = None
+        if in_decision_window or execution.state.position != 0:
+            evaluated = decision_kernel.evaluate_bar(
+                chan=chan,
+                current_position=execution.state.position,
+                price=price,
+                timestamp=timestamp,
+                active_symbol=active_symbol_str,
+                lv_idx=0,
+                account_equity=equity_cash,
+                available_funds=available_funds,
+                atr=_finite_or_none(atr_values.iloc[row_number]),
+                price_adjustment=price_adjustment,
+            )
+            if evaluated is not None:
+                _decisions.append(evaluated.decision)
+                if (
+                    evaluated.event is not None
+                    and evaluated.event.event_id not in _event_ids
+                ):
+                    _bar_events.append(evaluated.event)
+                    _event_ids.add(evaluated.event.event_id)
+
+        holding_direction = (
+            "long" if execution.state.position >= 0 else "short"
+        )
+        chan_exit_snapshot = decision_kernel.build_exit_snapshot(
+            chan,
+            observed_at=timestamp,
+            direction=holding_direction,
+            open_price=exec_open,
+            high_price=exec_high,
+            low_price=exec_low,
+            close_price=price,
+            average_amplitude=_finite_or_none(amplitude_values.iloc[row_number]),
+            price_adjustment=price_adjustment,
+            lv_idx=0,
+        )
+
+        # ── 1. 按固定优先级检查出场规则 ──
         if use_exit_rules and exit_manager.is_active:
             exit_signal = exit_manager.check(
                 bar_end_time=dt_timestamp,
-                open=float(row["open"]),
-                high=float(row["high"]),
-                low=float(row["low"]),
+                open=exec_open,
+                high=exec_high,
+                low=exec_low,
                 close=price,
+                opposite_signal_triggered=_is_confirmed_opposite(
+                    evaluated,
+                    execution.state.position,
+                ),
+                chan_snapshot=chan_exit_snapshot,
             )
             if exit_signal is not None and execution.state.position != 0:
                 # 强制平仓
@@ -386,26 +563,8 @@ def _run_loop(
                     "description": exit_signal.description,
                 })
 
-        # ── 2. 检查入场信号 ──
-        if exit_signal is None:
-            evaluated = decision_kernel.evaluate_bar(
-                chan=chan,
-                current_position=execution.state.position,
-                price=price, timestamp=timestamp,
-                active_symbol=active_symbol_str,
-                lv_idx=0,
-                account_equity=(
-                    config.sizing.capital
-                    + execution.mark_to_market(price)
-                    * config.execution.contract_multiplier
-                ),
-                atr=_finite_or_none(atr_values.iloc[row_number]),
-            )
-            if evaluated is not None:
-                _decisions.append(evaluated.decision)
-                if evaluated.event is not None and evaluated.event.event_id not in _event_ids:
-                    _bar_events.append(evaluated.event)
-                    _event_ids.add(evaluated.event.event_id)
+        # ── 2. 仅在样本外决策窗口内执行新入场/反转 ──
+        if exit_signal is None and in_decision_window:
             graded = evaluated if evaluated is not None and evaluated.accepted else None
             signal = graded.signal if graded is not None else None
 
@@ -458,7 +617,10 @@ def _run_loop(
         # ── 3. 记录 bar-level 快照 ──
         records.append({
             "row_number": row_number, "datetime": timestamp,
-            "close": price, "position": execution.state.position,
+            "close": adjusted_price,
+            "execution_close": price,
+            "active_symbol": active_symbol_str,
+            "position": execution.state.position,
             "avg_price": execution.state.avg_price,
             "realized_points": execution.state.realized_points,
             "equity_points": execution.mark_to_market(price),
@@ -477,6 +639,7 @@ def _run_loop(
                 decomposition.lifecycle.value if decomposition else None
             ),
         })
+        previous_active_symbol = active_symbol_str or previous_active_symbol
 
         # ── 4. 信号提取 + 持久化 (每 bar 都提取, 供后续信号分析) ──
         if extractor is not None:
@@ -491,7 +654,7 @@ def _run_loop(
 
     if position_context is not None and execution.state.position != 0 and records:
         last_bar = bars.iloc[-1]
-        exit_price = float(last_bar["close"])
+        exit_price = _execution_ohlc(last_bar, config)[3]
         action = (
             "close_long"
             if position_context.direction == SignalDirection.LONG
@@ -607,6 +770,56 @@ def _finite_or_none(value: object) -> float | None:
     if pd.isna(value):
         return None
     return float(value)
+
+
+def _execution_ohlc(
+    row: pd.Series,
+    config: StrategyConfig,
+) -> tuple[float, float, float, float]:
+    use_raw = (
+        config.production.enabled
+        and config.production.use_raw_execution_prices
+        and all(f"raw_{column}" in row.index for column in ("open", "high", "low", "close"))
+    )
+    prefix = "raw_" if use_raw else ""
+    return tuple(
+        float(row[f"{prefix}{column}"])
+        for column in ("open", "high", "low", "close")
+    )  # type: ignore[return-value]
+
+
+def _price_adjustment(row: pd.Series, config: StrategyConfig) -> float:
+    if not (
+        config.production.enabled and config.production.use_raw_execution_prices
+    ):
+        return 0.0
+    value = row.get("adjustment_points", 0.0)
+    return 0.0 if pd.isna(value) else float(value)
+
+
+def _in_decision_window(
+    timestamp: object,
+    *,
+    start: object | None,
+    end: object | None,
+) -> bool:
+    value = pd.Timestamp(timestamp)
+    return not (
+        (start is not None and value < pd.Timestamp(start))
+        or (end is not None and value > pd.Timestamp(end))
+    )
+
+
+def _is_confirmed_opposite(intent, current_position: int) -> bool:
+    if intent is None or intent.event is None or current_position == 0:
+        return False
+    if intent.event.state != SignalState.CONFIRMED:
+        return False
+    return (
+        current_position > 0 and intent.event.direction == SignalDirection.SHORT
+    ) or (
+        current_position < 0 and intent.event.direction == SignalDirection.LONG
+    )
 
 
 # ════════════════════════════════════════════════════════════════

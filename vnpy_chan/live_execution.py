@@ -19,7 +19,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from chan_futures.execution import Fill, PositionState
+from chan_futures.execution import Fill, PositionState, adverse_fill_price
 from chan_futures.strategy import StrategySignal
 
 
@@ -66,11 +66,15 @@ class VnpyExecutionEngine:
         *,
         fee_points: float = 1.0,
         slippage_points: float = 1.0,
+        price_tick: float = 1.0,
         max_retries: int = 3,
         order_timeout_seconds: int = 30,
     ) -> None:
         self.fee_points = float(fee_points)
         self.slippage_points = float(slippage_points)
+        self.price_tick = float(price_tick)
+        if self.price_tick <= 0:
+            raise ValueError("price_tick must be positive")
         self.max_retries = max_retries
         self.order_timeout_seconds = order_timeout_seconds
 
@@ -327,9 +331,12 @@ class VnpyExecutionEngine:
             ) / abs(target_position)
 
     def _fill_price(self, signal_price: float, quantity_delta: int) -> float:
-        if quantity_delta > 0:
-            return float(signal_price) + self.slippage_points
-        return float(signal_price) - self.slippage_points
+        return adverse_fill_price(
+            signal_price,
+            quantity_delta=quantity_delta,
+            slippage_points=self.slippage_points,
+            price_tick=self.price_tick,
+        )
 
     def mark_to_market(self, price: float) -> float:
         return self.state.equity_points(float(price))

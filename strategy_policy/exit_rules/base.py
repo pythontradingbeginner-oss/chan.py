@@ -118,6 +118,13 @@ class ChanExitSnapshot:
     macd_area_current: float | None = None       # 最新段面积
     macd_area_previous: float | None = None      # 前一段面积
     macd_area_ratio: float | None = None         # 面积比 = current / previous
+    macd_peaks: list[float] | None = None
+    price_strengths: list[float] | None = None
+    price_slopes: list[float] | None = None
+    momentum_status: str | None = None
+    momentum_confirmed: bool = False
+    momentum_reason_codes: tuple[str, ...] = ()
+    histogram_state: str | None = None
 
     # ── 笔力度 ──
     adjacent_bidong: list[float] | None = None   # 相邻笔的力度 (涨跌点数)
@@ -248,7 +255,7 @@ class ExitRule(ABC):
 
     # ── V2: 规则分类 (供 ExitManager 排序) ──
     # 优先级: 数字越小越先执行
-    # 类别顺序: risk(1) > protection(10) > chan_structure(15) > profit(30) > signal(40) > time(50) > auxiliary(60)
+    # 类别顺序: risk > protection > chan_structure > profit > signal > momentum > time > auxiliary
     category: str = "protection"
     priority: int = 50
 
@@ -312,7 +319,10 @@ class ExitManager:
         *,
         strict: bool = False,
     ) -> None:
-        self._rules: list[ExitRule] = list(rules) if rules else []
+        self._rules: list[ExitRule] = sorted(
+            list(rules) if rules else [],
+            key=_rule_sort_key,
+        )
         self._strict = strict
         self._rule_error_counts: dict[str, int] = {}
         self._tracking = TrailingState()
@@ -513,6 +523,7 @@ _CATEGORY_ORDER: dict[str, int] = {
     "chan_structure": 15,
     "profit": 30,
     "signal": 40,
+    "momentum": 45,
     "time": 50,
     "auxiliary": 60,
 }

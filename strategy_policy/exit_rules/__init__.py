@@ -38,6 +38,7 @@ from .rules import (
     MACDCrossRule,
     OppositeSignalRule,
     StructureStopRule,
+    StructureInvalidationExitRule,
     TimeStopRule,
     TrailingStopRule,
 )
@@ -61,6 +62,7 @@ __all__ = [
     # 通用规则
     "FixedStopRule",
     "StructureStopRule",
+    "StructureInvalidationExitRule",
     "TrailingStopRule",
     "TimeStopRule",
     "OppositeSignalRule",

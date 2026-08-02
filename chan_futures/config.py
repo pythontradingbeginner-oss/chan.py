@@ -111,6 +111,21 @@ class ExecutionParams:
     fee_points: float = 1.0
     slippage_points: float = 1.0
     contract_multiplier: float = 10.0  # RB: 10 元/点/手
+    price_tick: float = 1.0
+    margin_rate: float = 0.13
+    max_margin_utilization: float = 0.50
+
+    def __post_init__(self) -> None:
+        if self.fee_points < 0 or self.slippage_points < 0:
+            raise ValueError("execution fees and slippage must be non-negative")
+        if self.contract_multiplier <= 0 or self.price_tick <= 0:
+            raise ValueError("contract_multiplier and price_tick must be positive")
+        if not 0 < self.margin_rate < 1:
+            raise ValueError("execution.margin_rate must be between 0 and 1")
+        if not 0 < self.max_margin_utilization <= 1:
+            raise ValueError(
+                "execution.max_margin_utilization must be between 0 and 1"
+            )
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> ExecutionParams:
@@ -200,6 +215,59 @@ class MultiLevelParams:
         return cls(**values)
 
 
+@dataclass(frozen=True, slots=True)
+class MomentumParams:
+    """Qingpai MACD area/peak/price-force confirmation settings."""
+
+    enabled: bool = False
+    require_t1_confirmation: bool = True
+    require_histogram_confirmation: bool = True
+    area_ratio_max: float = 0.90
+    area_near_ratio: float = 1.05
+    peak_ratio_max: float = 0.95
+    price_strength_ratio_max: float = 1.0
+    micro_extension_ratio: float = 0.15
+    histogram_shrink_ratio: float = 0.90
+
+    def __post_init__(self) -> None:
+        positive = {
+            "area_ratio_max": self.area_ratio_max,
+            "area_near_ratio": self.area_near_ratio,
+            "peak_ratio_max": self.peak_ratio_max,
+            "price_strength_ratio_max": self.price_strength_ratio_max,
+            "micro_extension_ratio": self.micro_extension_ratio,
+            "histogram_shrink_ratio": self.histogram_shrink_ratio,
+        }
+        if any(value <= 0 for value in positive.values()):
+            raise ValueError("momentum ratios must be positive")
+        if self.area_ratio_max > self.area_near_ratio:
+            raise ValueError("momentum.area_ratio_max must not exceed area_near_ratio")
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> MomentumParams:
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionParams:
+    """RB production replay rules shared by backtest and paper trading."""
+
+    enabled: bool = False
+    adjusted_1m_path: str = "data/processed/RB_1m_continuous_adjusted.parquet"
+    use_raw_execution_prices: bool = True
+    close_on_rollover: bool = True
+    reset_structure_on_rollover: bool = True
+    warmup_bars: int = 800
+
+    def __post_init__(self) -> None:
+        if self.warmup_bars < 0:
+            raise ValueError("production.warmup_bars must be >= 0")
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> ProductionParams:
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
 # ═══════════════════════════════════════════
 # 出场规则规格
 # ═══════════════════════════════════════════
@@ -218,6 +286,7 @@ class ExitRuleSpec:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> ExitRuleSpec:
+        d = dict(d)
         type_ = d.pop("type")
         priority = d.pop("priority", 50)
         return cls(type=type_, priority=priority, params=d)
@@ -252,6 +321,8 @@ class StrategyConfig:
     filter: FilterParams = field(default_factory=FilterParams)  # 信号过滤
     decomposition: DecompositionParams = field(default_factory=DecompositionParams)
     multi_level: MultiLevelParams = field(default_factory=MultiLevelParams)
+    momentum: MomentumParams = field(default_factory=MomentumParams)
+    production: ProductionParams = field(default_factory=ProductionParams)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> StrategyConfig:
@@ -270,4 +341,6 @@ class StrategyConfig:
             filter=FilterParams.from_dict(d.get("filter", {})),
             decomposition=DecompositionParams.from_dict(d.get("decomposition", {})),
             multi_level=MultiLevelParams.from_dict(d.get("multi_level", {})),
+            momentum=MomentumParams.from_dict(d.get("momentum", {})),
+            production=ProductionParams.from_dict(d.get("production", {})),
         )

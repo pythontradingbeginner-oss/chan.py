@@ -31,6 +31,13 @@ BAR_COLUMNS = [
     "active_symbol",
     "flags",
 ]
+OPTIONAL_PRODUCTION_COLUMNS = [
+    "raw_open",
+    "raw_high",
+    "raw_low",
+    "raw_close",
+    "adjustment_points",
+]
 AUDIT_COLUMNS = [
     "frequency_minutes",
     "trading_day",
@@ -103,22 +110,37 @@ def aggregate_continuous_1m_to_Nm(
             window_end=("calendar_datetime", "max"),
         )
     )
+    aggregations: dict[str, tuple[str, object]] = {
+        "actual_count": ("datetime", "size"),
+        "actual_unique_count": ("datetime", "nunique"),
+        "active_symbol_count": (
+            "active_symbol",
+            lambda values: values.nunique(dropna=False),
+        ),
+        "open": ("open", "first"),
+        "high": ("high", "max"),
+        "low": ("low", "min"),
+        "close": ("close", "last"),
+        "volume": ("volume", "sum"),
+        "open_interest": ("open_interest", "last"),
+        "active_symbol": ("active_symbol", "last"),
+        "flags": ("flags", _bitwise_or),
+    }
+    optional_aggregations = {
+        "raw_open": ("raw_open", "first"),
+        "raw_high": ("raw_high", "max"),
+        "raw_low": ("raw_low", "min"),
+        "raw_close": ("raw_close", "last"),
+        "adjustment_points": ("adjustment_points", "last"),
+    }
+    for column, aggregation in optional_aggregations.items():
+        if column in source.columns:
+            aggregations[column] = aggregation
+
     grouped = (
         source.sort_values(["trading_day", "session", "session_minute_index"])
         .groupby(keys, as_index=False)
-        .agg(
-            actual_count=("datetime", "size"),
-            actual_unique_count=("datetime", "nunique"),
-            active_symbol_count=("active_symbol", lambda values: values.nunique(dropna=False)),
-            open=("open", "first"),
-            high=("high", "max"),
-            low=("low", "min"),
-            close=("close", "last"),
-            volume=("volume", "sum"),
-            open_interest=("open_interest", "last"),
-            active_symbol=("active_symbol", "last"),
-            flags=("flags", _bitwise_or),
-        )
+        .agg(**aggregations)
     )
     windows = window_plan.merge(grouped, on=keys, how="left")
     for column in ["actual_count", "actual_unique_count", "active_symbol_count"]:
@@ -145,7 +167,12 @@ def aggregate_continuous_1m_to_Nm(
     complete["datetime"] = complete["window_end"]
     if original_tz is not None:
         complete["datetime"] = complete["datetime"].dt.tz_localize(original_tz)
-    result = complete[BAR_COLUMNS].sort_values("datetime", kind="mergesort").reset_index(drop=True)
+    result_columns = BAR_COLUMNS + [
+        column for column in OPTIONAL_PRODUCTION_COLUMNS if column in complete.columns
+    ]
+    result = complete[result_columns].sort_values(
+        "datetime", kind="mergesort"
+    ).reset_index(drop=True)
     audit = windows.assign(frequency_minutes=freq_minutes)[AUDIT_COLUMNS].copy()
     if original_tz is not None:
         audit["window_end"] = audit["window_end"].dt.tz_localize(original_tz)

@@ -11,6 +11,7 @@ import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
+from math import floor
 
 from signal_core.models import (
     ScoreGrade,
@@ -43,6 +44,9 @@ class DecisionPipelineConfig:
     allow_short: bool = True
     require_confirmed: bool = True
     max_abs_position: int | None = None
+    contract_multiplier: float = 1.0
+    margin_rate: float = 0.0
+    max_margin_utilization: float = 1.0
 
     def __post_init__(self) -> None:
         if isinstance(self.mode, str) and not isinstance(self.mode, DecisionMode):
@@ -51,6 +55,12 @@ class DecisionPipelineConfig:
             object.__setattr__(self, "min_grade", ScoreGrade(self.min_grade))
         if self.max_abs_position is not None and self.max_abs_position < 1:
             raise ValueError("max_abs_position must be >= 1")
+        if self.contract_multiplier <= 0:
+            raise ValueError("contract_multiplier must be positive")
+        if not 0 <= self.margin_rate < 1:
+            raise ValueError("margin_rate must be in [0, 1)")
+        if not 0 < self.max_margin_utilization <= 1:
+            raise ValueError("max_margin_utilization must be in (0, 1]")
 
 
 class DecisionPipeline:
@@ -84,6 +94,7 @@ class DecisionPipeline:
         assessment: SignalAssessment | None,
         *,
         account_equity: float | None = None,
+        available_funds: float | None = None,
         atr: float | None = None,
     ) -> SignalDecision:
         """Return an accepted or rejected decision without executing anything."""
@@ -132,6 +143,7 @@ class DecisionPipeline:
             decision,
             signal=signal,
             account_equity=account_equity,
+            available_funds=available_funds,
             atr=atr,
         )
 
@@ -141,6 +153,7 @@ class DecisionPipeline:
         *,
         signal: StrategySignal,
         account_equity: float | None,
+        available_funds: float | None,
         atr: float | None,
     ) -> SignalDecision:
         if not decision.accepted or signal.target_position == 0 or self._sizer is None:
@@ -185,16 +198,36 @@ class DecisionPipeline:
         )
         if self.config.max_abs_position is not None:
             lots = min(lots, self.config.max_abs_position)
+        margin_cap_applied = False
+        if self.config.margin_rate > 0 and available_funds is not None:
+            margin_per_lot = (
+                entry * self.config.contract_multiplier * self.config.margin_rate
+            )
+            margin_budget = max(0.0, float(available_funds)) * (
+                self.config.max_margin_utilization
+            )
+            margin_lots = floor(margin_budget / margin_per_lot)
+            margin_cap_applied = margin_lots < lots
+            lots = min(lots, margin_lots)
         if lots < 1:
+            reason = (
+                "margin_budget_below_one_lot"
+                if self.config.margin_rate > 0 and available_funds is not None
+                else "risk_budget_below_one_lot"
+            )
             return replace(
                 decision,
                 accepted=False,
-                reason_codes=decision.reason_codes + ("risk_budget_below_one_lot",),
+                reason_codes=decision.reason_codes + (reason,),
                 entry_price_hint=None,
                 position_size_hint=0.0,
             )
+        reason_codes = decision.reason_codes
+        if margin_cap_applied:
+            reason_codes = reason_codes + ("margin_cap_applied",)
         return replace(
             decision,
+            reason_codes=reason_codes,
             entry_price_hint=entry,
             position_size_hint=float(lots),
         )

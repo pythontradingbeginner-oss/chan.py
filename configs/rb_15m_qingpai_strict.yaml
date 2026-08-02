@@ -1,5 +1,5 @@
 # RB 15m Qingpai strict entry profile.
-# P2: strict double anchors, structure protection stop and equity-based sizing.
+# P6: composite momentum, production execution and point-in-time multi-level replay.
 
 code: RB_MAIN
 kl_type: K_15M
@@ -14,7 +14,7 @@ chan:
   bsp3_follow_1: false
   min_zs_cnt: 0
   bs1_peak: false
-  macd_algo: peak
+  macd_algo: full_area
   bs_type: "1,1p,2,2s,3a,3b"
   print_warning: false
 
@@ -37,6 +37,25 @@ multi_level:
   require_child_confirmation: true
   accepted_child_bsp_types: ["1", "1p", "2"]
 
+momentum:
+  enabled: true
+  require_t1_confirmation: true
+  require_histogram_confirmation: true
+  area_ratio_max: 0.90
+  area_near_ratio: 1.05
+  peak_ratio_max: 0.95
+  price_strength_ratio_max: 1.0
+  micro_extension_ratio: 0.15
+  histogram_shrink_ratio: 0.90
+
+production:
+  enabled: true
+  adjusted_1m_path: data/processed/RB_1m_continuous_adjusted.parquet
+  use_raw_execution_prices: true
+  close_on_rollover: true
+  reset_structure_on_rollover: true
+  warmup_bars: 800
+
 entry:
   policy_id: rb_15m_qingpai_strict_v1
   policy_mode: qingpai_strict
@@ -46,14 +65,23 @@ entry:
 
 exits:
   - type: StructureStopRule
-    priority: 10
+    priority: 1
     grade_tighten: false
-  - type: TrailingStopRule
-    priority: 30
-    trigger_points: 500.0
-    giveback_ratio: 0.5
+  - type: StructureInvalidationExitRule
+    priority: 1
+  - type: ChanSmallTurnExitRule
+    priority: 5
+    amplitude_multiplier: 2.0
+    require_fractal_break: true
+  - type: OppositeSignalRule
+    priority: 1
+    mode: flat
+    only_high_grade: false
+  - type: ChanDivergenceExitRule
+    priority: 1
+    require_second_level_confirm: false
   - type: TimeStopRule
-    priority: 50
+    priority: 1
     max_bars: 192
 
 risk:
@@ -71,3 +99,6 @@ execution:
   fee_points: 1.0
   slippage_points: 1.0
   contract_multiplier: 10.0
+  price_tick: 1.0
+  margin_rate: 0.13
+  max_margin_utilization: 0.50

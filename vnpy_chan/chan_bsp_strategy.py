@@ -44,6 +44,8 @@ for _cp in _CHAN_CANDIDATES:
         sys.path.insert(0, str(_cp))
 
 from chan_futures.trade_intent import DecisionTraceRecord, PendingEntry, TradeIntent
+from chan_futures.execution import adverse_fill_price
+from signal_core import SignalDirection, SignalState
 from strategy_policy.position import PositionContext
 
 # Config defaults
@@ -233,9 +235,22 @@ class ChanBspStrategy(CtaTemplate):
         # 2. Update GUI display
         self._update_gui_vars()
 
-        # 3. Check exit rules
+        # 3. Build the same current-bar intent before applying exit priority.
+        intent = self._decision_kernel.evaluate_bar(
+            chan=self._chan,
+            current_position=int(self.pos),
+            price=price,
+            timestamp=timestamp,
+            active_symbol=bar.symbol,
+            lv_idx=0,
+            account_equity=self._account_equity(),
+            available_funds=self._account_available_funds(),
+            atr=atr,
+        )
+
+        # 4. Check exit rules, including confirmed opposite BSP and chan momentum.
         if self.pos != 0 and self._exit_manager is not None:
-            exit_sig = self._check_exit(bar, price, timestamp)
+            exit_sig = self._check_exit(bar, price, timestamp, intent=intent, atr=atr)
             if exit_sig is not None:
                 self._pending_reversal = None
                 self.exit_reason = exit_sig.reason_code
@@ -245,17 +260,7 @@ class ChanBspStrategy(CtaTemplate):
                 self.put_event()
                 return
 
-        # 4. Evaluate the same TradeIntent whether flat or already positioned.
-        intent = self._decision_kernel.evaluate_bar(
-            chan=self._chan,
-            current_position=int(self.pos),
-            price=price,
-            timestamp=timestamp,
-            active_symbol=bar.symbol,
-            lv_idx=0,
-            account_equity=self._account_equity(),
-            atr=atr,
-        )
+        # 5. Consume the already-audited TradeIntent.
         if intent is not None:
             self.last_signal_grade = intent.grade
             if not intent.accepted:
@@ -531,19 +536,39 @@ class ChanBspStrategy(CtaTemplate):
     # Exit checking
     # ============================================================
 
-    def _check_exit(self, bar: BarData, price: float, timestamp):
+    def _check_exit(
+        self,
+        bar: BarData,
+        price: float,
+        timestamp,
+        *,
+        intent: TradeIntent | None,
+        atr: float | None,
+    ):
         """Run ExitManager.check() for current position."""
         if self._exit_manager is None or not self._exit_manager.is_active:
             return None
 
+        direction = "long" if self.pos > 0 else "short"
+        snapshot = self._decision_kernel.build_exit_snapshot(
+            self._chan,
+            observed_at=timestamp,
+            direction=direction,
+            open_price=float(bar.open_price),
+            high_price=float(bar.high_price),
+            low_price=float(bar.low_price),
+            close_price=price,
+            average_amplitude=atr,
+            lv_idx=0,
+        )
         return self._exit_manager.check(
             bar_end_time=timestamp,
             open=float(bar.open_price),
             high=float(bar.high_price),
             low=float(bar.low_price),
             close=price,
-            opposite_signal_triggered=False,
-            chan_snapshot=None,
+            opposite_signal_triggered=_confirmed_opposite(intent, int(self.pos)),
+            chan_snapshot=snapshot,
         )
 
     def _close_existing(
@@ -551,6 +576,7 @@ class ChanBspStrategy(CtaTemplate):
     ):
         """Close current position."""
         order_price = float(bar.close_price) if price is None else float(price)
+        order_price = self._execution_price(order_price, -int(self.pos))
         if self.pos > 0:
             self.sell(order_price, abs(self.pos))
         elif self.pos < 0:
@@ -565,16 +591,27 @@ class ChanBspStrategy(CtaTemplate):
 
         self._pending_entry = PendingEntry(intent)
         direction_str = self._get_signal_direction(signal)
+        order_price = self._execution_price(signal.price, signal.target_position)
         if direction_str == "long":
-            order_ids = self.buy(signal.price, planned_size)
+            order_ids = self.buy(order_price, planned_size)
         else:
-            order_ids = self.short(signal.price, planned_size)
+            order_ids = self.short(order_price, planned_size)
         if not order_ids:
             self._pending_entry = None
             return
         self.write_log(
             f"ENTRY: {intent.bsp_type} grade={intent.grade} "
-            f"dir={direction_str} @ {signal.price:.1f}"
+            f"dir={direction_str} @ {order_price:.1f}"
+        )
+
+    def _execution_price(self, price: float, quantity_delta: int) -> float:
+        config = getattr(self, "_config", None)
+        execution = config.execution if config is not None else None
+        return adverse_fill_price(
+            price,
+            quantity_delta=quantity_delta,
+            slippage_points=(execution.slippage_points if execution else 0.0),
+            price_tick=(execution.price_tick if execution else 1.0),
         )
 
     def _account_equity(self) -> float | None:
@@ -587,6 +624,19 @@ class ChanBspStrategy(CtaTemplate):
             accounts = oms.get_all_accounts() if oms is not None else []
             balances = [float(account.balance) for account in accounts]
             return sum(balances) if balances else fallback
+        except Exception:
+            return fallback
+
+    def _account_available_funds(self) -> float | None:
+        fallback = self._account_equity()
+        main_engine = getattr(self.cta_engine, "main_engine", None)
+        if main_engine is None:
+            return fallback
+        try:
+            oms = main_engine.get_engine("oms")
+            accounts = oms.get_all_accounts() if oms is not None else []
+            available = [float(account.available) for account in accounts]
+            return sum(available) if available else fallback
         except Exception:
             return fallback
 
@@ -654,3 +704,13 @@ class ChanBspStrategy(CtaTemplate):
         if signal.target_position < 0:
             return "short"
         raise ValueError("开仓目标仓位不能为 0")
+
+
+def _confirmed_opposite(intent: TradeIntent | None, position: int) -> bool:
+    if intent is None or intent.event is None or position == 0:
+        return False
+    if intent.event.state != SignalState.CONFIRMED:
+        return False
+    return (
+        position > 0 and intent.event.direction == SignalDirection.SHORT
+    ) or (position < 0 and intent.event.direction == SignalDirection.LONG)

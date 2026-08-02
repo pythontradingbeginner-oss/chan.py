@@ -25,6 +25,7 @@ from strategy_policy.exit_rules import (
     MACDCrossRule,
     OppositeSignalRule,
     StructureStopRule,
+    StructureInvalidationExitRule,
     TimeStopRule,
     TrailingStopRule,
 )
@@ -53,6 +54,7 @@ _TYPE_STR_TO_BSP: dict[str, BSP_TYPE] = {
 
 _RULE_REGISTRY: dict[str, type[ExitRule]] = {
     "StructureStopRule": StructureStopRule,
+    "StructureInvalidationExitRule": StructureInvalidationExitRule,
     "FixedStopRule": FixedStopRule,
     "TrailingStopRule": TrailingStopRule,
     "TimeStopRule": TimeStopRule,
@@ -124,7 +126,10 @@ def make_exit_manager(config: StrategyConfig) -> ExitManager:
 
     便捷方法：等价于 _build_exit_manager(config.exits)。
     """
-    return _build_exit_manager(config.exits)
+    return ExitManager(
+        _build_exit_rules(config.exits),
+        strict=_decision_mode(config.entry) == DecisionMode.QINGPAI_STRICT,
+    )
 
 
 def make_decision_pipeline(config: StrategyConfig) -> DecisionPipeline:
@@ -142,6 +147,9 @@ def make_decision_pipeline(config: StrategyConfig) -> DecisionPipeline:
             allow_short=allow_short,
             require_confirmed=bool(entry.get("require_confirmed_bsp", True)),
             max_abs_position=config.risk.max_abs_position,
+            contract_multiplier=config.execution.contract_multiplier,
+            margin_rate=config.execution.margin_rate,
+            max_margin_utilization=config.execution.max_margin_utilization,
         ),
         sizer=make_sizer(
             config.sizing,
@@ -183,6 +191,7 @@ def make_runtime_decision_kernel(
     """Build the canonical decision entry shared by every runtime."""
     from signal_core import SignalExtractor
     from strategy_policy.qingpai_decomposition import QingpaiDecomposer
+    from .qingpai_momentum import QingpaiMomentumAnalyzer
 
     resolved_timeframe = timeframe or _timeframe_name(config.kl_type)
     return RuntimeDecisionKernel(
@@ -205,6 +214,11 @@ def make_runtime_decision_kernel(
                 parent_frame=parent_frame,
                 child_frame=child_frame,
             )
+        ),
+        momentum=(
+            QingpaiMomentumAnalyzer(config.momentum)
+            if config.momentum.enabled
+            else None
         ),
     )
 

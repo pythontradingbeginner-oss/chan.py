@@ -94,7 +94,9 @@ class GradedChanStrategy:
         lv_idx: int = 0,
         extractor=None,   # SignalExtractor — required for grading
         account_equity: float | None = None,
+        available_funds: float | None = None,
         atr: float | None = None,
+        price_adjustment: float = 0.0,
     ) -> GradedSignal | None:
         """Preserve the old API: return only accepted decisions."""
         evaluated = self.evaluate_bar(
@@ -106,7 +108,9 @@ class GradedChanStrategy:
             lv_idx=lv_idx,
             extractor=extractor,
             account_equity=account_equity,
+            available_funds=available_funds,
             atr=atr,
+            price_adjustment=price_adjustment,
         )
         if evaluated is None or not evaluated.accepted:
             return None
@@ -123,7 +127,9 @@ class GradedChanStrategy:
         lv_idx: int = 0,
         extractor=None,
         account_equity: float | None = None,
+        available_funds: float | None = None,
         atr: float | None = None,
+        price_adjustment: float = 0.0,
     ) -> GradedSignal | None:
         """Return the full accepted/rejected decision for runtime auditing."""
         inner_sig = self._inner.on_bar(
@@ -138,7 +144,12 @@ class GradedChanStrategy:
             return None
         if extractor is None:
             return self._build_result(
-                inner_sig, None, None, account_equity=account_equity, atr=atr
+                inner_sig,
+                None,
+                None,
+                account_equity=account_equity,
+                available_funds=available_funds,
+                atr=atr,
             )
 
         return self._grade(
@@ -148,7 +159,9 @@ class GradedChanStrategy:
             timestamp,
             lv_idx,
             account_equity=account_equity,
+            available_funds=available_funds,
             atr=atr,
+            price_adjustment=price_adjustment,
         )
 
     def _grade(
@@ -160,14 +173,21 @@ class GradedChanStrategy:
         lv_idx: int,
         *,
         account_equity: float | None = None,
+        available_funds: float | None = None,
         atr: float | None = None,
+        price_adjustment: float = 0.0,
     ) -> GradedSignal:
         """Extract and assess the exact BSP backing the strategy signal."""
         try:
             bsp_list = chan[lv_idx].bs_point_lst
         except Exception:
             return self._build_result(
-                sig, None, None, account_equity=account_equity, atr=atr
+                sig,
+                None,
+                None,
+                account_equity=account_equity,
+                available_funds=available_funds,
+                atr=atr,
             )
 
         # Match the exact source identity; substring matching confuses e.g. 1 and 1p.
@@ -183,7 +203,12 @@ class GradedChanStrategy:
 
         if matched_bsp is None:
             return self._build_result(
-                sig, None, None, account_equity=account_equity, atr=atr
+                sig,
+                None,
+                None,
+                account_equity=account_equity,
+                available_funds=available_funds,
+                atr=atr,
             )
 
         # resolve bar_end_time from timestamp
@@ -200,12 +225,23 @@ class GradedChanStrategy:
                 event = get_current(matched_bsp)
         if event is None:
             return self._build_result(
-                sig, None, None, account_equity=account_equity, atr=atr
+                sig,
+                None,
+                None,
+                account_equity=account_equity,
+                available_funds=available_funds,
+                atr=atr,
             )
 
+        event = _translate_event_prices(event, price_adjustment)
         assessment = assess_event(event)
         return self._build_result(
-            sig, event, assessment, account_equity=account_equity, atr=atr
+            sig,
+            event,
+            assessment,
+            account_equity=account_equity,
+            available_funds=available_funds,
+            atr=atr,
         )
 
     def _build_result(
@@ -215,6 +251,7 @@ class GradedChanStrategy:
         assessment: SignalAssessment | None,
         *,
         account_equity: float | None = None,
+        available_funds: float | None = None,
         atr: float | None = None,
     ) -> GradedSignal:
         decision = self._decision_pipeline.evaluate(
@@ -222,6 +259,7 @@ class GradedChanStrategy:
             event,
             assessment,
             account_equity=account_equity,
+            available_funds=available_funds,
             atr=atr,
         )
         if not decision.accepted and "signal_not_confirmed" in decision.reason_codes:
@@ -237,3 +275,32 @@ class GradedChanStrategy:
             event=event,
             assessment=assessment,
         )
+
+    def release_signal(self, signal: StrategySignal) -> None:
+        self._inner.release_signal(signal)
+
+    def reset(self) -> None:
+        self._inner.reset()
+
+
+def _translate_event_prices(
+    event: SignalEvent,
+    adjustment: float,
+) -> SignalEvent:
+    """Translate adjusted structural levels into the active contract domain."""
+    adjustment = float(adjustment)
+    if adjustment == 0.0:
+        return event
+
+    def translated(value: float | None) -> float | None:
+        return None if value is None else float(value) - adjustment
+
+    return replace(
+        event,
+        reference_price=float(event.reference_price) - adjustment,
+        structural_price=translated(event.structural_price),
+        bi_begin_price=translated(event.bi_begin_price),
+        zs_high=translated(event.zs_high),
+        zs_low=translated(event.zs_low),
+        related_bsp1_price=translated(event.related_bsp1_price),
+    )

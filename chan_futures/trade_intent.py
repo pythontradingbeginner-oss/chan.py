@@ -9,6 +9,7 @@ from strategy_policy.position import PositionContext
 from strategy_policy.qingpai_decomposition import DecompositionSnapshot
 
 from .multi_level import MultiLevelDecisionContext
+from .qingpai_momentum import MomentumConfirmation
 from .strategy import StrategySignal
 
 
@@ -46,6 +47,16 @@ class DecisionTraceRecord:
     child_match_ids: tuple[str, ...] = ()
     child_window_begin: object | None = None
     child_window_end: object | None = None
+    momentum_status: str = ""
+    momentum_accepted: bool | None = None
+    momentum_reason_codes: tuple[str, ...] = ()
+    momentum_available_at: object | None = None
+    macd_area_ratio: float | None = None
+    macd_peak_ratio: float | None = None
+    price_strength_ratio: float | None = None
+    price_slope_ratio: float | None = None
+    effective_extension: float | None = None
+    histogram_state: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -79,6 +90,16 @@ class DecisionTraceRecord:
             "child_match_ids": self.child_match_ids,
             "child_window_begin": self.child_window_begin,
             "child_window_end": self.child_window_end,
+            "momentum_status": self.momentum_status,
+            "momentum_accepted": self.momentum_accepted,
+            "momentum_reason_codes": self.momentum_reason_codes,
+            "momentum_available_at": self.momentum_available_at,
+            "macd_area_ratio": self.macd_area_ratio,
+            "macd_peak_ratio": self.macd_peak_ratio,
+            "price_strength_ratio": self.price_strength_ratio,
+            "price_slope_ratio": self.price_slope_ratio,
+            "effective_extension": self.effective_extension,
+            "histogram_state": self.histogram_state,
         }
 
 
@@ -92,6 +113,7 @@ class TradeIntent:
     assessment: SignalAssessment | None = None
     decomposition: DecompositionSnapshot | None = None
     multi_level: MultiLevelDecisionContext | None = None
+    momentum: MomentumConfirmation | None = None
 
     @property
     def accepted(self) -> bool:
@@ -172,6 +194,7 @@ class TradeIntent:
             stop = self.decision.initial_stop_price
         multi_level = self.multi_level
         parent = multi_level.parent_snapshot if multi_level is not None else None
+        momentum = self.momentum
 
         return DecisionTraceRecord(
             timestamp=self.signal.timestamp,
@@ -220,6 +243,18 @@ class TradeIntent:
             ),
             child_window_begin=(multi_level.child_window_begin if multi_level else None),
             child_window_end=(multi_level.child_window_end if multi_level else None),
+            momentum_status=(momentum.status.value if momentum else ""),
+            momentum_accepted=(momentum.accepted if momentum else None),
+            momentum_reason_codes=(momentum.reason_codes if momentum else ()),
+            momentum_available_at=(momentum.available_at if momentum else None),
+            macd_area_ratio=(momentum.area_ratio if momentum else None),
+            macd_peak_ratio=(momentum.peak_ratio if momentum else None),
+            price_strength_ratio=(
+                momentum.price_strength_ratio if momentum else None
+            ),
+            price_slope_ratio=(momentum.slope_ratio if momentum else None),
+            effective_extension=(momentum.effective_extension if momentum else None),
+            histogram_state=(momentum.histogram_state if momentum else ""),
         )
 
 

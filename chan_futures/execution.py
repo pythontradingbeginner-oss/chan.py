@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import ceil, floor
 
 from .strategy import StrategySignal
 
@@ -34,9 +35,18 @@ class Fill:
 
 
 class SimulatedExecutionEngine:
-    def __init__(self, *, fee_points: float = 0.0, slippage_points: float = 0.0) -> None:
+    def __init__(
+        self,
+        *,
+        fee_points: float = 0.0,
+        slippage_points: float = 0.0,
+        price_tick: float = 1.0,
+    ) -> None:
         self.fee_points = float(fee_points)
         self.slippage_points = float(slippage_points)
+        self.price_tick = float(price_tick)
+        if self.price_tick <= 0:
+            raise ValueError("price_tick must be positive")
         self.state = PositionState()
         self.fills: list[Fill] = []
 
@@ -71,9 +81,12 @@ class SimulatedExecutionEngine:
         return self.state.equity_points(float(price))
 
     def _fill_price(self, signal_price: float, quantity_delta: int) -> float:
-        if quantity_delta > 0:
-            return float(signal_price) + self.slippage_points
-        return float(signal_price) - self.slippage_points
+        return adverse_fill_price(
+            signal_price,
+            quantity_delta=quantity_delta,
+            slippage_points=self.slippage_points,
+            price_tick=self.price_tick,
+        )
 
     def _apply_position_change(self, target_position: int, fill_price: float) -> None:
         previous_position = self.state.position
@@ -91,3 +104,22 @@ class SimulatedExecutionEngine:
 
 def _sign(value: int) -> int:
     return 1 if value > 0 else -1 if value < 0 else 0
+
+
+def adverse_fill_price(
+    signal_price: float,
+    *,
+    quantity_delta: int,
+    slippage_points: float,
+    price_tick: float,
+) -> float:
+    """Apply adverse slippage, then round against the trader to a valid tick."""
+    tick = float(price_tick)
+    if tick <= 0:
+        raise ValueError("price_tick must be positive")
+    raw = float(signal_price) + (
+        float(slippage_points) if quantity_delta > 0 else -float(slippage_points)
+    )
+    ticks = raw / tick
+    rounded = ceil(ticks - 1e-12) if quantity_delta > 0 else floor(ticks + 1e-12)
+    return float(rounded * tick)

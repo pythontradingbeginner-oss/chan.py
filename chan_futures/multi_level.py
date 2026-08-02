@@ -416,6 +416,11 @@ class MultiLevelDecisionEngine:
         parent_frame: pd.DataFrame | None = None,
         child_frame: pd.DataFrame | None = None,
     ) -> None:
+        self._code = code
+        self._chan_config = dict(chan_config)
+        self._parent_level_name = parent_level_name
+        self._child_level_name = child_level_name
+        self._require_confirmed_parent = require_confirmed_parent
         self.enabled = enabled
         self.require_parent_direction = require_parent_direction
         self.require_child_confirmation = require_child_confirmation
@@ -438,6 +443,38 @@ class MultiLevelDecisionEngine:
         self._parent_cursor = 0
         self._child_cursor = 0
         self._audit: list[MultiLevelDecisionContext] = []
+
+    def reset_contract_state(
+        self,
+        start_time: object | None = None,
+        active_symbol: str | None = None,
+    ) -> None:
+        """Reset both structural levels at an actual-contract boundary."""
+        self.parent_tracker = ParentStructureTracker(
+            level=self._parent_level_name,
+            require_confirmed=self._require_confirmed_parent,
+        )
+        self.child_tracker = SubLevelSignalTracker(level=self._child_level_name)
+        self._parent_chan = _new_level_chan(
+            self._code,
+            self.parent_kl_type,
+            CChanConfig(dict(self._chan_config)),
+        )
+        self._child_chan = _new_level_chan(
+            self._code,
+            self.child_kl_type,
+            CChanConfig(dict(self._chan_config)),
+        )
+        self._parent_cursor = _contract_cursor(
+            self._parent_frame,
+            start_time,
+            active_symbol,
+        )
+        self._child_cursor = _contract_cursor(
+            self._child_frame,
+            start_time,
+            active_symbol,
+        )
 
     def advance_to(self, decision_time: object) -> None:
         if not self.enabled:
@@ -695,6 +732,24 @@ def _level_rank(value: str) -> int:
         return ranks[value]
     except KeyError as exc:
         raise ValueError(f"unsupported multi-level K-line type: {value}") from exc
+
+
+def _contract_cursor(
+    frame: pd.DataFrame | None,
+    start_time: object | None,
+    active_symbol: str | None,
+) -> int:
+    if frame is None or start_time is None:
+        return 0
+    if active_symbol is not None and "active_symbol" in frame.columns:
+        matches = frame.index[frame["active_symbol"].astype(str) == active_symbol]
+        if len(matches):
+            return int(matches[0])
+    cutoff = market_timestamp(start_time)
+    for idx, value in enumerate(frame["datetime"]):
+        if market_timestamp(value) >= cutoff:
+            return idx
+    return len(frame)
 
 
 def market_timestamp(value: object) -> pd.Timestamp:

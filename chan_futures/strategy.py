@@ -100,6 +100,10 @@ class MinimalChanTrendStrategy:
         }
         self._consumed_keys.difference_update(matching)
 
+    def reset(self) -> None:
+        """Forget contract-local BSP identities after an RB rollover."""
+        self._consumed_keys.clear()
+
 
 def _bsp_is_on_last_confirmed_klc(kl_list, bsp) -> bool:
     if len(kl_list) < 2:

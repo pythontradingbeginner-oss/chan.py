@@ -86,6 +86,11 @@ class SignalExtractor:
         self._seen: dict[tuple[int, str, str], tuple[str, SignalState, int]] = {}
         self._current_events: dict[tuple[int, str, str], SignalEvent] = {}
 
+    def reset(self) -> None:
+        """Clear contract-local lifecycle state without changing extractor identity."""
+        self._seen.clear()
+        self._current_events.clear()
+
     def extract(
         self, bsp, *, chan, bar_end_time: datetime, lv_idx: int = 0,
     ) -> SignalEvent | None:

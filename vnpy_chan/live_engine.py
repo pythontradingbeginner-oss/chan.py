@@ -41,14 +41,14 @@ except ImportError:
 from Chan import CChan
 from ChanConfig import CChanConfig
 from Common.CEnum import AUTYPE
-from signal_core import SignalExtractor, SignalDirection
+from signal_core import SignalExtractor, SignalDirection, SignalState
 from signal_core.lifecycle import SignalJournal, SignalLifecycleTracker
 from strategy_policy.exit_rules import (
-    ChanExitSnapshot,
     ExitManager,
     ExitSignal,
 )
 from chan_futures.config import StrategyConfig
+from chan_futures.execution import adverse_fill_price
 from chan_futures.config_loader import (
     load_config,
     make_exit_manager,
@@ -282,26 +282,12 @@ class LiveTradingEngine(BaseEngine):
             lv_idx=0,
         )
 
-        # ── 1. 检查出场规则 (如果当前有持仓) ──
-        if self._position is not None and self._exit_manager is not None:
-            exit_signal = self._check_exit(
-                open=float(bar.open_price),
-                high=float(bar.high_price),
-                low=float(bar.low_price),
-                close=price,
-                bar_end_time=timestamp,
-            )
-            if exit_signal is not None:
-                self._pending_reversal = None
-                self._close_position(exit_signal.exit_price, exit_signal.reason_code, exit_signal.description)
-                return
-
-        # ── 2. 无论空仓/持仓，都消费同一个 TradeIntent ──
         current_position = 0
         if self._position is not None:
             sign = 1 if self._position.direction == SignalDirection.LONG else -1
             current_position = sign * self._position.volume
 
+        # ── 1. 先形成当根统一决策，供反向 BSP 出场使用 ──
         intent = self._decision_kernel.evaluate_bar(
             chan=chan_snap,
             current_position=current_position,
@@ -310,8 +296,27 @@ class LiveTradingEngine(BaseEngine):
             active_symbol=bar.symbol,
             lv_idx=0,
             account_equity=self._account_equity(),
+            available_funds=self._account_available_funds(),
             atr=atr,
         )
+
+        # ── 2. 按统一优先级检查出场规则 ──
+        if self._position is not None and self._exit_manager is not None:
+            exit_signal = self._check_exit(
+                open=float(bar.open_price),
+                high=float(bar.high_price),
+                low=float(bar.low_price),
+                close=price,
+                bar_end_time=timestamp,
+                intent=intent,
+                atr=atr,
+            )
+            if exit_signal is not None:
+                self._pending_reversal = None
+                self._close_position(exit_signal.exit_price, exit_signal.reason_code, exit_signal.description)
+                return
+
+        # ── 3. 消费已经审计过的同一个 TradeIntent ──
         if intent is not None:
             self._record_signal(intent, timestamp)
             if not intent.accepted:
@@ -456,12 +461,13 @@ class LiveTradingEngine(BaseEngine):
         """向 vnpy 发送开仓订单。"""
         signal = intent.signal
         direction = _vnpy_direction_from_target(signal.target_position)
+        order_price = self._execution_price(signal.price, signal.target_position)
         order_req = OrderRequest(
             symbol=self._vt_symbol.split(".")[0] if "." in self._vt_symbol else self._vt_symbol,
             exchange=getattr(self, "_exchange", None) or Exchange.SHFE,
             direction=direction,
             type=OrderType.LIMIT,
-            price=signal.price,
+            price=order_price,
             volume=abs(signal.target_position),
             offset=Offset.OPEN,
         )
@@ -475,7 +481,7 @@ class LiveTradingEngine(BaseEngine):
         self._last_accepted_grade = intent.grade
         self._last_event_id = intent.event_id
         self._log(
-            f"发送开仓单: {direction.value} @ {signal.price} "
+            f"发送开仓单: {direction.value} @ {order_price} "
             f"volume={abs(signal.target_position)} "
             f"grade={intent.grade} bsp={intent.bsp_type}"
         )
@@ -485,19 +491,37 @@ class LiveTradingEngine(BaseEngine):
         if self._position is None:
             return
         direction = Direction.SHORT if self._position.direction == SignalDirection.LONG else Direction.LONG
+        quantity_delta = (
+            -self._position.volume
+            if self._position.direction == SignalDirection.LONG
+            else self._position.volume
+        )
+        order_price = self._execution_price(price, quantity_delta)
         order_req = OrderRequest(
             symbol=self._vt_symbol.split(".")[0] if "." in self._vt_symbol else self._vt_symbol,
             exchange=getattr(self, "_exchange", None) or Exchange.SHFE,
             direction=direction,
             type=OrderType.LIMIT,
-            price=price,
+            price=order_price,
             volume=self._position.volume,
             offset=Offset.CLOSE,
         )
         vt_orderid = self._send_order(order_req)
         if vt_orderid:
             self._pending_order_ids.add(vt_orderid)
-        self._log(f"发送平仓单: {direction.value} @ {price} ({reason}) {description}")
+        self._log(
+            f"发送平仓单: {direction.value} @ {order_price} ({reason}) {description}"
+        )
+
+    def _execution_price(self, price: float, quantity_delta: int) -> float:
+        config = getattr(self, "_config", None)
+        execution = config.execution if config is not None else None
+        return adverse_fill_price(
+            price,
+            quantity_delta=quantity_delta,
+            slippage_points=(execution.slippage_points if execution else 0.0),
+            price_tick=(execution.price_tick if execution else 1.0),
+        )
 
     def _send_order(self, request: OrderRequest) -> str:
         """Resolve the gateway and track one vn.py order id atomically."""
@@ -519,12 +543,32 @@ class LiveTradingEngine(BaseEngine):
         low: float,
         close: float,
         bar_end_time: datetime,
+        intent: TradeIntent | None,
+        atr: float | None,
     ) -> ExitSignal | None:
         """使用 ExitManager 检查出场条件。"""
         if self._position is None or self._exit_manager is None:
             return None
 
-        chan_snap = self._build_chan_exit_snapshot()
+        chan = self._snapshot.current if self._snapshot else None
+        if chan is None or self._decision_kernel is None:
+            return None
+        direction = (
+            "long"
+            if self._position.direction == SignalDirection.LONG
+            else "short"
+        )
+        chan_snap = self._decision_kernel.build_exit_snapshot(
+            chan,
+            observed_at=bar_end_time,
+            direction=direction,
+            open_price=open,
+            high_price=high,
+            low_price=low,
+            close_price=close,
+            average_amplitude=atr,
+            lv_idx=0,
+        )
 
         return self._exit_manager.check(
             bar_end_time=bar_end_time,
@@ -532,27 +576,12 @@ class LiveTradingEngine(BaseEngine):
             high=high,
             low=low,
             close=close,
-            opposite_signal_triggered=False,
+            opposite_signal_triggered=_confirmed_opposite(
+                intent,
+                1 if direction == "long" else -1,
+            ),
             chan_snapshot=chan_snap,
         )
-
-    def _build_chan_exit_snapshot(self) -> ChanExitSnapshot | None:
-        """从当前 CChan 快照构建缠论结构快照。"""
-        chan = self._snapshot.current if self._snapshot else None
-        if chan is None:
-            return None
-
-        try:
-            kl_list = chan[0]
-            seg_list = kl_list.seg_list
-            last_seg = seg_list.lst[-1] if seg_list.lst else None
-            return ChanExitSnapshot(
-                available_at=datetime.now(),
-                segment_complete=last_seg is not None and last_seg.is_sure if last_seg else False,
-                segment_direction="up" if last_seg and last_seg.dir.value > 0 else "down" if last_seg else None,
-            )
-        except Exception:
-            return None
 
     # ════════════════════════════════════════
     # 信号追踪
@@ -626,6 +655,16 @@ class LiveTradingEngine(BaseEngine):
             accounts = oms.get_all_accounts() if oms is not None else []
             balances = [float(account.balance) for account in accounts]
             return sum(balances) if balances else fallback
+        except Exception:
+            return fallback
+
+    def _account_available_funds(self) -> float | None:
+        fallback = self._account_equity()
+        try:
+            oms = self.main_engine.get_engine("oms")
+            accounts = oms.get_all_accounts() if oms is not None else []
+            available = [float(account.available) for account in accounts]
+            return sum(available) if available else fallback
         except Exception:
             return fallback
 
@@ -704,6 +743,16 @@ class LiveTradingEngine(BaseEngine):
             "pending_signals": len(self._pending_signals),
             "vt_symbol": self._vt_symbol,
         }
+
+
+def _confirmed_opposite(intent: TradeIntent | None, position: int) -> bool:
+    if intent is None or intent.event is None or position == 0:
+        return False
+    if intent.event.state != SignalState.CONFIRMED:
+        return False
+    return (
+        position > 0 and intent.event.direction == SignalDirection.SHORT
+    ) or (position < 0 and intent.event.direction == SignalDirection.LONG)
 
 
 def _vnpy_direction_from_target(target_position: int) -> Direction:

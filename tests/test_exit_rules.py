@@ -481,7 +481,7 @@ class TestExitManagerV2:
             close=3770.0,
         )
         assert result is not None
-        assert result.reason_code == "chan_divergence"  # small turn only triggers(CLOSE_ALL) when fractal break, which we didn't set.
+        assert result.reason_code == "chan_small_turn"
 
     def test_chan_snapshot_passed_through(self):
         manager = ExitManager([ChanDivergenceExitRule(require_second_level_confirm=False)])
