@@ -50,6 +50,7 @@ class EntryPolicyConfig:
     # 仓位与止损
     default_stop_ratio: float         = 0.02    # 默认止损比例 2%
     default_size:       float         = 1.0
+    reject_hard_blockers: bool        = True
 
 
 class EntryPolicy:
@@ -78,7 +79,7 @@ class EntryPolicy:
             reasons.append("signal_not_confirmed")
 
         # 2. BSP 类型
-        if event.primary_bsp not in self.cfg.accepted_bsp_types:
+        if not set(event.bsp_types).intersection(self.cfg.accepted_bsp_types):
             reasons.append(f"bsp_type_rejected:_{event.primary_bsp}")
 
         # 3. 方向限制
@@ -91,8 +92,9 @@ class EntryPolicy:
             reasons.append(f"grade_below_min:_{assessment.grade.value}")
 
         # 5. 硬阻断
-        for blocker in assessment.hard_blockers:
-            reasons.append(f"hard_blocker:{blocker}")
+        if self.cfg.reject_hard_blockers:
+            for blocker in assessment.hard_blockers:
+                reasons.append(f"hard_blocker:{blocker}")
 
         # 6. 自定义条件
         for cond in self.cfg.extra_conditions:

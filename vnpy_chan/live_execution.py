@@ -48,6 +48,7 @@ class PendingOrder:
     retry_count: int = 0
     max_retries: int = 3
     timeout_seconds: int = 30  # 超时秒数
+    previous_position: int = 0
 
 
 @dataclass
@@ -79,6 +80,8 @@ class VnpyExecutionEngine:
         self._pending: dict[str, PendingOrder] = {}   # order_id → PendingOrder
         self._main_engine: Any = None                  # vnpy MainEngine (由外部注入)
         self._vt_symbol: str = ""
+        self._exchange: Any = None
+        self._gateway_name: str = ""
 
     # ════════════════════════════════════════
     # 配置
@@ -88,6 +91,10 @@ class VnpyExecutionEngine:
         """注入 vnpy 依赖 (避免构造函数强制依赖)。"""
         self._main_engine = main_engine
         self._vt_symbol = vt_symbol
+        contract = main_engine.get_contract(vt_symbol)
+        if contract is not None:
+            self._exchange = contract.exchange
+            self._gateway_name = contract.gateway_name
 
     # ════════════════════════════════════════
     # 下单 (同步发送，异步成交)
@@ -107,6 +114,8 @@ class VnpyExecutionEngine:
 
         if quantity_delta == 0:
             return None
+        if previous_position and target_position and _sign(previous_position) != _sign(target_position):
+            raise ValueError("实盘执行器不允许单单直接反手，请先平仓再开仓")
 
         # ── 计算挂单价 (含滑点) ──
         order_price = self._fill_price(signal.price, quantity_delta)
@@ -114,19 +123,22 @@ class VnpyExecutionEngine:
 
         # ── 方向 ──
         from vnpy.trader.constant import Direction, Offset, OrderType
-        if quantity_delta > 0:
-            direction = Direction.LONG
+        if previous_position == 0:
+            direction = Direction.LONG if target_position > 0 else Direction.SHORT
             offset = Offset.OPEN
-        else:
-            direction = Direction.SHORT
+        elif target_position == 0 or abs(target_position) < abs(previous_position):
+            direction = Direction.SHORT if previous_position > 0 else Direction.LONG
             offset = Offset.CLOSE
+        else:
+            direction = Direction.LONG if target_position > 0 else Direction.SHORT
+            offset = Offset.OPEN
 
         # ── 构建 OrderRequest ──
         try:
             from vnpy.trader.object import OrderRequest
             req = OrderRequest(
                 symbol=self._vt_symbol.split(".")[0] if "." in self._vt_symbol else self._vt_symbol,
-                exchange=getattr(self, "_exchange", None) or "SHFE",
+                exchange=self._exchange,
                 direction=direction,
                 type=OrderType.LIMIT,
                 price=order_price,
@@ -138,16 +150,19 @@ class VnpyExecutionEngine:
             return None
 
         # ── 发送 ──
-        vt_orderids = self._main_engine.send_order(req)
-        if not vt_orderids:
+        if self._exchange is None or not self._gateway_name:
+            return None
+        vt_orderid = self._main_engine.send_order(req, self._gateway_name)
+        if not vt_orderid:
             return None
 
-        order_id = str(vt_orderids[0])
+        order_id = str(vt_orderid)
         self._pending[order_id] = PendingOrder(
             order_id=order_id,
             signal=signal,
             price=order_price,
             volume=order_volume,
+            previous_position=previous_position,
             max_retries=self.max_retries,
             timeout_seconds=self.order_timeout_seconds,
         )
@@ -179,7 +194,6 @@ class VnpyExecutionEngine:
             po.status = OrderStatus.CANCELLED
         elif status == Status.ALLTRADED:
             po.status = OrderStatus.FILLED
-            self._pending.pop(order_id, None)
 
     def on_trade_filled(self, trade: Any) -> None:
         """vnpy EVENT_TRADE → 记录成交。
@@ -198,12 +212,21 @@ class VnpyExecutionEngine:
         signal = po.signal if po else None
 
         # ── 更新 PositionState ──
+        if signal is None:
+            return
+
+        from vnpy.trader.constant import Direction
+
         previous_position = self.state.position
-        target_position = self.state.position  # 默认不变
-
-        if signal is not None:
-            target_position = signal.target_position
-
+        signed_fill = int(round(fill_volume))
+        if trade.direction == Direction.SHORT:
+            signed_fill = -signed_fill
+        target_position = previous_position + signed_fill
+        planned_target = signal.target_position
+        if signed_fill > 0:
+            target_position = min(target_position, planned_target)
+        else:
+            target_position = max(target_position, planned_target)
         quantity_delta = target_position - previous_position
         if quantity_delta == 0:
             return
@@ -230,6 +253,7 @@ class VnpyExecutionEngine:
 
         if po:
             po.filled_volume += fill_volume
+            po.last_updated = datetime.now()
             po.avg_fill_price = (
                 (po.avg_fill_price * (po.filled_volume - fill_volume) + fill_price * fill_volume)
                 / po.filled_volume
@@ -237,6 +261,8 @@ class VnpyExecutionEngine:
             if po.filled_volume >= po.volume:
                 po.status = OrderStatus.FILLED
                 self._pending.pop(order_id, None)
+            else:
+                po.status = OrderStatus.PARTIALLY_FILLED
 
     # ════════════════════════════════════════
     # 超时 / 重试
@@ -247,9 +273,9 @@ class VnpyExecutionEngine:
         now = datetime.now()
         timed_out: list[str] = []
         for oid, po in self._pending.items():
-            if po.status != OrderStatus.PENDING:
+            if po.status not in (OrderStatus.PENDING, OrderStatus.PARTIALLY_FILLED):
                 continue
-            elapsed = (now - po.sent_at).total_seconds()
+            elapsed = (now - po.last_updated).total_seconds()
             if elapsed > po.timeout_seconds:
                 timed_out.append(oid)
                 po.status = OrderStatus.TIMED_OUT
@@ -272,15 +298,33 @@ class VnpyExecutionEngine:
     def _apply_position_change(self, target_position: int, fill_price: float) -> None:
         previous_position = self.state.position
         previous_avg = self.state.avg_price
-        if previous_position != 0 and previous_avg is not None:
-            if target_position == 0 or _sign(target_position) != _sign(previous_position):
-                self.state.realized_points += previous_position * (fill_price - previous_avg)
+        if previous_position == 0:
+            self.state.position = target_position
+            self.state.avg_price = fill_price if target_position else None
+            return
+
+        previous_sign = _sign(previous_position)
+        target_sign = _sign(target_position)
+        if previous_avg is not None and (
+            target_position == 0
+            or target_sign != previous_sign
+            or abs(target_position) < abs(previous_position)
+        ):
+            closed = min(abs(previous_position), abs(previous_position - target_position))
+            self.state.realized_points += (
+                closed * previous_sign * (fill_price - previous_avg)
+            )
 
         self.state.position = target_position
         if target_position == 0:
             self.state.avg_price = None
-        elif previous_position == 0 or _sign(target_position) != _sign(previous_position):
+        elif target_sign != previous_sign:
             self.state.avg_price = fill_price
+        elif abs(target_position) > abs(previous_position) and previous_avg is not None:
+            added = abs(target_position) - abs(previous_position)
+            self.state.avg_price = (
+                previous_avg * abs(previous_position) + fill_price * added
+            ) / abs(target_position)
 
     def _fill_price(self, signal_price: float, quantity_delta: int) -> float:
         if quantity_delta > 0:

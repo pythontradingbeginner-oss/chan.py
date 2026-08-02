@@ -1,0 +1,57 @@
+# RB 15m Qingpai strict entry profile.
+# P1 only changes the shared decision gate; structure-stop sizing is added in P2.
+
+code: RB_MAIN
+kl_type: K_15M
+data_path: data/processed/RB_15m_continuous_raw.parquet
+allow_short: true
+
+chan:
+  trigger_step: true
+  bi_strict: true
+  divergence_rate: .inf
+  bsp2_follow_1: false
+  bsp3_follow_1: false
+  min_zs_cnt: 0
+  bs1_peak: false
+  macd_algo: peak
+  bs_type: "1,1p,2,2s,3a,3b"
+  print_warning: false
+
+grading:
+  min_grade: standard
+
+entry:
+  policy_id: rb_15m_qingpai_strict_v1
+  policy_mode: qingpai_strict
+  require_confirmed_bsp: true
+  accepted_bsp_types: ["1", "1p", "2", "2s", "3a", "3b"]
+  long_only: false
+
+exits:
+  - type: FixedStopRule
+    priority: 20
+    stop_points: 180.0
+    grade_adjust: true
+  - type: TrailingStopRule
+    priority: 30
+    trigger_points: 500.0
+    giveback_ratio: 0.5
+  - type: TimeStopRule
+    priority: 50
+    max_bars: 192
+
+risk:
+  max_abs_position: 1
+  max_loss_points: 600.0
+  daily_loss_limit: null
+  max_consecutive_losses: 5
+
+sizing:
+  method: fixed
+  lots: 1
+
+execution:
+  fee_points: 1.0
+  slippage_points: 1.0
+  contract_multiplier: 10.0

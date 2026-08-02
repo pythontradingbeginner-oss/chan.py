@@ -131,6 +131,7 @@ class SignalEvent:
     features:   dict[str, Any]  # 从 CBS_Point.features + 结构计算的标量快照
     chan_version: str           # chan.py 版本标识
     data_run_id:  str           # 数据管线批次标识
+    structural_price: float | None = None  # 笔端极值，不等同于确认 K 线收盘价
 
     def to_dict(self) -> dict[str, Any]:
         """转为 JSON 友好的 dict (用于 DataFrame 或持久化)。"""
@@ -158,6 +159,7 @@ class SignalEvent:
             "features":       str(self.features),  # JSON 字符串化, 避免 DataFrame object 列
             "chan_version":   self.chan_version,
             "data_run_id":    self.data_run_id,
+            "structural_price": self.structural_price,
         }
 
 

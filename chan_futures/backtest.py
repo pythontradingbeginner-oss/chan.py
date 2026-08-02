@@ -6,7 +6,7 @@
   run_backtest(config) → BacktestResult
     └─ 每根 K 线：
        1. CChan.trigger_load(klu)
-       2. GradedChanStrategy.on_bar() → GradedSignal
+       2. GradedChanStrategy.evaluate_bar() → SignalDecision
        3. 如果有仓位：ExitManager.check(ctx) → 优先出场
        4. 如果 graded.accepted：RiskManager.approve() → execute()
        5. 统一 trade tracking
@@ -26,14 +26,14 @@ from ChanConfig import CChanConfig
 from Common.CEnum import AUTYPE, BSP_TYPE, DATA_SRC, KL_TYPE
 
 from .config import ExecutionParams, RiskParams, StrategyConfig
-from .config_loader import make_exit_manager
+from .config_loader import make_exit_manager, make_graded_strategy
 from .execution import Fill, SimulatedExecutionEngine
 from .feed import prepare_ohlc_frame, row_to_klu
-from .graded_strategy import GradedChanStrategy, GradeFilterConfig
+from .graded_strategy import GradedChanStrategy
 from .risk import RiskConfig, RiskManager
 from .strategy import StrategySignal
 from signal_core import SignalExtractor
-from signal_core.models import SignalDirection
+from signal_core.models import SignalDecision, SignalDirection, SignalEvent
 from strategy_policy.exit_rules import ExitManager, ExitSignal
 from strategy_policy.reporting import (
     StandardMetrics,
@@ -72,6 +72,7 @@ class BacktestResult:
     exit_manager: ExitManager     # 异常审计接口
     config: StrategyConfig        # 回测使用的配置 (只读)
     signal_events: list = field(default_factory=list)  # 全量 SignalEvent
+    signal_decisions: list = field(default_factory=list)  # 含 rejected 的全量决策
 
     def save(self, output_dir: Path | str) -> None:
         """保存标准化报告。"""
@@ -90,12 +91,17 @@ class BacktestResult:
                 "code": self.config.code,
                 "kl_type": self.config.kl_type,
                 "min_grade": self.config.grading.min_grade.value,
+                "policy_mode": self.config.entry.get("policy_mode", "legacy"),
                 "exit_rules": " + ".join(e.type for e in self.config.exits),
                 "fee_points": self.config.execution.fee_points,
                 "slippage_points": self.config.execution.slippage_points,
             },
             metrics=metrics,
         )
+        if self.signal_decisions:
+            pd.DataFrame([decision.to_dict() for decision in self.signal_decisions]).to_csv(
+                output_dir / "signal_decisions.csv", index=False, encoding="utf-8-sig"
+            )
 
 
 # ════════════════════════════════════════════════════════════════
@@ -133,12 +139,7 @@ def run_backtest(
     chan = _new_chan(config, kl_type)
 
     # ── 策略 (grade-filtered) ──
-    accepted_bsp = _resolve_bsp_types(config.entry.get("accepted_bsp_types"))
-    wrapper = GradedChanStrategy(GradeFilterConfig(
-        min_grade=config.grading.min_grade.value,
-        accepted_bsp_types=accepted_bsp,
-        allow_short=config.allow_short,
-    ))
+    wrapper = make_graded_strategy(config)
     timeframe_str = kl_type.name.replace("K_", "").replace("M", "m")
     extractor = SignalExtractor(symbol="RB", timeframe=timeframe_str)
 
@@ -170,7 +171,7 @@ def run_backtest(
         filter_ctx = pipeline.precompute(bars)
 
     # ── 回测循环 ──
-    records, fills_df, trades, exit_events, signal_events = _run_loop(
+    records, fills_df, trades, exit_events, signal_events, signal_decisions = _run_loop(
         bars=bars,
         chan=chan,
         kl_type=kl_type,
@@ -200,6 +201,7 @@ def run_backtest(
         exit_manager=exit_manager,
         config=config,
         signal_events=signal_events,
+        signal_decisions=signal_decisions,
     )
 
 
@@ -221,7 +223,14 @@ def _run_loop(
     execution: SimulatedExecutionEngine,
     config: StrategyConfig,
     filter_ctx: object | None = None,
-) -> tuple[list[dict], pd.DataFrame, list[dict], list[dict]]:
+) -> tuple[
+    list[dict],
+    pd.DataFrame,
+    list[dict],
+    list[dict],
+    list[SignalEvent],
+    list[SignalDecision],
+]:
     """每根 K 线的主循环。"""
 
     use_filters = filter_ctx is not None and config.filter.enabled
@@ -231,6 +240,8 @@ def _run_loop(
     trades: list[dict] = []
     current_trade: dict | None = None
     _bar_events: list[SignalEvent] = []
+    _event_ids: set[str] = set()
+    _decisions: list[SignalDecision] = []
 
     def _close_trade(
         exit_bar: int, exit_price: float, exit_time,
@@ -310,13 +321,19 @@ def _run_loop(
 
         # ── 2. 检查入场信号 ──
         if exit_signal is None:
-            graded = wrapper.on_bar(
+            evaluated = wrapper.evaluate_bar(
                 chan=chan,
                 current_position=execution.state.position,
                 price=price, timestamp=timestamp,
                 active_symbol=active_symbol_str,
                 lv_idx=0, extractor=extractor,
             )
+            if evaluated is not None:
+                _decisions.append(evaluated.decision)
+                if evaluated.event is not None and evaluated.event.event_id not in _event_ids:
+                    _bar_events.append(evaluated.event)
+                    _event_ids.add(evaluated.event.event_id)
+            graded = evaluated if evaluated is not None and evaluated.accepted else None
             signal = graded.signal if graded is not None else None
             grade_info = {"grade": graded.grade} if graded else None
 
@@ -392,10 +409,11 @@ def _run_loop(
             if bsp_list is not None:
                 for bsp in bsp_list.bsp_iter():
                     evt = extractor.extract(bsp, chan=chan_snap, bar_end_time=dt_timestamp, lv_idx=0)
-                    if evt is not None:
+                    if evt is not None and evt.event_id not in _event_ids:
                         _bar_events.append(evt)
+                        _event_ids.add(evt.event_id)
 
-    return records, pd.DataFrame(), trades, exit_events, _bar_events
+    return records, pd.DataFrame(), trades, exit_events, _bar_events, _decisions
 
 
 # ════════════════════════════════════════════════════════════════

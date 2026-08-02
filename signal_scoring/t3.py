@@ -31,7 +31,14 @@ class T3Scorer(SignalScorer):
         # ── 1. 中枢突破有效性 ──
         zs_h = event.zs_high
         zs_l = event.zs_low
-        ref = event.reference_price
+        boundary_price = (
+            event.structural_price
+            if event.structural_price is not None
+            else event.reference_price
+        )
+        components["structural_price_available"] = (
+            1.0 if event.structural_price is not None else 0.0
+        )
 
         if zs_h is None or zs_l is None:
             # 尝试从 features.zs_height 回退 (中枢高度已知但范围未知)
@@ -45,19 +52,19 @@ class T3Scorer(SignalScorer):
                 blockers.append("zs_range_unavailable")
                 components["zs_break"] = 0.0
                 score -= 0.5
-        elif ref <= 0:
+        elif boundary_price <= 0:
             blockers.append("invalid_reference_price")
             components["zs_break"] = 0.0
             score -= 0.5
         else:
             if event.direction == SignalDirection.LONG:
                 # 三买: 应在中枢上方
-                if ref <= zs_h:
+                if boundary_price <= zs_h:
                     blockers.append("not_above_zs")
                     components["zs_break"] = 0.0
                     score -= 0.5
                 else:
-                    margin = (ref - zs_h) / zs_h
+                    margin = (boundary_price - zs_h) / zs_h
                     # margin 0%~1% → 0.4, 1%~3% → 0.7, >3% → 1.0
                     if margin < 0.005:
                         components["zs_break"] = 0.3
@@ -69,12 +76,12 @@ class T3Scorer(SignalScorer):
                         components["zs_break"] = 1.0
             else:
                 # 三卖: 应在中枢下方
-                if ref >= zs_l:
+                if boundary_price >= zs_l:
                     blockers.append("not_below_zs")
                     components["zs_break"] = 0.0
                     score -= 0.5
                 else:
-                    margin = (zs_l - ref) / zs_l
+                    margin = (zs_l - boundary_price) / zs_l
                     if margin < 0.005:
                         components["zs_break"] = 0.3
                     elif margin < 0.01:

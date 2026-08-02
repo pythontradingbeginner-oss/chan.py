@@ -84,6 +84,7 @@ class SignalExtractor:
         self.data_run_id = data_run_id
         # 去重: (bi_idx, dir, primary_bsp) → (sig_key, last_state, revision)
         self._seen: dict[tuple[int, str, str], tuple[str, SignalState, int]] = {}
+        self._current_events: dict[tuple[int, str, str], SignalEvent] = {}
 
     def extract(
         self, bsp, *, chan, bar_end_time: datetime, lv_idx: int = 0,
@@ -114,6 +115,7 @@ class SignalExtractor:
         self._seen[dedup_key] = (sig_key, current_state, rev)
 
         ref_price = float(bsp.klu.close)
+        structural_price = _safe_bi_end(bsp)
         bi_begin = _safe_bi_begin(bsp)
         zs_high, zs_low = _nearest_zs_range(bsp)
         features = _extract_features(bsp)
@@ -125,7 +127,7 @@ class SignalExtractor:
         parent_id = _find_parent_event_id(bsp, chan, lv_idx, self.contract)
         seg_idx: int | None = bsp.bi.seg_idx
 
-        return SignalEvent(
+        event = SignalEvent(
             event_id=new_event_id(sig_key, rev),
             signal_key=sig_key,
             revision=rev,
@@ -149,7 +151,19 @@ class SignalExtractor:
             features=features,
             chan_version=self.chan_version,
             data_run_id=self.data_run_id,
+            structural_price=structural_price,
         )
+        self._current_events[dedup_key] = event
+        return event
+
+    def get_current(self, bsp) -> SignalEvent | None:
+        """Return the latest immutable event without changing dedup state."""
+        types = getattr(bsp, "type", None)
+        if not types:
+            return None
+        primary = _bsp_primary_type(types)
+        direction = SignalDirection.LONG if bsp.is_buy else SignalDirection.SHORT
+        return self._current_events.get((bsp.bi.idx, direction.value, primary))
 
     def mark_invalidated(
         self, event_id: str, invalidation_time: datetime,
@@ -169,7 +183,7 @@ class SignalExtractor:
         else:
             rev = dedup_match[3] + 1
             self._seen[dedup_match[0]] = (sig_key, SignalState.INVALIDATED, rev)
-        return SignalEvent(
+        event = SignalEvent(
             event_id=new_event_id(sig_key, rev),
             signal_key=sig_key,
             revision=rev,
@@ -194,6 +208,9 @@ class SignalExtractor:
             chan_version=self.chan_version,
             data_run_id=self.data_run_id,
         )
+        if dedup_match is not None:
+            self._current_events[dedup_match[0]] = event
+        return event
 
 
 # ═══════════════════════════════════════════════════════
@@ -225,6 +242,13 @@ def _determine_state(bsp) -> SignalState:
 def _safe_bi_begin(bsp) -> float | None:
     try:
         return float(bsp.bi.get_begin_val())
+    except Exception:
+        return None
+
+
+def _safe_bi_end(bsp) -> float | None:
+    try:
+        return float(bsp.bi.get_end_val())
     except Exception:
         return None
 

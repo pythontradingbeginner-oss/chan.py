@@ -85,6 +85,17 @@ class MinimalChanTrendStrategy:
             return -1
         return 0 if current_position > 0 else current_position
 
+    def release_signal(self, signal: StrategySignal) -> None:
+        """Allow a temporarily rejected BSP to be reconsidered after state change."""
+        matching = {
+            key
+            for key in self._consumed_keys
+            if key[0] == signal.bsp_bi_idx
+            and key[1] == signal.bsp_klu_idx
+            and key[2] == signal.bsp_type
+        }
+        self._consumed_keys.difference_update(matching)
+
 
 def _bsp_is_on_last_confirmed_klc(kl_list, bsp) -> bool:
     if len(kl_list) < 2:

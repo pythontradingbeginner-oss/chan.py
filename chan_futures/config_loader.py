@@ -13,6 +13,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from Common.CEnum import BSP_TYPE
+from signal_core.models import ScoreGrade
 from strategy_policy.exit_rules import (
     ChanDivergenceExitRule,
     ChanSegmentCompleteExitRule,
@@ -28,6 +30,18 @@ from strategy_policy.exit_rules import (
 )
 
 from .config import ExitRuleSpec, StrategyConfig
+from .decision_pipeline import DecisionMode, DecisionPipeline, DecisionPipelineConfig
+from .graded_strategy import GradeFilterConfig, GradedChanStrategy
+
+
+_TYPE_STR_TO_BSP: dict[str, BSP_TYPE] = {
+    "1": BSP_TYPE.T1,
+    "1p": BSP_TYPE.T1P,
+    "2": BSP_TYPE.T2,
+    "2s": BSP_TYPE.T2S,
+    "3a": BSP_TYPE.T3A,
+    "3b": BSP_TYPE.T3B,
+}
 
 
 # ═══════════════════════════════════════════
@@ -108,6 +122,74 @@ def make_exit_manager(config: StrategyConfig) -> ExitManager:
     便捷方法：等价于 _build_exit_manager(config.exits)。
     """
     return _build_exit_manager(config.exits)
+
+
+def make_decision_pipeline(config: StrategyConfig) -> DecisionPipeline:
+    """Build the single entry-decision kernel shared by every runtime."""
+    entry = config.entry
+    accepted = _accepted_bsp_values(entry.get("accepted_bsp_types"))
+    mode = _decision_mode(entry)
+    allow_short = config.allow_short and not bool(entry.get("long_only", False))
+    return DecisionPipeline(
+        DecisionPipelineConfig(
+            policy_id=str(entry.get("policy_id", "chan_entry_v1")),
+            mode=mode,
+            min_grade=ScoreGrade(config.grading.min_grade.value),
+            accepted_bsp_types=accepted,
+            allow_short=allow_short,
+            require_confirmed=bool(entry.get("require_confirmed_bsp", True)),
+        )
+    )
+
+
+def make_graded_strategy(config: StrategyConfig) -> GradedChanStrategy:
+    """Build the canonical BSP adapter around the shared decision kernel."""
+    entry = config.entry
+    accepted_values = _accepted_bsp_values(entry.get("accepted_bsp_types"))
+    accepted_types = tuple(_TYPE_STR_TO_BSP[value] for value in accepted_values)
+    allow_short = config.allow_short and not bool(entry.get("long_only", False))
+    mode = _decision_mode(entry)
+    return GradedChanStrategy(
+        GradeFilterConfig(
+            min_grade=config.grading.min_grade.value,
+            accepted_bsp_types=accepted_types,
+            allow_short=allow_short,
+            require_confirmed_bsp=bool(entry.get("require_confirmed_bsp", True)),
+            policy_mode=mode.value,
+            policy_id=str(entry.get("policy_id", "chan_entry_v1")),
+        ),
+        decision_pipeline=make_decision_pipeline(config),
+    )
+
+
+def _decision_mode(entry: dict[str, Any]) -> DecisionMode:
+    raw = entry.get("policy_mode")
+    if raw is None:
+        raw = (
+            DecisionMode.QINGPAI_STRICT.value
+            if bool(entry.get("strict_hard_blockers", False))
+            else DecisionMode.LEGACY.value
+        )
+    try:
+        return DecisionMode(str(raw))
+    except ValueError as exc:
+        available = ", ".join(mode.value for mode in DecisionMode)
+        raise ValueError(f"未知 entry.policy_mode: {raw}。可用: {available}") from exc
+
+
+def _accepted_bsp_values(raw: object) -> frozenset[str]:
+    if raw is None:
+        return frozenset({"1", "1p", "2", "3a", "3b"})
+    if isinstance(raw, (str, bytes)):
+        raise ValueError("entry.accepted_bsp_types 必须是列表，不能是字符串")
+    try:
+        values = frozenset(str(value) for value in raw)
+    except TypeError as exc:
+        raise ValueError("entry.accepted_bsp_types 必须是可迭代列表") from exc
+    unknown = values.difference(_TYPE_STR_TO_BSP)
+    if unknown:
+        raise ValueError(f"未知 BSP 类型: {', '.join(sorted(unknown))}")
+    return values
 
 
 # ═══════════════════════════════════════════

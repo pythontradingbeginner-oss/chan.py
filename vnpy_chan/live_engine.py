@@ -20,35 +20,38 @@
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 from vnpy.event import Event, EventEngine
-from vnpy.trader.constant import Direction, Interval, Offset, OrderType
+from vnpy.trader.constant import Direction, Exchange, Offset, OrderType
 from vnpy.trader.engine import BaseEngine, MainEngine
-from vnpy.trader.event import EVENT_BAR, EVENT_ORDER, EVENT_TRADE
-from vnpy.trader.object import BarData, OrderData, OrderRequest, TradeData, SubscribeRequest
+from vnpy.trader.event import EVENT_ORDER, EVENT_TRADE
+from vnpy.trader.object import BarData, OrderData, OrderRequest, TradeData
+
+try:
+    from vnpy.trader.event import EVENT_BAR
+except ImportError:
+    # vn.py core publishes ticks; bar-producing apps can publish this conventional topic.
+    EVENT_BAR = "eBar."
 
 from Chan import CChan
 from ChanConfig import CChanConfig
-from Common.CEnum import AUTYPE, KL_TYPE
-from signal_core import SignalExtractor, SignalEvent, SignalDirection
+from Common.CEnum import AUTYPE
+from signal_core import SignalExtractor, SignalDirection
 from signal_core.lifecycle import SignalJournal, SignalLifecycleTracker
-from signal_scoring import assess_event
 from strategy_policy.exit_rules import (
     ChanExitSnapshot,
-    ExitContext,
     ExitManager,
     ExitSignal,
-    SignalDirection as ExitSignalDirection,
 )
 from chan_futures.config import StrategyConfig
-from chan_futures.config_loader import load_config, make_exit_manager
+from chan_futures.config_loader import load_config, make_exit_manager, make_graded_strategy
 from chan_futures.strategy import StrategySignal
-from chan_futures.graded_strategy import GradedChanStrategy, GradeFilterConfig
+from chan_futures.graded_strategy import GradedChanStrategy
 from chan_futures.risk import RiskConfig, RiskManager
 
 from .converter import bar_to_klu, window_to_kl_type
@@ -105,8 +108,8 @@ class LiveTradingEngine(BaseEngine):
     每根 bar 的决策流程:
       1. SnapshotManager 更新 CChan
       2. 如有活动仓位 → ExitManager.check() → 出场？
-      3. 否则 → GradedChanStrategy.on_bar() → SignalExtractor → assess_event
-      4. 如果 (grade >= min_grade, 风控通过) → 发送开仓订单
+      3. 否则 → GradedChanStrategy.evaluate_bar() → SignalDecision
+      4. 如果 (decision.accepted, 风控通过) → 发送开仓订单
       5. 记录所有信号到 SignalJournal
     """
 
@@ -176,16 +179,8 @@ class LiveTradingEngine(BaseEngine):
             lv_list=[kl_type],
         )
 
-        # ── Grade-filter 策略 ──
-        from chan_futures.config import _TYPE_STR_TO_BSP
-        accepted_bsp = [_TYPE_STR_TO_BSP[t] for t in cfg.entry.get("accepted_bsp_types", ["1", "1p", "2"])
-                        if t in _TYPE_STR_TO_BSP]
-        self._wrapper = GradedChanStrategy(GradeFilterConfig(
-            min_grade=cfg.grading.min_grade.value,
-            accepted_bsp_types=accepted_bsp,
-            allow_short=cfg.allow_short,
-            require_confirmed_bsp=True,
-        ))
+        # ── 共享决策管线 ──
+        self._wrapper = make_graded_strategy(cfg)
 
         # ── SignalExtractor ──
         self._extractor = SignalExtractor(symbol="RB", timeframe="15m")
@@ -212,6 +207,7 @@ class LiveTradingEngine(BaseEngine):
         self.main_engine.write_log(
             f"[ChanLive] 策略已初始化: {cfg.code} {cfg.kl_type} "
             f"grade={cfg.grading.min_grade.value} "
+            f"policy={cfg.entry.get('policy_mode', 'legacy')} "
             f"exits={[e.type for e in cfg.exits]} "
             f"risk={cfg.risk}",
             self.engine_name,
@@ -281,7 +277,7 @@ class LiveTradingEngine(BaseEngine):
             if chan_snap is None:
                 return
 
-            graded = self._wrapper.on_bar(
+            graded = self._wrapper.evaluate_bar(
                 chan=chan_snap,
                 current_position=0,
                 price=price,
@@ -290,9 +286,15 @@ class LiveTradingEngine(BaseEngine):
                 lv_idx=0,
                 extractor=self._extractor,
             )
-            if graded is not None and graded.grade is not None:
-                sig = graded.signal
+            if graded is not None:
                 self._record_signal(graded, timestamp)
+                if not graded.accepted:
+                    self._log(
+                        "决策拒绝: " + ",".join(graded.decision.reason_codes)
+                    )
+                    return
+
+                sig = graded.signal
 
                 # 风控审批
                 if self._risk is not None:
@@ -302,7 +304,7 @@ class LiveTradingEngine(BaseEngine):
                         return
 
                 # 发送开仓订单
-                self._open_position(sig.price, graded.bsp_type, graded.grade, graded.event_id)
+                self._open_position(sig, graded.bsp_type, graded.grade, graded.event_id)
 
         # ── 3. 信号状态更新 (pending signals → confirmed/invalidated) ──
         self._update_pending_signals(timestamp)
@@ -354,22 +356,33 @@ class LiveTradingEngine(BaseEngine):
     # 交易操作
     # ════════════════════════════════════════
 
-    def _open_position(self, price: float, bsp_type: str, grade: str, event_id: str) -> None:
+    def _open_position(
+        self,
+        signal: StrategySignal,
+        bsp_type: str,
+        grade: str,
+        event_id: str,
+    ) -> None:
         """向 vnpy 发送开仓订单。"""
-        direction = Direction.LONG  # FIXME: from signal
+        direction = _vnpy_direction_from_target(signal.target_position)
         order_req = OrderRequest(
             symbol=self._vt_symbol.split(".")[0] if "." in self._vt_symbol else self._vt_symbol,
-            exchange=getattr(self, "_exchange", None) or "SHFE",
+            exchange=getattr(self, "_exchange", None) or Exchange.SHFE,
             direction=direction,
             type=OrderType.LIMIT,
-            price=price,
-            volume=1,
+            price=signal.price,
+            volume=abs(signal.target_position),
+            offset=Offset.OPEN,
         )
-        vt_orderids = self.main_engine.send_order(order_req)
-        if vt_orderids:
-            self._pending_order_ids.update(vt_orderids)
+        vt_orderid = self._send_order(order_req)
+        if vt_orderid:
+            self._pending_order_ids.add(vt_orderid)
         self._last_accepted_grade = grade
-        self._log(f"发送开仓单: {direction.value} @ {price} grade={grade} bsp={bsp_type}")
+        self._last_event_id = event_id
+        self._log(
+            f"发送开仓单: {direction.value} @ {signal.price} "
+            f"volume={abs(signal.target_position)} grade={grade} bsp={bsp_type}"
+        )
 
     def _close_position(self, price: float, reason: str, description: str) -> None:
         """向 vnpy 发送平仓订单。"""
@@ -378,17 +391,26 @@ class LiveTradingEngine(BaseEngine):
         direction = Direction.SHORT if self._position.direction == SignalDirection.LONG else Direction.LONG
         order_req = OrderRequest(
             symbol=self._vt_symbol.split(".")[0] if "." in self._vt_symbol else self._vt_symbol,
-            exchange=getattr(self, "_exchange", None) or "SHFE",
+            exchange=getattr(self, "_exchange", None) or Exchange.SHFE,
             direction=direction,
             type=OrderType.LIMIT,
             price=price,
             volume=1,
             offset=Offset.CLOSE,
         )
-        vt_orderids = self.main_engine.send_order(order_req)
-        if vt_orderids:
-            self._pending_order_ids.update(vt_orderids)
+        vt_orderid = self._send_order(order_req)
+        if vt_orderid:
+            self._pending_order_ids.add(vt_orderid)
         self._log(f"发送平仓单: {direction.value} @ {price} ({reason}) {description}")
+
+    def _send_order(self, request: OrderRequest) -> str:
+        """Resolve the gateway and track one vn.py order id atomically."""
+        contract = self.main_engine.get_contract(self._vt_symbol)
+        gateway_name = getattr(contract, "gateway_name", "") if contract else ""
+        if not gateway_name:
+            self._log(f"拒绝发单: 未找到 {self._vt_symbol} 对应的交易接口")
+            return ""
+        return self.main_engine.send_order(request, gateway_name)
 
     # ════════════════════════════════════════
     # 出场规则检查
@@ -406,7 +428,6 @@ class LiveTradingEngine(BaseEngine):
         if self._position is None or self._exit_manager is None:
             return None
 
-        exit_direction = ExitSignalDirection.LONG if self._position.direction == SignalDirection.LONG else ExitSignalDirection.SHORT
         chan_snap = self._build_chan_exit_snapshot()
 
         return self._exit_manager.check(
@@ -442,12 +463,21 @@ class LiveTradingEngine(BaseEngine):
     # ════════════════════════════════════════
 
     def _record_signal(self, graded, timestamp: datetime) -> None:
-        """记录信号到 Journal (忽略 GradedSignal 没有 SignalEvent 的情况)。"""
+        """Persist the event, assessment and accepted/rejected decision."""
         self._last_accepted_grade = graded.grade
         self._last_signal_key = getattr(graded, "signal_key", str(uuid.uuid4())[:12])
+        if self._journal is not None:
+            if graded.event is not None:
+                self._journal.write_events([graded.event])
+                if self._tracker is not None:
+                    self._tracker.add(graded.event)
+            if graded.assessment is not None:
+                self._journal.write_assessments([graded.assessment])
+            self._journal.write_decisions([graded.decision])
         self._log(
             f"信号: {graded.bsp_type} grade={graded.grade} "
-            f"score={graded.structural_score:.2f} key={self._last_signal_key}"
+            f"score={graded.structural_score:.2f} accepted={graded.accepted} "
+            f"key={self._last_signal_key}"
         )
 
     def _update_pending_signals(self, timestamp: datetime) -> None:
@@ -520,3 +550,12 @@ class LiveTradingEngine(BaseEngine):
             "pending_signals": len(self._pending_signals),
             "vt_symbol": self._vt_symbol,
         }
+
+
+def _vnpy_direction_from_target(target_position: int) -> Direction:
+    """Map the signed target position to an opening order direction."""
+    if target_position > 0:
+        return Direction.LONG
+    if target_position < 0:
+        return Direction.SHORT
+    raise ValueError("开仓目标仓位不能为 0")

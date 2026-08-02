@@ -113,3 +113,14 @@ python scripts/build_qingpai_p0_samples.py
 4. 保本止损、分批止盈和对立中枢目标位的实际增益。
 
 P0 的完成标准不是“所有交易细节永远不再变化”，而是每条定义、默认值和研究假设都有身份、依据、样本和所属阶段，后续代码不再依赖口头约定。
+
+## 10. P1 决策内核追踪
+
+P1 使用 `chan_futures.decision_pipeline.DecisionPipeline` 作为回测、CTA 和实盘的共享入口判定内核，并保留两种显式模式：
+
+- `legacy`：保持历史回测可比性，继续按 grade 准入，不启用 hard blocker 一票否决。
+- `qingpai_strict`：信号事件或评分缺失时关闭准入，要求确认状态，并执行 hard blocker 一票否决。
+
+严格配置位于 `configs/rb_15m_qingpai_strict.yaml`。无论使用哪种模式，事件与评分不匹配、BSP 身份不匹配、交易方向不匹配和 `available_at` 晚于决策时刻都属于不可关闭的安全约束。回测结果通过 `signal_decisions` 保留接受与拒绝记录，调用 `BacktestResult.save()` 时写出 `signal_decisions.csv`；实盘入口同步写入 `SignalJournal`。
+
+三买、三卖边界从 P1 起使用笔端结构极值 `SignalEvent.structural_price` 判断，确认 K 线收盘价 `reference_price` 只作为成交参考，不再替代回踩或反弹极值。P0 样本 `P0-RB15-007` 因结构极值回到 ZG 下方，在严格模式下产生 `hard_blocker:not_above_zs`。

@@ -13,8 +13,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Iterable
 
-from Common.CEnum import BSP_TYPE, KL_TYPE
+from Common.CEnum import BSP_TYPE
+from signal_core.models import SignalAssessment, SignalDecision, SignalEvent
+from signal_scoring import assess_event
 
+from .decision_pipeline import DecisionMode, DecisionPipeline, DecisionPipelineConfig
 from .strategy import MinimalChanTrendStrategy, StrategySignal
 
 
@@ -27,6 +30,8 @@ class GradeFilterConfig:
     allow_short: bool = True
     require_confirmed_bsp: bool = True
     min_grade: str = "standard"  # "ideal" | "standard" | "weak"
+    policy_mode: str = DecisionMode.LEGACY.value
+    policy_id: str = "chan_entry_v1"
 
 
 # ── graded signal (extends StrategySignal with assessment info) ─
@@ -40,6 +45,13 @@ class GradedSignal:
     structural_score: float
     event_id: str
     signal_key: str
+    decision: SignalDecision | None = None
+    event: SignalEvent | None = None
+    assessment: SignalAssessment | None = None
+
+    @property
+    def accepted(self) -> bool:
+        return self.decision.accepted if self.decision is not None else True
 
 
 # ── wrapper class ─────────────────────────────────────
@@ -56,14 +68,33 @@ class GradedChanStrategy:
             execution.execute(graded.signal)
     """
 
-    def __init__(self, config: GradeFilterConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: GradeFilterConfig | None = None,
+        *,
+        decision_pipeline: DecisionPipeline | None = None,
+    ) -> None:
         cfg = config or GradeFilterConfig()
+        accepted = tuple(cfg.accepted_bsp_types) if cfg.accepted_bsp_types is not None else None
         self._inner = MinimalChanTrendStrategy(
-            accepted_bsp_types=cfg.accepted_bsp_types,
+            accepted_bsp_types=accepted,
             allow_short=cfg.allow_short,
             require_confirmed_bsp=cfg.require_confirmed_bsp,
         )
         self.min_grade = cfg.min_grade
+        accepted_values = frozenset(
+            bsp_type.value for bsp_type in self._inner.accepted_bsp_types
+        )
+        self._decision_pipeline = decision_pipeline or DecisionPipeline(
+            DecisionPipelineConfig(
+                policy_id=cfg.policy_id,
+                mode=DecisionMode(cfg.policy_mode),
+                min_grade=cfg.min_grade,
+                accepted_bsp_types=accepted_values,
+                allow_short=cfg.allow_short,
+                require_confirmed=cfg.require_confirmed_bsp,
+            )
+        )
         # 用于生成 signal_id: (bi_idx, dir, primary_bsp) → revision
         self._signal_seq: dict[tuple[int, str, str], int] = {}
 
@@ -78,7 +109,32 @@ class GradedChanStrategy:
         lv_idx: int = 0,
         extractor=None,   # SignalExtractor — required for grading
     ) -> GradedSignal | None:
-        """Generate a signal and grade it. Returns None if below min_grade."""
+        """Preserve the old API: return only accepted decisions."""
+        evaluated = self.evaluate_bar(
+            chan=chan,
+            current_position=current_position,
+            price=price,
+            timestamp=timestamp,
+            active_symbol=active_symbol,
+            lv_idx=lv_idx,
+            extractor=extractor,
+        )
+        if evaluated is None or not evaluated.accepted:
+            return None
+        return evaluated
+
+    def evaluate_bar(
+        self,
+        *,
+        chan,
+        current_position: int,
+        price: float,
+        timestamp: object,
+        active_symbol: str | None = None,
+        lv_idx: int = 0,
+        extractor=None,
+    ) -> GradedSignal | None:
+        """Return the full accepted/rejected decision for runtime auditing."""
         inner_sig = self._inner.on_bar(
             chan=chan,
             current_position=current_position,
@@ -90,15 +146,7 @@ class GradedChanStrategy:
         if inner_sig is None:
             return None
         if extractor is None:
-            # No grader → pass through with default grade info
-            return GradedSignal(
-                signal=inner_sig,
-                bsp_type=inner_sig.bsp_type,
-                grade="standard",
-                structural_score=0.0,
-                event_id="",
-                signal_key="",
-            )
+            return self._build_result(inner_sig, None, None)
 
         return self._grade(inner_sig, chan, extractor, timestamp, lv_idx)
 
@@ -109,29 +157,26 @@ class GradedChanStrategy:
         extractor,
         timestamp,
         lv_idx: int,
-    ) -> GradedSignal | None:
-        """Extract + assess the BSP that backs this StrategySignal, filter by grade."""
+    ) -> GradedSignal:
+        """Extract and assess the exact BSP backing the strategy signal."""
         try:
             bsp_list = chan[lv_idx].bs_point_lst
         except Exception:
-            return None
+            return self._build_result(sig, None, None)
 
-        # Find the CBS_Point matching this StrategySignal's bi_idx + bsp_type
+        # Match the exact source identity; substring matching confuses e.g. 1 and 1p.
         matched_bsp = None
         for bsp in bsp_list.bsp_iter():
-            if bsp.bi.idx == sig.bsp_bi_idx and sig.bsp_type in bsp.type2str():
+            if (
+                bsp.bi.idx == sig.bsp_bi_idx
+                and bsp.klu.idx == sig.bsp_klu_idx
+                and bsp.type2str() == sig.bsp_type
+            ):
                 matched_bsp = bsp
                 break
 
         if matched_bsp is None:
-            return GradedSignal(
-                signal=sig, bsp_type=sig.bsp_type,
-                grade="standard", structural_score=0.0,
-                event_id="", signal_key="",
-            )
-
-        # Extract + assess
-        from signal_scoring import assess_event
+            return self._build_result(sig, None, None)
 
         # resolve bar_end_time from timestamp
         bar_end_time = timestamp
@@ -142,20 +187,32 @@ class GradedChanStrategy:
 
         event = extractor.extract(matched_bsp, chan=chan, bar_end_time=bar_end_time, lv_idx=lv_idx)
         if event is None:
-            return None
+            get_current = getattr(extractor, "get_current", None)
+            if callable(get_current):
+                event = get_current(matched_bsp)
+        if event is None:
+            return self._build_result(sig, None, None)
 
         assessment = assess_event(event)
+        return self._build_result(sig, event, assessment)
 
-        # Grade filter: reject below min_grade
-        grade_order = {"ideal": 3, "standard": 2, "weak": 1}
-        if grade_order.get(assessment.grade.value, 0) < grade_order.get(self.min_grade, 0):
-            return None
-
+    def _build_result(
+        self,
+        sig: StrategySignal,
+        event: SignalEvent | None,
+        assessment: SignalAssessment | None,
+    ) -> GradedSignal:
+        decision = self._decision_pipeline.evaluate(sig, event, assessment)
+        if not decision.accepted and "signal_not_confirmed" in decision.reason_codes:
+            self._inner.release_signal(sig)
         return GradedSignal(
             signal=sig,
             bsp_type=sig.bsp_type,
-            grade=assessment.grade.value,
-            structural_score=assessment.structural_score or 0.0,
-            event_id=event.event_id,
-            signal_key=event.signal_key,
+            grade=assessment.grade.value if assessment is not None else "standard",
+            structural_score=(assessment.structural_score or 0.0) if assessment is not None else 0.0,
+            event_id=event.event_id if event is not None else "",
+            signal_key=event.signal_key if event is not None else "",
+            decision=decision,
+            event=event,
+            assessment=assessment,
         )

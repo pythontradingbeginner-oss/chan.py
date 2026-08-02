@@ -151,6 +151,8 @@ class TestSignalExtractor:
         assert len(events2) == 0, (
             f"第二次提取同一数据应返回 0 个事件（已去重），实际={len(events2)}"
         )
+        first_bsp = next(chan[0].bs_point_lst.bsp_iter())
+        assert extractor.get_current(first_bsp) is not None
 
     def test_event_has_required_fields(self):
         """每个 SignalEvent 必须包含必填字段。"""

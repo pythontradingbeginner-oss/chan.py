@@ -6,7 +6,7 @@ inside a standard CtaTemplate so it appears in vnpy's strategy dropdown.
 
 Flow per N-minute bar:
   BarData -> CKLine_Unit -> CChan.trigger_load()
-  -> GradedChanStrategy.on_bar() -> grade filter -> signal
+  -> GradedChanStrategy.evaluate_bar() -> SignalDecision -> signal
   -> ExitManager.check() (if position held)
   -> RiskManager.approve()
   -> vnpy buy/sell/short/cover
@@ -18,6 +18,7 @@ Ensure chan.py project is in PYTHONPATH.
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -56,7 +57,7 @@ class ChanBspStrategy(CtaTemplate):
 
     Triggers on each N-minute bar:
       1. bar -> CKLine_Unit -> CChan.trigger_load()
-      2. GradedChanStrategy.on_bar() -> grade filter -> signal
+      2. GradedChanStrategy.evaluate_bar() -> SignalDecision -> signal
       3. If holding a position: ExitManager.check() -> exit?
       4. If no position and signal triggers: buy/short
       5. If signal reverses: sell/cover
@@ -209,7 +210,7 @@ class ChanBspStrategy(CtaTemplate):
 
         # 4. Check entry signals
         if self.pos == 0:
-            graded = self._wrapper.on_bar(
+            graded = self._wrapper.evaluate_bar(
                 chan=self._chan,
                 current_position=0,
                 price=price,
@@ -220,38 +221,39 @@ class ChanBspStrategy(CtaTemplate):
             )
             if graded is not None:
                 self.last_signal_grade = graded.grade
+                if not graded.accepted:
+                    reasons = ",".join(graded.decision.reason_codes)
+                    self.write_log(f"Decision rejected: {reasons}")
+                    self.put_event()
+                    return
+
+                planned_size = int(self.fixed_size)
+                if planned_size <= 0:
+                    self.write_log("Decision rejected: fixed_size_non_positive")
+                    self.put_event()
+                    return
+                signed_target = planned_size if graded.signal.target_position > 0 else -planned_size
+                planned_signal = replace(graded.signal, target_position=signed_target)
 
                 # Risk check
                 if self._risk is not None:
-                    from chan_futures.strategy import StrategySignal
-                    dummy_sig = StrategySignal(
-                        timestamp=timestamp,
-                        action="open_long",
-                        target_position=1,
-                        price=price,
-                        reason="chan_bsp",
-                        bsp_type=graded.bsp_type,
-                        bsp_bi_idx=0,
-                        bsp_klu_idx=0,
-                        active_symbol=bar.symbol,
-                    )
-                    decision = self._risk.approve(dummy_sig)
+                    decision = self._risk.approve(planned_signal)
                     if not decision.approved:
                         self.write_log(f"Risk rejected: {decision.reason}")
                         self.put_event()
                         return
 
                 # Determine direction
-                direction_str = self._get_signal_direction(graded)
+                direction_str = self._get_signal_direction(planned_signal)
                 self._entry_price = price
                 self._entry_grade = graded.grade
                 self._entry_direction_str = direction_str
                 self._entry_bar = self.bars_processed
 
                 if direction_str == "long":
-                    self.buy(price, self.fixed_size)
+                    self.buy(price, planned_size)
                 elif direction_str == "short":
-                    self.short(price, self.fixed_size)
+                    self.short(price, planned_size)
 
                 self.write_log(
                     f"ENTRY: {graded.bsp_type} grade={graded.grade} "
@@ -311,10 +313,10 @@ class ChanBspStrategy(CtaTemplate):
             from ChanConfig import CChanConfig
             from Common.CEnum import AUTYPE, KL_TYPE
 
-            from chan_futures.config_loader import load_config, make_exit_manager
-            from chan_futures.graded_strategy import (
-                GradeFilterConfig,
-                GradedChanStrategy,
+            from chan_futures.config_loader import (
+                load_config,
+                make_exit_manager,
+                make_graded_strategy,
             )
             from chan_futures.risk import RiskConfig, RiskManager
             from signal_core import SignalExtractor
@@ -350,21 +352,8 @@ class ChanBspStrategy(CtaTemplate):
             autype=AUTYPE.NONE,
         )
 
-        # Graded strategy
-        from chan_futures.backtest import _TYPE_STR_TO_BSP
-        accepted = [
-            _TYPE_STR_TO_BSP.get(t)
-            for t in cfg.entry.get("accepted_bsp_types", ["1", "1p", "2"])
-            if t in _TYPE_STR_TO_BSP
-        ]
-        self._wrapper = GradedChanStrategy(
-            GradeFilterConfig(
-                min_grade=cfg.grading.min_grade.value,
-                accepted_bsp_types=accepted or None,
-                allow_short=cfg.allow_short,
-                require_confirmed_bsp=True,
-            )
-        )
+        # Shared decision strategy
+        self._wrapper = make_graded_strategy(cfg)
 
         # SignalExtractor
         tf_str = kl_type.name.replace("K_", "").replace("M", "m")
@@ -488,11 +477,10 @@ class ChanBspStrategy(CtaTemplate):
         except Exception:
             pass
 
-    def _get_signal_direction(self, graded) -> str:
-        """Infer direction from GradedSignal action."""
-        sig = graded.signal
-        if "long" in sig.action:
+    def _get_signal_direction(self, signal) -> str:
+        """Infer direction from the signed target position."""
+        if signal.target_position > 0:
             return "long"
-        if "short" in sig.action:
+        if signal.target_position < 0:
             return "short"
-        return "long"
+        raise ValueError("开仓目标仓位不能为 0")
