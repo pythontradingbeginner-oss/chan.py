@@ -1,0 +1,226 @@
+{
+  "contract_id": "qingpai_rule_contract_v1",
+  "version": "1.0.0-p0",
+  "status": "provisional",
+  "scope": "RB 15m Qingpai strategy semantics outside the chan.py core algorithms",
+  "theory_source": {
+    "name": "交易_青派缠论_27讲_文本清洗.md",
+    "sha256": "5C181AE58295CB1188323232E3C0596AD7B3056BFE1C357EDA13807188E45EC8"
+  },
+  "statuses": {
+    "fixed": "Directly supported by the supplied teaching transcript and treated as a definition.",
+    "engineering_default": "A safety-oriented implementation default; configurable only when research needs it.",
+    "research_candidate": "A measurable hypothesis that must be compared on labeled samples and walk-forward data.",
+    "deferred": "Not required for P1/P2 and must be resolved before its owning phase is enabled."
+  },
+  "rules": [
+    {
+      "id": "QP-STRUCT-001",
+      "name": "中枢形成",
+      "status": "fixed",
+      "decision": "先确定进入笔或进入段；其后的连续三笔或三段必须有共同重叠区，进入结构的起点不得先被破坏。",
+      "evidence": ["transcript:427-433", "transcript:441-445"]
+    },
+    {
+      "id": "QP-STRUCT-002",
+      "name": "中枢方向",
+      "status": "fixed",
+      "decision": "中枢方向只由进入笔或进入段决定：上涨进入为偏多，下跌进入为偏空；高级别位置不得改写本中枢方向。",
+      "evidence": ["transcript:427", "transcript:437", "transcript:457"]
+    },
+    {
+      "id": "QP-STRUCT-003",
+      "name": "中枢起点",
+      "status": "fixed",
+      "decision": "中枢起点是进入笔或进入段的起始极值，不是 ZG、ZD 或中轴。",
+      "evidence": ["transcript:427-437", "transcript:469"]
+    },
+    {
+      "id": "QP-STRUCT-004",
+      "name": "中枢有效性",
+      "status": "fixed",
+      "decision": "偏多中枢跌破进入起点、偏空中枢突破进入起点后，原方向结构失效并重新分析。",
+      "evidence": ["transcript:437-439", "transcript:469", "transcript:671-675"]
+    },
+    {
+      "id": "QP-STRUCT-005",
+      "name": "类中枢",
+      "status": "fixed",
+      "decision": "类中枢只作认识，不作为严格青派策略的入场结构。",
+      "evidence": ["transcript:459-463"]
+    },
+    {
+      "id": "QP-REGIME-001",
+      "name": "走势分类",
+      "status": "fixed",
+      "decision": "走势类型分为趋势与盘整；盘整继续分为延伸、扩张和扩展。趋势要求至少两个同向且震荡区不重叠的中枢。",
+      "evidence": ["transcript:473-479"]
+    },
+    {
+      "id": "QP-REGIME-002",
+      "name": "中枢延伸",
+      "status": "fixed",
+      "decision": "标准中枢后允许连续两笔或两段不与原中枢接触；形成第二个中枢后转入扩张或扩展分类；达到九笔或九段可升级。",
+      "evidence": ["transcript:503-517", "transcript:529-539"]
+    },
+    {
+      "id": "QP-REGIME-003",
+      "name": "扩张与扩展",
+      "status": "fixed",
+      "decision": "扩张和扩展都包含两个同向中枢，但操作位置不同，状态机不得把二者或延伸静默合并成同一状态。",
+      "evidence": ["transcript:549-569", "transcript:587-605"]
+    },
+    {
+      "id": "QP-BSP-001",
+      "name": "三买三卖结构边界",
+      "status": "fixed",
+      "decision": "三买回踩必须保持在 ZG 之上，三卖反弹必须保持在 ZD 之下；重新进入中枢即不再是有效三买或三卖。",
+      "evidence": ["transcript:1270-1276", "chan.py:BuySellPoint/BSPointList.py:419-420"]
+    },
+    {
+      "id": "QP-BSP-002",
+      "name": "二买二卖双层失效位",
+      "status": "engineering_default",
+      "decision": "保存两个不同含义的价格：关联一买或一卖极值是 setup_invalidation；二买或二卖回撤极值是 execution_stop。",
+      "evidence": ["transcript:447", "transcript:573", "p0:semantic-separation"]
+    },
+    {
+      "id": "QP-BSP-003",
+      "name": "硬阻断优先于评分",
+      "status": "engineering_default",
+      "decision": "no_divergence、结构未在中枢正确一侧、缺少必要锚点等 hard_blocker 必须一票否决，不得由 STANDARD 分数抵消。",
+      "evidence": ["transcript:1380", "chan.py:signal_scoring/t1.py:38-40", "chan.py:strategy_policy/entry_policy.py:93-95"]
+    },
+    {
+      "id": "QP-MACD-001",
+      "name": "结构优先",
+      "status": "fixed",
+      "decision": "MACD 只辅助判断力度，不替代中枢方向、走势分类和价格结构。",
+      "evidence": ["transcript:621-623", "transcript:972-984", "transcript:1376-1380"]
+    },
+    {
+      "id": "QP-MACD-002",
+      "name": "面积与峰值",
+      "status": "fixed",
+      "decision": "背驰比较以同方向柱体绝对面积为主，面积接近时再比较柱体高度；不同颜色不作代数抵消。",
+      "evidence": ["transcript:785-813", "transcript:964-970", "chan.py:Bi/Bi.py:160-189"]
+    },
+    {
+      "id": "QP-MACD-003",
+      "name": "价格力度裁决",
+      "status": "research_candidate",
+      "decision": "默认以有效推进距离为主、单位 K 线斜率为辅衡量价格力度；微创新高或新低且 MACD 面积显著缩小仍属于背驰候选。",
+      "evidence": ["transcript:980-986", "transcript:1214-1220", "p0:metric-default"]
+    },
+    {
+      "id": "QP-MACD-004",
+      "name": "柱体缩短信号生命周期",
+      "status": "engineering_default",
+      "decision": "一根已收盘柱体明显缩短产生 candidate；第二根已收盘柱继续缩短或发生颜色确认后进入 confirmed。",
+      "evidence": ["transcript:1082-1098", "transcript:1344-1356", "p0:lifecycle-default"]
+    },
+    {
+      "id": "QP-RISK-001",
+      "name": "先止损后仓位",
+      "status": "fixed",
+      "decision": "没有清晰结构止损的信号不交易；止损越宽，仓位越小。",
+      "evidence": ["transcript:573-575", "transcript:884-888", "transcript:1394-1396"]
+    },
+    {
+      "id": "QP-RISK-002",
+      "name": "仓位风险基数",
+      "status": "engineering_default",
+      "decision": "单笔风险预算以决策时账户总权益计算；可用资金、保证金和 max_abs_position 只作为最终可执行手数上限。",
+      "evidence": ["p0:futures-risk-default"]
+    },
+    {
+      "id": "QP-RISK-003",
+      "name": "不足一手拒绝",
+      "status": "engineering_default",
+      "decision": "结构止损无效、方向错误或风险预算不足一手时返回零手并拒绝交易，不得强制回退到一手。",
+      "evidence": ["transcript:884-888", "p0:futures-risk-default"]
+    },
+    {
+      "id": "QP-RISK-004",
+      "name": "信号确认与保护止损分离",
+      "status": "engineering_default",
+      "decision": "入场信号只使用已收盘 K 线；保护止损按盘中触及执行，跳空穿越止损时按下一可成交价格加滑点成交。",
+      "evidence": ["transcript:437-439", "transcript:1374-1382", "p0:execution-safety-default"]
+    },
+    {
+      "id": "QP-LEVEL-001",
+      "name": "区间套时间诚实性",
+      "status": "engineering_default",
+      "decision": "跨级别确认必须按时间区间和 available_at 对齐，禁止直接比较各级别独立编号的 K 线 idx。",
+      "evidence": ["transcript:755-783", "transcript:1430-1434", "chan.py:chan_futures/interval_filter.py:108-135"]
+    },
+    {
+      "id": "QP-LEVEL-002",
+      "name": "父级别冲突",
+      "status": "deferred",
+      "decision": "严格配置暂定为父级别方向冲突时拒绝逆向开仓；是否允许减仓试错须在 P5 独立回测。",
+      "evidence": ["transcript:1058-1066", "p0:strict-profile-default"]
+    },
+    {
+      "id": "QP-DECOMP-001",
+      "name": "同级别分解",
+      "status": "fixed",
+      "decision": "同级别分解以确认的笔、中枢和结构转折持续分解，不采用固定 N 笔切割；交易使用最合理而非任意可行的分解。",
+      "evidence": ["transcript:815-830", "transcript:1394-1418", "transcript:1440-1448"]
+    },
+    {
+      "id": "QP-DECOMP-002",
+      "name": "状态修订边界",
+      "status": "engineering_default",
+      "decision": "只允许重算尚未关闭的当前走势状态；已输出的历史决策保持不可变，通过 revision 记录新认识。",
+      "evidence": ["p0:event-sourcing-default"]
+    },
+    {
+      "id": "QP-EXIT-001",
+      "name": "出场优先级",
+      "status": "engineering_default",
+      "decision": "保护止损或跳空止损优先，其次是结构失效、对立确认买卖点、动量预警；保本移动和分批止盈默认关闭。",
+      "evidence": ["transcript:437-439", "transcript:673-675", "transcript:1374-1382", "p0:exit-priority-default"]
+    },
+    {
+      "id": "QP-RB-001",
+      "name": "RB 主力换月",
+      "status": "engineering_default",
+      "decision": "研究结构使用调整后的连续序列；真实执行使用具体合约。P1-P6 第一版换月平旧仓并重置结构，不继承原始价差形成的笔和中枢。",
+      "evidence": ["p0:rb-rollover-default"]
+    },
+    {
+      "id": "QP-RB-002",
+      "name": "RB 隔夜跳空",
+      "status": "engineering_default",
+      "decision": "隔夜开盘越过保护止损时按第一可成交价格退出，不等待一至三根 K 线观察。",
+      "evidence": ["p0:execution-safety-default"]
+    }
+  ],
+  "open_decisions": [
+    {
+      "id": "OPEN-001",
+      "owner_phase": "P4",
+      "question": "主动结构与被动支撑的完整枚举及切换条件",
+      "default_until_resolved": "不把仅有被动支撑的形态升级为严格入场"
+    },
+    {
+      "id": "OPEN-002",
+      "owner_phase": "P4",
+      "question": "扩张、扩展发生时当前未关闭走势的最优重分解规则",
+      "default_until_resolved": "只修订当前开放状态，不回写历史决策"
+    },
+    {
+      "id": "OPEN-003",
+      "owner_phase": "P5",
+      "question": "父级别冲突和缺少次级别确认时，拒绝与减仓哪种更优",
+      "default_until_resolved": "qingpai_strict 配置拒绝"
+    },
+    {
+      "id": "OPEN-004",
+      "owner_phase": "P6",
+      "question": "保本止损、分批止盈和对立中枢目标位是否增加净收益",
+      "default_until_resolved": "关闭"
+    }
+  ]
+}
