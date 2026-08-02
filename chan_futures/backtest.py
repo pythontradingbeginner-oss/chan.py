@@ -29,6 +29,7 @@ from .config import ExecutionParams, RiskParams, StrategyConfig
 from .config_loader import make_exit_manager, make_runtime_decision_kernel
 from .execution import Fill, SimulatedExecutionEngine
 from .feed import prepare_ohlc_frame, row_to_klu
+from .multi_level import MultiLevelDecisionContext
 from .runtime_kernel import RuntimeDecisionKernel
 from .risk import RiskConfig, RiskManager
 from .strategy import StrategySignal
@@ -77,6 +78,7 @@ class BacktestResult:
     signal_decisions: list = field(default_factory=list)  # 含 rejected 的全量决策
     decision_trace: list[DecisionTraceRecord] = field(default_factory=list)
     decomposition_transitions: list[DecompositionTransition] = field(default_factory=list)
+    multi_level_audit: list[MultiLevelDecisionContext] = field(default_factory=list)
 
     def save(self, output_dir: Path | str) -> None:
         """保存标准化报告。"""
@@ -115,6 +117,14 @@ class BacktestResult:
                 [transition.to_dict() for transition in self.decomposition_transitions]
             ).to_csv(
                 output_dir / "decomposition_transitions.csv",
+                index=False,
+                encoding="utf-8-sig",
+            )
+        if self.multi_level_audit:
+            pd.DataFrame(
+                [context.to_dict() for context in self.multi_level_audit]
+            ).to_csv(
+                output_dir / "multi_level_decisions.csv",
                 index=False,
                 encoding="utf-8-sig",
             )
@@ -160,6 +170,12 @@ def run_backtest(
         config,
         symbol="RB",
         timeframe=timeframe_str,
+        parent_frame=_load_level_frame(config.multi_level.parent_data_path)
+        if config.multi_level.enabled
+        else None,
+        child_frame=_load_level_frame(config.multi_level.child_data_path)
+        if config.multi_level.enabled
+        else None,
     )
 
     # ── 出场规则 ──
@@ -199,6 +215,7 @@ def run_backtest(
         signal_decisions,
         decision_trace,
         decomposition_transitions,
+        multi_level_audit,
     ) = _run_loop(
         bars=bars,
         chan=chan,
@@ -227,6 +244,7 @@ def run_backtest(
         signal_decisions=signal_decisions,
         decision_trace=decision_trace,
         decomposition_transitions=decomposition_transitions,
+        multi_level_audit=multi_level_audit,
     )
 
 
@@ -256,6 +274,7 @@ def _run_loop(
     list[SignalDecision],
     list[DecisionTraceRecord],
     list[DecompositionTransition],
+    list[MultiLevelDecisionContext],
 ]:
     """每根 K 线的主循环。"""
 
@@ -518,6 +537,7 @@ def _run_loop(
         _decisions,
         list(decision_kernel.decision_trace),
         list(decision_kernel.decomposition_transitions),
+        list(decision_kernel.multi_level_audit),
     )
 
 
@@ -538,6 +558,12 @@ def _new_chan(config: StrategyConfig, kl_type: KL_TYPE) -> CChan:
         config=CChanConfig(chan_cfg),
         autype=AUTYPE.NONE,
     )
+
+
+def _load_level_frame(path: str | None) -> pd.DataFrame | None:
+    if not path:
+        return None
+    return prepare_ohlc_frame(pd.read_parquet(path))
 
 
 def _resolve_kl_type(kl_type_str: str) -> KL_TYPE:

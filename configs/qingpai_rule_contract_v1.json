@@ -152,14 +152,14 @@
       "name": "区间套时间诚实性",
       "status": "engineering_default",
       "decision": "跨级别确认必须按时间区间和 available_at 对齐，禁止直接比较各级别独立编号的 K 线 idx。",
-      "evidence": ["transcript:755-783", "transcript:1430-1434", "chan.py:chan_futures/interval_filter.py:108-135"]
+      "evidence": ["transcript:755-783", "transcript:1430-1434", "chan.py:chan_futures/multi_level.py", "p5:point-in-time-rb-replay"]
     },
     {
       "id": "QP-LEVEL-002",
       "name": "父级别冲突",
       "status": "deferred",
-      "decision": "严格配置暂定为父级别方向冲突时拒绝逆向开仓；是否允许减仓试错须在 P5 独立回测。",
-      "evidence": ["transcript:1058-1066", "p0:strict-profile-default"]
+      "decision": "严格执行固定为父级别方向冲突或父级已确认结构缺失时拒绝逆向开仓；减仓试错不进入严格执行链，是否有研究收益继续单列对照。",
+      "evidence": ["transcript:1058-1066", "p0:strict-profile-default", "p5:parent-direction-gate"]
     },
     {
       "id": "QP-DECOMP-001",
@@ -221,8 +221,8 @@
     {
       "id": "OPEN-003",
       "owner_phase": "P5",
-      "question": "父级别冲突和缺少次级别确认时，拒绝与减仓哪种更优",
-      "default_until_resolved": "qingpai_strict 配置拒绝"
+      "question": "研究配置中，父级别冲突和缺少次级别确认时，减仓是否优于严格拒绝",
+      "default_until_resolved": "qingpai_strict 执行链固定拒绝；仅研究分支允许对照"
     },
     {
       "id": "OPEN-004",

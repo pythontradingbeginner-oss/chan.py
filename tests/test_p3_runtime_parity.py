@@ -1,9 +1,11 @@
 from collections import defaultdict
+from dataclasses import replace
 from datetime import datetime
 
 import pandas as pd
 
 from chan_futures.backtest import _calculate_atr, _new_chan, _resolve_kl_type
+from chan_futures.config import MultiLevelParams
 from chan_futures.config_loader import load_config, make_runtime_decision_kernel
 from chan_futures.feed import prepare_ohlc_frame, row_to_klu
 from chan_futures.parity import compare_runtime_traces
@@ -42,6 +44,8 @@ def test_position_update_preserves_exit_tracking_state() -> None:
 
 def test_same_rb_bars_produce_identical_three_runtime_decision_traces() -> None:
     config = load_config("configs/rb_15m_qingpai_strict.yaml")
+    # P3 isolates runtime parity; P5 evidence parity is covered separately.
+    config = replace(config, multi_level=MultiLevelParams(enabled=False))
     bars = prepare_ohlc_frame(
         pd.read_parquet(config.data_path).iloc[:1500].reset_index(drop=True)
     )

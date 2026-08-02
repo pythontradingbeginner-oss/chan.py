@@ -148,6 +148,58 @@ class DecompositionParams:
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
 
+@dataclass(frozen=True, slots=True)
+class MultiLevelParams:
+    """Point-in-time parent filtering and sub-level confirmation settings."""
+
+    enabled: bool = False
+    parent_kl_type: str = "K_60M"
+    parent_data_path: str | None = None
+    child_kl_type: str = "K_5M"
+    child_data_path: str | None = None
+    require_parent_direction: bool = True
+    require_confirmed_parent: bool = True
+    require_child_confirmation: bool = True
+    accepted_child_bsp_types: tuple[str, ...] = ("1", "1p", "2")
+
+    def __post_init__(self) -> None:
+        if isinstance(self.accepted_child_bsp_types, (str, bytes)):
+            raise ValueError(
+                "multi_level.accepted_child_bsp_types must be a list, not a string"
+            )
+        if isinstance(self.accepted_child_bsp_types, list):
+            object.__setattr__(
+                self,
+                "accepted_child_bsp_types",
+                tuple(str(value) for value in self.accepted_child_bsp_types),
+            )
+        if self.enabled:
+            if self.parent_kl_type == self.child_kl_type:
+                raise ValueError("multi_level parent and child levels must differ")
+            if not self.accepted_child_bsp_types:
+                raise ValueError("multi_level.accepted_child_bsp_types must not be empty")
+            allowed = {"1", "1p", "2", "2s", "3a", "3b"}
+            unknown = set(self.accepted_child_bsp_types).difference(allowed)
+            if unknown:
+                raise ValueError(
+                    "unknown multi-level child BSP types: "
+                    + ", ".join(sorted(unknown))
+                )
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> MultiLevelParams:
+        values = {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
+        if "accepted_child_bsp_types" in values:
+            if isinstance(values["accepted_child_bsp_types"], (str, bytes)):
+                raise ValueError(
+                    "multi_level.accepted_child_bsp_types must be a list, not a string"
+                )
+            values["accepted_child_bsp_types"] = tuple(
+                str(value) for value in values["accepted_child_bsp_types"]
+            )
+        return cls(**values)
+
+
 # ═══════════════════════════════════════════
 # 出场规则规格
 # ═══════════════════════════════════════════
@@ -199,6 +251,7 @@ class StrategyConfig:
     execution: ExecutionParams = field(default_factory=ExecutionParams)
     filter: FilterParams = field(default_factory=FilterParams)  # 信号过滤
     decomposition: DecompositionParams = field(default_factory=DecompositionParams)
+    multi_level: MultiLevelParams = field(default_factory=MultiLevelParams)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> StrategyConfig:
@@ -216,4 +269,5 @@ class StrategyConfig:
             execution=ExecutionParams.from_dict(d.get("execution", {})),
             filter=FilterParams.from_dict(d.get("filter", {})),
             decomposition=DecompositionParams.from_dict(d.get("decomposition", {})),
+            multi_level=MultiLevelParams.from_dict(d.get("multi_level", {})),
         )

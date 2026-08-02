@@ -12,6 +12,7 @@ from KLine.KLine_Unit import CKLine_Unit
 
 WINDOW_KL_TYPE_MAP: dict[int, KL_TYPE] = {
     1: KL_TYPE.K_1M,
+    5: KL_TYPE.K_5M,
     15: KL_TYPE.K_15M,
     30: KL_TYPE.K_30M,
     60: KL_TYPE.K_60M,

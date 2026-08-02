@@ -47,7 +47,13 @@ def test_bar_to_klu_maps_vnpy_bar_fields():
 
 @pytest.mark.parametrize(
     ("window", "expected"),
-    [(1, KL_TYPE.K_1M), (15, KL_TYPE.K_15M), (30, KL_TYPE.K_30M), (60, KL_TYPE.K_60M)],
+    [
+        (1, KL_TYPE.K_1M),
+        (5, KL_TYPE.K_5M),
+        (15, KL_TYPE.K_15M),
+        (30, KL_TYPE.K_30M),
+        (60, KL_TYPE.K_60M),
+    ],
 )
 def test_window_to_kl_type_maps_supported_windows(window, expected):
     assert window_to_kl_type(window) == expected

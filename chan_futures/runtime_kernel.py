@@ -10,6 +10,7 @@ from strategy_policy.qingpai_decomposition import (
 )
 
 from .graded_strategy import GradedChanStrategy
+from .multi_level import MultiLevelDecisionContext, MultiLevelDecisionEngine
 from .trade_intent import DecisionTraceRecord, TradeIntent
 
 
@@ -21,10 +22,12 @@ class RuntimeDecisionKernel:
         strategy: GradedChanStrategy,
         extractor: SignalExtractor,
         decomposer: QingpaiDecomposer | None = None,
+        multi_level: MultiLevelDecisionEngine | None = None,
     ) -> None:
         self.strategy = strategy
         self.extractor = extractor
         self.decomposer = decomposer
+        self.multi_level = multi_level
         self._decision_trace: list[DecisionTraceRecord] = []
 
     def observe_structure(
@@ -54,6 +57,8 @@ class RuntimeDecisionKernel:
         account_equity: float | None = None,
         atr: float | None = None,
     ) -> TradeIntent | None:
+        if self.multi_level is not None:
+            self.multi_level.advance_to(timestamp)
         decomposition = self.observe_structure(
             chan=chan,
             timestamp=timestamp,
@@ -72,8 +77,23 @@ class RuntimeDecisionKernel:
         )
         if intent is not None:
             intent = intent.with_decomposition(decomposition)
+            if self.multi_level is not None:
+                intent = self.multi_level.apply(
+                    intent,
+                    current_chan=chan,
+                    decision_time=timestamp,
+                    lv_idx=lv_idx,
+                )
             self._decision_trace.append(intent.to_trace_record())
         return intent
+
+    def observe_parent_bar(self, klu, *, available_at: object | None = None) -> None:
+        if self.multi_level is not None:
+            self.multi_level.observe_parent_bar(klu, available_at=available_at)
+
+    def observe_child_bar(self, klu, *, available_at: object | None = None) -> None:
+        if self.multi_level is not None:
+            self.multi_level.observe_child_bar(klu, available_at=available_at)
 
     @property
     def decision_trace(self) -> tuple[DecisionTraceRecord, ...]:
@@ -86,3 +106,7 @@ class RuntimeDecisionKernel:
     @property
     def decomposition_transitions(self) -> tuple[DecompositionTransition, ...]:
         return self.decomposer.transitions if self.decomposer is not None else ()
+
+    @property
+    def multi_level_audit(self) -> tuple[MultiLevelDecisionContext, ...]:
+        return self.multi_level.audit if self.multi_level is not None else ()

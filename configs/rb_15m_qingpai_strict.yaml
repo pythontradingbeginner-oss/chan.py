@@ -25,6 +25,18 @@ decomposition:
   enabled: true
   level: bi
 
+# P5: every level is replayed independently and joined by first-visible time.
+multi_level:
+  enabled: true
+  parent_kl_type: K_60M
+  parent_data_path: data/processed/RB_60m_continuous_raw.parquet
+  child_kl_type: K_5M
+  child_data_path: data/processed/RB_5m_continuous_raw.parquet
+  require_parent_direction: true
+  require_confirmed_parent: true
+  require_child_confirmation: true
+  accepted_child_bsp_types: ["1", "1p", "2"]
+
 entry:
   policy_id: rb_15m_qingpai_strict_v1
   policy_mode: qingpai_strict

@@ -8,6 +8,7 @@ from signal_core.models import SignalAssessment, SignalDecision, SignalEvent
 from strategy_policy.position import PositionContext
 from strategy_policy.qingpai_decomposition import DecompositionSnapshot
 
+from .multi_level import MultiLevelDecisionContext
 from .strategy import StrategySignal
 
 
@@ -33,6 +34,18 @@ class DecisionTraceRecord:
     regime: str = "unclassified"
     regime_direction: str = ""
     regime_lifecycle: str = ""
+    multi_level_accepted: bool | None = None
+    multi_level_time_honest: bool | None = None
+    multi_level_reason_codes: tuple[str, ...] = ()
+    parent_direction: str = ""
+    parent_structure_id: str = ""
+    parent_available_at: object | None = None
+    parent_action: str = ""
+    child_confirmed: bool | None = None
+    child_match_count: int = 0
+    child_match_ids: tuple[str, ...] = ()
+    child_window_begin: object | None = None
+    child_window_end: object | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -54,6 +67,18 @@ class DecisionTraceRecord:
             "regime": self.regime,
             "regime_direction": self.regime_direction,
             "regime_lifecycle": self.regime_lifecycle,
+            "multi_level_accepted": self.multi_level_accepted,
+            "multi_level_time_honest": self.multi_level_time_honest,
+            "multi_level_reason_codes": self.multi_level_reason_codes,
+            "parent_direction": self.parent_direction,
+            "parent_structure_id": self.parent_structure_id,
+            "parent_available_at": self.parent_available_at,
+            "parent_action": self.parent_action,
+            "child_confirmed": self.child_confirmed,
+            "child_match_count": self.child_match_count,
+            "child_match_ids": self.child_match_ids,
+            "child_window_begin": self.child_window_begin,
+            "child_window_end": self.child_window_end,
         }
 
 
@@ -66,6 +91,7 @@ class TradeIntent:
     event: SignalEvent | None = None
     assessment: SignalAssessment | None = None
     decomposition: DecompositionSnapshot | None = None
+    multi_level: MultiLevelDecisionContext | None = None
 
     @property
     def accepted(self) -> bool:
@@ -144,6 +170,8 @@ class TradeIntent:
         stop = self.decision.execution_stop_price
         if stop is None:
             stop = self.decision.initial_stop_price
+        multi_level = self.multi_level
+        parent = multi_level.parent_snapshot if multi_level is not None else None
 
         return DecisionTraceRecord(
             timestamp=self.signal.timestamp,
@@ -176,6 +204,22 @@ class TradeIntent:
             regime_lifecycle=(
                 self.decomposition.lifecycle.value if self.decomposition else ""
             ),
+            multi_level_accepted=(multi_level.accepted if multi_level else None),
+            multi_level_time_honest=(multi_level.time_honest if multi_level else None),
+            multi_level_reason_codes=(multi_level.reason_codes if multi_level else ()),
+            parent_direction=(parent.direction.value if parent else ""),
+            parent_structure_id=(parent.snapshot_id if parent else ""),
+            parent_available_at=(parent.available_at if parent else None),
+            parent_action=(multi_level.parent_action if multi_level else ""),
+            child_confirmed=(multi_level.child_confirmed if multi_level else None),
+            child_match_count=(len(multi_level.child_matches) if multi_level else 0),
+            child_match_ids=(
+                tuple(match.signal_id for match in multi_level.child_matches)
+                if multi_level
+                else ()
+            ),
+            child_window_begin=(multi_level.child_window_begin if multi_level else None),
+            child_window_end=(multi_level.child_window_end if multi_level else None),
         )
 
 

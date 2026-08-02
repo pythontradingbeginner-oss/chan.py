@@ -63,6 +63,20 @@ from .converter import bar_to_klu, window_to_kl_type
 from .snapshot import ChanSnapshotManager
 
 
+def _kl_type_minutes(value: str) -> int:
+    mapping = {
+        "K_1M": 1,
+        "K_5M": 5,
+        "K_15M": 15,
+        "K_30M": 30,
+        "K_60M": 60,
+    }
+    try:
+        return mapping[value]
+    except KeyError as exc:
+        raise ValueError(f"unsupported intraday K-line type: {value}") from exc
+
+
 # ════════════════════════════════════════════════════════════════
 # 引擎状态
 # ════════════════════════════════════════════════════════════════
@@ -153,7 +167,7 @@ class LiveTradingEngine(BaseEngine):
 
         cfg = self._config
         self._vt_symbol = symbol
-        kl_type = window_to_kl_type(15)  # FIXME: read from config.kl_type
+        kl_type = window_to_kl_type(_kl_type_minutes(cfg.kl_type))
 
         # ── CChan ──
         self._chan = CChan(
@@ -176,7 +190,7 @@ class LiveTradingEngine(BaseEngine):
         self._decision_kernel = make_runtime_decision_kernel(
             cfg,
             symbol="RB",
-            timeframe="15m",
+            timeframe=f"{_kl_type_minutes(cfg.kl_type)}m",
         )
         self._wrapper = self._decision_kernel.strategy
         self._extractor = self._decision_kernel.extractor
@@ -322,6 +336,32 @@ class LiveTradingEngine(BaseEngine):
 
         # ── 3. 信号状态更新 (pending signals → confirmed/invalidated) ──
         self._update_pending_signals(timestamp)
+
+    def feed_parent_bar(self, bar: BarData) -> None:
+        """Feed one completed parent bar before the same-time decision bar."""
+        self._feed_context_bar(bar, parent=True)
+
+    def feed_child_bar(self, bar: BarData) -> None:
+        """Feed one completed child bar before the same-time decision bar."""
+        self._feed_context_bar(bar, parent=False)
+
+    def _feed_context_bar(self, bar: BarData, *, parent: bool) -> None:
+        if self._config is None or self._decision_kernel is None:
+            raise RuntimeError("strategy is not initialized")
+        params = self._config.multi_level
+        if not params.enabled:
+            return
+        level_name = params.parent_kl_type if parent else params.child_kl_type
+        kl_type = window_to_kl_type(_kl_type_minutes(level_name))
+        klu = bar_to_klu(bar, kl_type=kl_type)
+        if parent:
+            self._decision_kernel.observe_parent_bar(
+                klu, available_at=bar.datetime
+            )
+        else:
+            self._decision_kernel.observe_child_bar(
+                klu, available_at=bar.datetime
+            )
 
     def _on_order(self, event: Event) -> None:
         order: OrderData = event.data

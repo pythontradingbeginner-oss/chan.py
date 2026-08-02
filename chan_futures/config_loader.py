@@ -32,6 +32,7 @@ from strategy_policy.exit_rules import (
 from .config import ExitRuleSpec, StrategyConfig
 from .decision_pipeline import DecisionMode, DecisionPipeline, DecisionPipelineConfig
 from .graded_strategy import GradeFilterConfig, GradedChanStrategy
+from .multi_level import MultiLevelDecisionEngine, make_multi_level_engine
 from .runtime_kernel import RuntimeDecisionKernel
 from .sizing import make_sizer
 
@@ -175,6 +176,9 @@ def make_runtime_decision_kernel(
     symbol: str = "RB",
     timeframe: str | None = None,
     contract: str = "",
+    multi_level: MultiLevelDecisionEngine | None = None,
+    parent_frame=None,
+    child_frame=None,
 ) -> RuntimeDecisionKernel:
     """Build the canonical decision entry shared by every runtime."""
     from signal_core import SignalExtractor
@@ -192,6 +196,15 @@ def make_runtime_decision_kernel(
             QingpaiDecomposer(level=config.decomposition.level)
             if config.decomposition.enabled
             else None
+        ),
+        multi_level=(
+            multi_level
+            if multi_level is not None
+            else make_multi_level_engine(
+                config,
+                parent_frame=parent_frame,
+                child_frame=child_frame,
+            )
         ),
     )
 

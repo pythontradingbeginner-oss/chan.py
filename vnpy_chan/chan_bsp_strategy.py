@@ -117,6 +117,10 @@ class ChanBspStrategy(CtaTemplate):
 
         # BarGenerator for N-minute bar synthesis
         self.bg = BarGenerator(self.on_bar, self.kl_window, self._on_kl_bar)
+        self._parent_bg = None
+        self._child_bg = None
+        self._parent_kl_type = None
+        self._child_kl_type = None
 
         # Lazy-initialized chan components
         self._chan = None
@@ -176,7 +180,35 @@ class ChanBspStrategy(CtaTemplate):
 
     def on_bar(self, bar: BarData):
         """1-min bar -> BarGenerator -> N-min bar."""
+        # Complete child and parent bars first.  Evidence sharing the same
+        # close timestamp is therefore visible to the current-level decision.
+        if self._child_bg is not None:
+            self._child_bg.update_bar(bar)
+        if self._parent_bg is not None:
+            self._parent_bg.update_bar(bar)
         self.bg.update_bar(bar)
+
+    def _on_parent_bar(self, bar: BarData):
+        if self._decision_kernel is None or self._parent_kl_type is None:
+            return
+        available_at = self._window_end_time(bar, self._parent_kl_type)
+        klu = self._bar_to_klu(
+            bar,
+            kl_type=self._parent_kl_type,
+            timestamp=available_at,
+        )
+        self._decision_kernel.observe_parent_bar(klu, available_at=available_at)
+
+    def _on_child_bar(self, bar: BarData):
+        if self._decision_kernel is None or self._child_kl_type is None:
+            return
+        available_at = self._window_end_time(bar, self._child_kl_type)
+        klu = self._bar_to_klu(
+            bar,
+            kl_type=self._child_kl_type,
+            timestamp=available_at,
+        )
+        self._decision_kernel.observe_child_bar(klu, available_at=available_at)
 
     def _on_kl_bar(self, bar: BarData):
         """N-minute bar completed. Main strategy logic."""
@@ -186,16 +218,12 @@ class ChanBspStrategy(CtaTemplate):
             return
 
         # 1. Feed bar to CChan
-        klu = self._bar_to_klu(bar)
+        timestamp = self._window_end_time(bar, self._current_kl_type())
+        klu = self._bar_to_klu(bar, timestamp=timestamp)
         self._chan.trigger_load({klu.kl_type: [klu]})
 
         price = float(bar.close_price)
         atr = self._update_atr(bar)
-        timestamp = (
-            bar.datetime
-            if isinstance(bar.datetime, datetime)
-            else pd.Timestamp(bar.datetime)
-        )
         self._decision_kernel.observe_structure(
             chan=self._chan,
             timestamp=timestamp,
@@ -399,6 +427,27 @@ class ChanBspStrategy(CtaTemplate):
         self._wrapper = self._decision_kernel.strategy
         self._extractor = self._decision_kernel.extractor
 
+        if cfg.multi_level.enabled:
+            level_to_window = {
+                "K_1M": 1,
+                "K_5M": 5,
+                "K_15M": 15,
+                "K_30M": 30,
+                "K_60M": 60,
+            }
+            self._parent_kl_type = w2k[level_to_window[cfg.multi_level.parent_kl_type]]
+            self._child_kl_type = w2k[level_to_window[cfg.multi_level.child_kl_type]]
+            self._parent_bg = BarGenerator(
+                self.on_bar,
+                level_to_window[cfg.multi_level.parent_kl_type],
+                self._on_parent_bar,
+            )
+            self._child_bg = BarGenerator(
+                self.on_bar,
+                level_to_window[cfg.multi_level.child_kl_type],
+                self._on_child_bar,
+            )
+
         # ExitManager
         self._exit_manager = make_exit_manager(cfg)
 
@@ -416,13 +465,19 @@ class ChanBspStrategy(CtaTemplate):
     # Internal: bar conversion
     # ============================================================
 
-    def _bar_to_klu(self, bar: BarData):
+    def _bar_to_klu(
+        self,
+        bar: BarData,
+        *,
+        kl_type=None,
+        timestamp: object | None = None,
+    ):
         """Convert vnpy BarData to chan.py CKLine_Unit."""
         from Common.CEnum import DATA_FIELD, KL_TYPE
         from Common.CTime import CTime
         from KLine.KLine_Unit import CKLine_Unit
 
-        ts = pd.Timestamp(bar.datetime)
+        ts = pd.Timestamp(timestamp if timestamp is not None else bar.datetime)
         if ts.tzinfo is not None:
             ts = ts.tz_convert("Asia/Shanghai").tz_localize(None)
 
@@ -430,7 +485,7 @@ class ChanBspStrategy(CtaTemplate):
             1: KL_TYPE.K_1M, 5: KL_TYPE.K_5M, 15: KL_TYPE.K_15M,
             30: KL_TYPE.K_30M, 60: KL_TYPE.K_60M,
         }
-        kl_type = w2k.get(self.kl_window, KL_TYPE.K_15M)
+        kl_type = kl_type or w2k.get(self.kl_window, KL_TYPE.K_15M)
 
         item = {
             DATA_FIELD.FIELD_TIME: CTime(
@@ -447,6 +502,30 @@ class ChanBspStrategy(CtaTemplate):
         klu = CKLine_Unit(item, autofix=True)
         klu.kl_type = kl_type
         return klu
+
+    def _current_kl_type(self):
+        from Common.CEnum import KL_TYPE
+
+        return {
+            1: KL_TYPE.K_1M,
+            5: KL_TYPE.K_5M,
+            15: KL_TYPE.K_15M,
+            30: KL_TYPE.K_30M,
+            60: KL_TYPE.K_60M,
+        }.get(self.kl_window, KL_TYPE.K_15M)
+
+    @staticmethod
+    def _window_end_time(bar: BarData, kl_type) -> datetime:
+        from datetime import timedelta
+
+        minutes = {
+            "K_1M": 1,
+            "K_5M": 5,
+            "K_15M": 15,
+            "K_30M": 30,
+            "K_60M": 60,
+        }.get(kl_type.name, 1)
+        return pd.Timestamp(bar.datetime).to_pydatetime() + timedelta(minutes=minutes)
 
     # ============================================================
     # Exit checking
