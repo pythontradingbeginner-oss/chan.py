@@ -242,15 +242,14 @@ def test_cta_open_fill_installs_the_same_decision_anchors() -> None:
     from vnpy.trader.constant import Offset
     from vnpy_chan.chan_bsp_strategy import ChanBspStrategy
 
-    event, decision = _accepted_sized_plan()
+    from chan_futures.trade_intent import PendingEntry
+
+    intent = _accepted_sized_intent()
     capture = _ExitManagerCapture()
     strategy = ChanBspStrategy.__new__(ChanBspStrategy)
-    strategy._entry_volume = 0
-    strategy._entry_price = 0.0
-    strategy._entry_direction_str = "long"
-    strategy._entry_grade = "standard"
-    strategy._entry_bar = 10
-    strategy._pending_entry_context = SimpleNamespace(event=event, decision=decision)
+    strategy._position_context = None
+    strategy._pending_entry = PendingEntry(intent)
+    strategy.bars_processed = 10
     strategy._exit_manager = capture
     strategy._config = None
     strategy.write_log = lambda message: None
@@ -258,9 +257,9 @@ def test_cta_open_fill_installs_the_same_decision_anchors() -> None:
 
     strategy.on_trade(SimpleNamespace(offset=Offset.OPEN, volume=3, price=100.0))
 
-    assert strategy._entry_volume == 3
-    assert capture.entry_kwargs["initial_stop_price"] == 90.0
-    assert capture.entry_kwargs["invalidation_price"] == 90.0
+    assert strategy.position_context.volume == 3
+    assert strategy.position_context.execution_stop_price == 90.0
+    assert capture.context is strategy.position_context
 
 
 def test_live_open_fill_installs_the_same_decision_anchors_and_volume() -> None:
@@ -270,20 +269,13 @@ def test_live_open_fill_installs_the_same_decision_anchors_and_volume() -> None:
     from vnpy.trader.constant import Direction, Offset
     from vnpy_chan.live_engine import LiveTradingEngine
 
-    event, decision = _accepted_sized_plan()
+    from chan_futures.trade_intent import PendingEntry
+
+    intent = _accepted_sized_intent()
     capture = _ExitManagerCapture()
     engine = LiveTradingEngine.__new__(LiveTradingEngine)
     engine._pending_order_ids = {"SIM.1"}
-    engine._pending_entry_contexts = {
-        "SIM.1": {
-            "event": event,
-            "decision": decision,
-            "grade": "standard",
-            "signal_key": event.signal_key,
-            "planned_volume": 3,
-            "filled_volume": 0,
-        }
-    }
+    engine._pending_entries = {"SIM.1": PendingEntry(intent)}
     engine._position = None
     engine._bar_count = 10
     engine._exit_manager = capture
@@ -300,8 +292,7 @@ def test_live_open_fill_installs_the_same_decision_anchors_and_volume() -> None:
 
     assert engine._position.volume == 3
     assert engine._position.initial_stop_price == 90.0
-    assert capture.entry_kwargs["initial_stop_price"] == 90.0
-    assert capture.entry_kwargs["invalidation_price"] == 90.0
+    assert capture.context is engine._position
 
 
 def _pipeline(
@@ -320,31 +311,36 @@ def _pipeline(
     )
 
 
-def _accepted_sized_plan():
+def _accepted_sized_intent():
     event = _event(
         bsp_type="1",
         direction=SignalDirection.LONG,
         reference=100.0,
         structural=90.0,
     )
-    decision = _pipeline(
+    pipeline = _pipeline(
         sizer=FixedFractionalSizer(
             capital=100_000.0,
             risk_pct=0.01,
             contract_multiplier=10.0,
         ),
         max_abs_position=3,
-    ).evaluate(_signal(event), event, _assessment(event))
-    assert decision.accepted
-    return event, decision
+    )
+    wrapper = GradedChanStrategy(
+        GradeFilterConfig(policy_mode=DecisionMode.QINGPAI_STRICT.value),
+        decision_pipeline=pipeline,
+    )
+    intent = wrapper._build_result(_signal(event), event, _assessment(event))
+    assert intent.accepted
+    return intent
 
 
 class _ExitManagerCapture:
     def __init__(self) -> None:
-        self.entry_kwargs = None
+        self.context = None
 
-    def on_entry(self, **kwargs) -> None:
-        self.entry_kwargs = kwargs
+    def on_position_opened(self, context) -> None:
+        self.context = context
 
     def on_close(self) -> None:
         pass

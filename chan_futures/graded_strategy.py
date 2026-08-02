@@ -14,11 +14,12 @@ from datetime import datetime
 from typing import Iterable
 
 from Common.CEnum import BSP_TYPE
-from signal_core.models import SignalAssessment, SignalDecision, SignalEvent
+from signal_core.models import SignalAssessment, SignalEvent
 from signal_scoring import assess_event
 
 from .decision_pipeline import DecisionMode, DecisionPipeline, DecisionPipelineConfig
 from .strategy import MinimalChanTrendStrategy, StrategySignal
+from .trade_intent import TradeIntent
 
 
 # ── grade filter configuration ────────────────────────
@@ -34,24 +35,8 @@ class GradeFilterConfig:
     policy_id: str = "chan_entry_v1"
 
 
-# ── graded signal (extends StrategySignal with assessment info) ─
-
-@dataclass(frozen=True)
-class GradedSignal:
-    """StrategySignal + assessment snapshot for audit/logging."""
-    signal: StrategySignal
-    bsp_type: str
-    grade: str
-    structural_score: float
-    event_id: str
-    signal_key: str
-    decision: SignalDecision | None = None
-    event: SignalEvent | None = None
-    assessment: SignalAssessment | None = None
-
-    @property
-    def accepted(self) -> bool:
-        return self.decision.accepted if self.decision is not None else True
+# Compatibility name retained for external research scripts.
+GradedSignal = TradeIntent
 
 
 # ── wrapper class ─────────────────────────────────────
@@ -246,13 +231,8 @@ class GradedChanStrategy:
             lots = int(decision.position_size_hint or 0)
             signed_target = lots if sig.target_position > 0 else -lots
             executable_signal = replace(sig, target_position=signed_target)
-        return GradedSignal(
+        return TradeIntent(
             signal=executable_signal,
-            bsp_type=sig.bsp_type,
-            grade=assessment.grade.value if assessment is not None else "standard",
-            structural_score=(assessment.structural_score or 0.0) if assessment is not None else 0.0,
-            event_id=event.event_id if event is not None else "",
-            signal_key=event.signal_key if event is not None else "",
             decision=decision,
             event=event,
             assessment=assessment,

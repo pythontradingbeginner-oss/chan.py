@@ -22,6 +22,7 @@ from datetime import datetime
 from enum import StrEnum
 
 from signal_core.models import SignalDirection
+from strategy_policy.position import PositionContext
 
 
 # ═══════════════════════════════════════════
@@ -300,7 +301,7 @@ class ExitManager:
     """管理多条出场规则和每笔持仓的跟踪状态。
 
     核心流程:
-      1. 开仓 → on_entry()  重置状态 + 记录锚点
+      1. 开仓 → on_position_opened()  重置状态 + 安装统一持仓上下文
       2. 每 bar → check()   更新跟踪 → 组装 ExitContext → 依次询问规则
       3. 平仓 → on_close()  清理状态 (或下次 on_entry 自动覆盖)
     """
@@ -316,16 +317,7 @@ class ExitManager:
         self._rule_error_counts: dict[str, int] = {}
         self._tracking = TrailingState()
 
-        # ── 入口锚点 (on_entry 时快照) ──
-        self._active = False
-        self._entry_price: float = 0.0
-        self._entry_direction: SignalDirection | None = None
-        self._bi_begin_price: float | None = None
-        self._zs_high: float | None = None
-        self._zs_low: float | None = None
-        self._initial_stop: float | None = None
-        self._invalidation_price: float | None = None
-        self._entry_grade: str | None = None
+        self._position: PositionContext | None = None
 
     # ── 规则管理 ──
 
@@ -369,11 +361,15 @@ class ExitManager:
 
     @property
     def is_active(self) -> bool:
-        return self._active
+        return self._position is not None
 
     @property
     def entry_price(self) -> float:
-        return self._entry_price
+        return self._position.entry_price if self._position is not None else 0.0
+
+    @property
+    def position_context(self) -> PositionContext | None:
+        return self._position
 
     @property
     def bars_since_entry(self) -> int:
@@ -384,6 +380,19 @@ class ExitManager:
         return self._tracking.best_favorable_move
 
     # ── 核心接口 ──
+
+    def on_position_opened(self, context: PositionContext) -> None:
+        """Install the canonical fill-derived holding context."""
+        self._tracking.reset()
+        self._position = context
+
+    def on_position_updated(self, context: PositionContext) -> None:
+        """Replace fill/volume state without resetting holding-period trackers."""
+        if self._position is None:
+            raise RuntimeError("cannot update an inactive position")
+        if self._position.direction != context.direction:
+            raise ValueError("position direction cannot change during an update")
+        self._position = context
 
     def on_entry(
         self,
@@ -402,22 +411,23 @@ class ExitManager:
         所有锚点字段都是可选的——如果策略没有对应的信号管线,
         直接传 None 即可, 依赖这些锚点的规则会自行跳过。
         """
-        self._tracking.reset()
-        self._active = True
-        self._entry_price = float(entry_price)
-        self._entry_direction = direction
-        self._bi_begin_price = bi_begin_price
-        self._zs_high = zs_high
-        self._zs_low = zs_low
-        self._initial_stop = initial_stop_price
-        self._invalidation_price = invalidation_price
-        self._entry_grade = entry_grade
+        self.on_position_opened(
+            PositionContext.from_legacy_entry(
+                direction=direction,
+                entry_price=entry_price,
+                bi_begin_price=bi_begin_price,
+                zs_high=zs_high,
+                zs_low=zs_low,
+                initial_stop_price=initial_stop_price,
+                invalidation_price=invalidation_price,
+                entry_grade=entry_grade,
+            )
+        )
 
     def on_close(self) -> None:
         """平仓时调用——清理跟踪状态。"""
         self._tracking.reset()
-        self._active = False
-        self._entry_direction = None
+        self._position = None
 
     def check(
         self,
@@ -438,15 +448,16 @@ class ExitManager:
         Returns:
             第一个触发的 ExitSignal, 或 None (没有规则触发)。
         """
-        if not self._active or self._entry_direction is None:
+        position = self._position
+        if position is None:
             return None
 
-        direction = self._entry_direction
+        direction = position.direction
         sign = 1 if direction == SignalDirection.LONG else -1
 
         # ── 更新跟踪 ──
         self._tracking.bars_since_entry += 1
-        current_move = sign * (float(close) - self._entry_price)
+        current_move = sign * (float(close) - position.entry_price)
         if current_move > self._tracking.best_favorable_move:
             self._tracking.best_favorable_move = current_move
         if current_move < self._tracking.worst_adverse_move:
@@ -460,13 +471,13 @@ class ExitManager:
             low=float(low),
             close=float(close),
             direction=direction,
-            entry_price=self._entry_price,
-            bi_begin_price=self._bi_begin_price,
-            zs_high=self._zs_high,
-            zs_low=self._zs_low,
-            initial_stop_price=self._initial_stop,
-            invalidation_price=self._invalidation_price,
-            entry_grade=self._entry_grade,
+            entry_price=position.entry_price,
+            bi_begin_price=position.bi_begin_price,
+            zs_high=position.zs_high,
+            zs_low=position.zs_low,
+            initial_stop_price=position.execution_stop_price,
+            invalidation_price=position.setup_invalidation_price,
+            entry_grade=position.entry_grade,
             bars_since_entry=self._tracking.bars_since_entry,
             current_move=current_move,
             mfe=self._tracking.best_favorable_move,

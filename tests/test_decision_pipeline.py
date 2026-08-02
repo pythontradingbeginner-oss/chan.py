@@ -120,6 +120,7 @@ def test_candidate_rejection_is_released_for_confirmation_retry() -> None:
 def test_live_open_order_uses_signal_direction_open_offset_and_gateway() -> None:
     pytest.importorskip("vnpy")
     from vnpy.trader.constant import Direction, Exchange, Offset
+    from chan_futures.trade_intent import TradeIntent
     from vnpy_chan.live_engine import LiveTradingEngine
 
     class _Contract:
@@ -147,8 +148,19 @@ def test_live_open_order_uses_signal_direction_open_offset_and_gateway() -> None
     engine._vt_symbol = "RB2505.SHFE"
     engine._exchange = Exchange.SHFE
     engine._pending_order_ids = set()
+    engine._pending_entries = {}
 
-    engine._open_position(_signal(target_position=-1), "1", "standard", "event-1")
+    event = _event(direction=SignalDirection.SHORT)
+    signal = _signal(target_position=-1)
+    intent = TradeIntent(
+        signal=signal,
+        decision=_pipeline(DecisionMode.QINGPAI_STRICT).evaluate(
+            signal, event, _assessment(event)
+        ),
+        event=event,
+        assessment=_assessment(event),
+    )
+    engine._open_position(intent)
 
     request = engine.main_engine.request
     assert request.direction == Direction.SHORT
@@ -156,6 +168,7 @@ def test_live_open_order_uses_signal_direction_open_offset_and_gateway() -> None
     assert request.volume == 1
     assert engine.main_engine.gateway_name == "SIM"
     assert engine._pending_order_ids == {"SIM.1"}
+    assert engine._pending_entries["SIM.1"].intent is intent
 
 
 def test_vnpy_execution_engine_opens_short_and_rejects_direct_reversal() -> None:

@@ -80,8 +80,12 @@ class MinimalChanTrendStrategy:
 
     def _target_position(self, is_buy: bool, current_position: int) -> int:
         if is_buy:
+            if current_position > 0:
+                return current_position
             return 1
         if self.allow_short:
+            if current_position < 0:
+                return current_position
             return -1
         return 0 if current_position > 0 else current_position
 

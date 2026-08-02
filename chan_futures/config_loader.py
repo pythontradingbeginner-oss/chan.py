@@ -32,6 +32,7 @@ from strategy_policy.exit_rules import (
 from .config import ExitRuleSpec, StrategyConfig
 from .decision_pipeline import DecisionMode, DecisionPipeline, DecisionPipelineConfig
 from .graded_strategy import GradeFilterConfig, GradedChanStrategy
+from .runtime_kernel import RuntimeDecisionKernel
 from .sizing import make_sizer
 
 
@@ -168,6 +169,27 @@ def make_graded_strategy(config: StrategyConfig) -> GradedChanStrategy:
     )
 
 
+def make_runtime_decision_kernel(
+    config: StrategyConfig,
+    *,
+    symbol: str = "RB",
+    timeframe: str | None = None,
+    contract: str = "",
+) -> RuntimeDecisionKernel:
+    """Build the canonical decision entry shared by every runtime."""
+    from signal_core import SignalExtractor
+
+    resolved_timeframe = timeframe or _timeframe_name(config.kl_type)
+    return RuntimeDecisionKernel(
+        strategy=make_graded_strategy(config),
+        extractor=SignalExtractor(
+            symbol=symbol,
+            timeframe=resolved_timeframe,
+            contract=contract,
+        ),
+    )
+
+
 def _decision_mode(entry: dict[str, Any]) -> DecisionMode:
     raw = entry.get("policy_mode")
     if raw is None:
@@ -196,6 +218,10 @@ def _accepted_bsp_values(raw: object) -> frozenset[str]:
     if unknown:
         raise ValueError(f"未知 BSP 类型: {', '.join(sorted(unknown))}")
     return values
+
+
+def _timeframe_name(kl_type: str) -> str:
+    return kl_type.replace("K_", "").replace("M", "m").lower()
 
 
 # ═══════════════════════════════════════════

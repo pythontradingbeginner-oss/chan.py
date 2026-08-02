@@ -7,11 +7,13 @@
 """
 
 from .entry_policy import EntryPolicy, EntryPolicyConfig, MultiPolicyEvaluator
+from .position import PositionContext
 
 __all__ = [
     "EntryPolicy",
     "EntryPolicyConfig",
     "MultiPolicyEvaluator",
+    "PositionContext",
 ]
 
 # 子模块不在此处延迟导入 (用户按需 from strategy_policy.exit_rules import ...)

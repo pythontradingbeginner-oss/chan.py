@@ -49,10 +49,15 @@ from strategy_policy.exit_rules import (
     ExitSignal,
 )
 from chan_futures.config import StrategyConfig
-from chan_futures.config_loader import load_config, make_exit_manager, make_graded_strategy
-from chan_futures.strategy import StrategySignal
+from chan_futures.config_loader import (
+    load_config,
+    make_exit_manager,
+    make_runtime_decision_kernel,
+)
 from chan_futures.graded_strategy import GradedChanStrategy
 from chan_futures.risk import RiskConfig, RiskManager
+from chan_futures.trade_intent import DecisionTraceRecord, PendingEntry, TradeIntent
+from strategy_policy.position import PositionContext
 
 from .converter import bar_to_klu, window_to_kl_type
 from .snapshot import ChanSnapshotManager
@@ -61,24 +66,6 @@ from .snapshot import ChanSnapshotManager
 # ════════════════════════════════════════════════════════════════
 # 引擎状态
 # ════════════════════════════════════════════════════════════════
-
-@dataclass
-class _PositionContext:
-    """活动持仓的快照 (入场信息 —— 驱动出场逻辑)。"""
-
-    direction: SignalDirection
-    entry_price: float
-    entry_time: datetime
-    entry_bar: int
-    entry_grade: str = "standard"
-    bi_begin_price: float | None = None
-    zs_high: float | None = None
-    zs_low: float | None = None
-    invalidation_price: float | None = None
-    initial_stop_price: float | None = None
-    signal_key: str = ""
-    volume: int = 1
-
 
 @dataclass
 class _SignalContext:
@@ -121,20 +108,22 @@ class LiveTradingEngine(BaseEngine):
         self._snapshot: ChanSnapshotManager | None = None
         self._wrapper: GradedChanStrategy | None = None
         self._extractor: SignalExtractor | None = None
+        self._decision_kernel = None
         self._exit_manager: ExitManager | None = None
         self._risk: RiskManager | None = None
         self._journal: SignalJournal | None = None
         self._tracker: SignalLifecycleTracker | None = None
 
         # ── 状态 ──
-        self._position: _PositionContext | None = None
+        self._position: PositionContext | None = None
         self._pending_signals: dict[str, _SignalContext] = {}
         self._bar_count: int = 0
         self._vt_symbol: str = ""
 
         # ── 订单追踪 ──
         self._pending_order_ids: set[str] = set()
-        self._pending_entry_contexts: dict[str, dict[str, Any]] = {}
+        self._pending_entries: dict[str, PendingEntry] = {}
+        self._pending_reversal: PendingEntry | None = None
         self._current_order_ref: str = ""
         self._previous_close: float | None = None
         self._true_ranges: list[float] = []
@@ -183,11 +172,14 @@ class LiveTradingEngine(BaseEngine):
             lv_list=[kl_type],
         )
 
-        # ── 共享决策管线 ──
-        self._wrapper = make_graded_strategy(cfg)
-
-        # ── SignalExtractor ──
-        self._extractor = SignalExtractor(symbol="RB", timeframe="15m")
+        # ── 三端共享决策管线 ──
+        self._decision_kernel = make_runtime_decision_kernel(
+            cfg,
+            symbol="RB",
+            timeframe="15m",
+        )
+        self._wrapper = self._decision_kernel.strategy
+        self._extractor = self._decision_kernel.extractor
 
         # ── ExitManager ──
         self._exit_manager = make_exit_manager(cfg)
@@ -247,7 +239,12 @@ class LiveTradingEngine(BaseEngine):
 
     def _on_bar(self, event: Event) -> None:
         """每根 bar 的主循环。"""
-        if self._config is None or self._chan is None or self._snapshot is None:
+        if (
+            self._config is None
+            or self._chan is None
+            or self._snapshot is None
+            or self._decision_kernel is None
+        ):
             return
 
         bar: BarData = event.data
@@ -273,53 +270,50 @@ class LiveTradingEngine(BaseEngine):
                 bar_end_time=timestamp,
             )
             if exit_signal is not None:
+                self._pending_reversal = None
                 self._close_position(exit_signal.exit_price, exit_signal.reason_code, exit_signal.description)
                 return
 
-        # ── 2. 检查入场信号 ──
-        if self._position is None:
-            chan_snap = self._snapshot.current
-            if chan_snap is None:
+        # ── 2. 无论空仓/持仓，都消费同一个 TradeIntent ──
+        chan_snap = self._snapshot.current
+        if chan_snap is None:
+            return
+        current_position = 0
+        if self._position is not None:
+            sign = 1 if self._position.direction == SignalDirection.LONG else -1
+            current_position = sign * self._position.volume
+
+        intent = self._decision_kernel.evaluate_bar(
+            chan=chan_snap,
+            current_position=current_position,
+            price=price,
+            timestamp=timestamp,
+            active_symbol=bar.symbol,
+            lv_idx=0,
+            account_equity=self._account_equity(),
+            atr=atr,
+        )
+        if intent is not None:
+            self._record_signal(intent, timestamp)
+            if not intent.accepted:
+                self._log("决策拒绝: " + ",".join(intent.decision.reason_codes))
                 return
 
-            graded = self._wrapper.evaluate_bar(
-                chan=chan_snap,
-                current_position=0,
-                price=price,
-                timestamp=timestamp,
-                active_symbol=bar.symbol,
-                lv_idx=0,
-                extractor=self._extractor,
-                account_equity=self._account_equity(),
-                atr=atr,
-            )
-            if graded is not None:
-                self._record_signal(graded, timestamp)
-                if not graded.accepted:
-                    self._log(
-                        "决策拒绝: " + ",".join(graded.decision.reason_codes)
-                    )
+            signal = intent.signal
+            if self._risk is not None:
+                risk_decision = self._risk.approve(signal)
+                if not risk_decision.approved:
+                    self._log(f"风控拒绝: {risk_decision.reason}")
                     return
 
-                sig = graded.signal
-
-                # 风控审批
-                if self._risk is not None:
-                    decision = self._risk.approve(sig)
-                    if not decision.approved:
-                        self._log(f"风控拒绝: {decision.reason}")
-                        return
-
-                # 发送开仓订单
-                self._open_position(
-                    sig,
-                    graded.bsp_type,
-                    graded.grade,
-                    graded.event_id,
-                    event=graded.event,
-                    decision=graded.decision,
-                    signal_key=graded.signal_key,
-                )
+            if self._position is None:
+                self._open_position(intent)
+            elif signal.target_position == 0:
+                self._pending_reversal = None
+                self._close_position(signal.price, "strategy_close", "策略平仓")
+            elif (current_position > 0) != (signal.target_position > 0):
+                self._pending_reversal = PendingEntry(intent)
+                self._close_position(signal.price, "strategy_reverse", "策略反转")
 
         # ── 3. 信号状态更新 (pending signals → confirmed/invalidated) ──
         self._update_pending_signals(timestamp)
@@ -331,13 +325,13 @@ class LiveTradingEngine(BaseEngine):
         self._log(f"订单状态: {order.vt_orderid} → {order.status.value}")
         if order.status in {Status.CANCELLED, Status.REJECTED}:
             self._pending_order_ids.discard(order.vt_orderid)
-            self._pending_entry_contexts.pop(order.vt_orderid, None)
+            self._pending_entries.pop(order.vt_orderid, None)
 
     def _on_trade(self, event: Event) -> None:
         trade: TradeData = event.data
         if (
             trade.vt_orderid not in self._pending_order_ids
-            and trade.vt_orderid not in self._pending_entry_contexts
+            and trade.vt_orderid not in self._pending_entries
         ):
             return
 
@@ -349,62 +343,41 @@ class LiveTradingEngine(BaseEngine):
                 else SignalDirection.SHORT
             )
             fill_volume = int(trade.volume)
-            pending = self._pending_entry_contexts.get(trade.vt_orderid, {})
-            event_snapshot = pending.get("event")
-            decision_snapshot = pending.get("decision")
-            if self._position is not None and self._position.direction == direction:
-                previous_volume = self._position.volume
-                total_volume = previous_volume + fill_volume
-                entry_price = (
-                    self._position.entry_price * previous_volume
-                    + float(trade.price) * fill_volume
-                ) / total_volume
+            pending = self._pending_entries.get(trade.vt_orderid)
+            if pending is None:
+                self._log("忽略开仓成交: 缺少 TradeIntent")
+                return
+            opening_position = self._position is None
+            if opening_position:
+                self._position = pending.intent.position_from_fill(
+                    fill_price=float(trade.price),
+                    fill_volume=fill_volume,
+                    fill_time=getattr(trade, "datetime", None) or datetime.now(),
+                    entry_bar=self._bar_count,
+                    active_symbol=getattr(trade, "symbol", None),
+                )
             else:
-                total_volume = fill_volume
-                entry_price = float(trade.price)
-            self._position = _PositionContext(
-                direction=direction,
-                entry_price=entry_price,
-                entry_time=datetime.now(),
-                entry_bar=self._bar_count,
-                entry_grade=pending.get(
-                    "grade", getattr(self, "_last_accepted_grade", "standard")
-                ),
-                bi_begin_price=(
-                    event_snapshot.bi_begin_price if event_snapshot else None
-                ),
-                zs_high=event_snapshot.zs_high if event_snapshot else None,
-                zs_low=event_snapshot.zs_low if event_snapshot else None,
-                invalidation_price=(
-                    decision_snapshot.setup_invalidation_price
-                    if decision_snapshot else None
-                ),
-                initial_stop_price=(
-                    decision_snapshot.execution_stop_price
-                    if decision_snapshot else None
-                ),
-                signal_key=pending.get(
-                    "signal_key", getattr(self, "_last_signal_key", "")
-                ),
-                volume=total_volume,
-            )
-            self._exit_manager.on_entry(
-                direction=direction,
-                entry_price=entry_price,
-                bi_begin_price=self._position.bi_begin_price,
-                zs_high=self._position.zs_high,
-                zs_low=self._position.zs_low,
-                initial_stop_price=self._position.initial_stop_price,
-                invalidation_price=self._position.invalidation_price,
-                entry_grade=self._position.entry_grade,
-            )
+                if self._position.direction != direction:
+                    self._log("忽略开仓成交: 成交方向与活动持仓不一致")
+                    return
+                self._position = self._position.merge_open_fill(
+                    fill_price=float(trade.price),
+                    fill_volume=fill_volume,
+                    fill_time=getattr(trade, "datetime", None),
+                )
+            if opening_position:
+                self._exit_manager.on_position_opened(self._position)
+            else:
+                self._exit_manager.on_position_updated(self._position)
             self._log(
                 f"开仓成交: {direction.value} @ {trade.price} volume={fill_volume}"
             )
-            pending["filled_volume"] = int(pending.get("filled_volume", 0)) + fill_volume
-            if pending["filled_volume"] >= int(pending.get("planned_volume", fill_volume)):
+            pending = pending.apply_fill(fill_volume)
+            if pending.complete:
                 self._pending_order_ids.discard(trade.vt_orderid)
-                self._pending_entry_contexts.pop(trade.vt_orderid, None)
+                self._pending_entries.pop(trade.vt_orderid, None)
+            else:
+                self._pending_entries[trade.vt_orderid] = pending
 
         # ── 平仓成交 → 清理持仓 ──
         elif self._position is not None:
@@ -416,11 +389,16 @@ class LiveTradingEngine(BaseEngine):
                 f"PnL={pnl:.0f} pts "
                 f"累计已实现={self._risk._realized_points:.0f} pts"
             )
-            self._position.volume = max(0, self._position.volume - fill_volume)
-            if self._position.volume == 0:
-                self._position = None
+            self._position = self._position.reduce_volume(fill_volume)
+            if self._position is None:
                 self._exit_manager.on_close()
                 self._pending_order_ids.discard(trade.vt_orderid)
+                pending_reversal = self._pending_reversal
+                self._pending_reversal = None
+                if pending_reversal is not None:
+                    self._open_position(pending_reversal.intent)
+            else:
+                self._exit_manager.on_position_updated(self._position)
 
     # ════════════════════════════════════════
     # 交易操作
@@ -428,16 +406,10 @@ class LiveTradingEngine(BaseEngine):
 
     def _open_position(
         self,
-        signal: StrategySignal,
-        bsp_type: str,
-        grade: str,
-        event_id: str,
-        *,
-        event: Any | None = None,
-        decision: Any | None = None,
-        signal_key: str = "",
+        intent: TradeIntent,
     ) -> None:
         """向 vnpy 发送开仓订单。"""
+        signal = intent.signal
         direction = _vnpy_direction_from_target(signal.target_position)
         order_req = OrderRequest(
             symbol=self._vt_symbol.split(".")[0] if "." in self._vt_symbol else self._vt_symbol,
@@ -451,22 +423,16 @@ class LiveTradingEngine(BaseEngine):
         vt_orderid = self._send_order(order_req)
         if vt_orderid:
             self._pending_order_ids.add(vt_orderid)
-            contexts = getattr(self, "_pending_entry_contexts", None)
-            if contexts is None:
-                self._pending_entry_contexts = {}
-            self._pending_entry_contexts[vt_orderid] = {
-                "event": event,
-                "decision": decision,
-                "grade": grade,
-                "signal_key": signal_key,
-                "planned_volume": abs(signal.target_position),
-                "filled_volume": 0,
-            }
-        self._last_accepted_grade = grade
-        self._last_event_id = event_id
+            entries = getattr(self, "_pending_entries", None)
+            if entries is None:
+                self._pending_entries = {}
+            self._pending_entries[vt_orderid] = PendingEntry(intent)
+        self._last_accepted_grade = intent.grade
+        self._last_event_id = intent.event_id
         self._log(
             f"发送开仓单: {direction.value} @ {signal.price} "
-            f"volume={abs(signal.target_position)} grade={grade} bsp={bsp_type}"
+            f"volume={abs(signal.target_position)} "
+            f"grade={intent.grade} bsp={intent.bsp_type}"
         )
 
     def _close_position(self, price: float, reason: str, description: str) -> None:
@@ -601,12 +567,12 @@ class LiveTradingEngine(BaseEngine):
     def _calc_pnl(self, exit_price: float, *, volume: int | None = None) -> float:
         if self._position is None:
             return 0
-        pnl = exit_price - self._position.entry_price
-        if self._position.direction == SignalDirection.SHORT:
-            pnl = -pnl
         fee = self._config.execution.fee_points if self._config else 1.0
-        lots = self._position.volume if volume is None else volume
-        return (pnl - fee * 2) * lots
+        return self._position.pnl_points(
+            exit_price=exit_price,
+            fee_points=fee,
+            volume=volume,
+        )
 
     def _account_equity(self) -> float | None:
         fallback = self._config.sizing.capital if self._config else None
@@ -644,8 +610,14 @@ class LiveTradingEngine(BaseEngine):
         return self._position is not None
 
     @property
-    def position_context(self) -> _PositionContext | None:
+    def position_context(self) -> PositionContext | None:
         return self._position
+
+    @property
+    def decision_trace(self) -> tuple[DecisionTraceRecord, ...]:
+        if self._decision_kernel is None:
+            return ()
+        return self._decision_kernel.decision_trace
 
     def engine_status(self) -> dict[str, Any]:
         """返回引擎状态的快照。"""

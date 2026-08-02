@@ -5,6 +5,9 @@ from .graded_strategy import GradedChanStrategy, GradeFilterConfig, GradedSignal
 from .decision_pipeline import DecisionMode, DecisionPipeline, DecisionPipelineConfig
 from .risk import RiskConfig, RiskDecision, RiskManager
 from .strategy import MinimalChanTrendStrategy, StrategySignal
+from .trade_intent import DecisionTraceRecord, PendingEntry, TradeIntent
+from .runtime_kernel import RuntimeDecisionKernel
+from .parity import RuntimeParityReport, TraceMismatch, compare_runtime_traces
 
 __all__ = [
     "ChanBacktestConfig",
@@ -13,16 +16,23 @@ __all__ = [
     "DecisionMode",
     "DecisionPipeline",
     "DecisionPipelineConfig",
+    "DecisionTraceRecord",
     "GradedChanStrategy",
     "GradeFilterConfig",
     "GradedSignal",
     "MinimalChanTrendStrategy",
     "PositionState",
+    "PendingEntry",
     "RiskConfig",
     "RiskDecision",
     "RiskManager",
+    "RuntimeDecisionKernel",
+    "RuntimeParityReport",
     "SimulatedExecutionEngine",
     "StrategySignal",
+    "TradeIntent",
+    "TraceMismatch",
+    "compare_runtime_traces",
     "dataframe_to_klu_iter",
     "row_to_klu",
     "run_chan_trigger_backtest",

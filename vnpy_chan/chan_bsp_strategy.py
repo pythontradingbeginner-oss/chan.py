@@ -20,9 +20,6 @@ from __future__ import annotations
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any
-
-import numpy as np
 import pandas as pd
 
 from vnpy_ctastrategy import (
@@ -34,7 +31,7 @@ from vnpy_ctastrategy import (
     TickData,
     TradeData,
 )
-from vnpy.trader.constant import Direction, Interval, Offset
+from vnpy.trader.constant import Interval, Offset
 
 # Ensure chan.py project is in sys.path
 _CHAN_CANDIDATES = [
@@ -45,6 +42,9 @@ _CHAN_CANDIDATES = [
 for _cp in _CHAN_CANDIDATES:
     if _cp.exists() and str(_cp) not in sys.path:
         sys.path.insert(0, str(_cp))
+
+from chan_futures.trade_intent import DecisionTraceRecord, PendingEntry, TradeIntent
+from strategy_policy.position import PositionContext
 
 # Config defaults
 DEFAULT_CHAN_PROJECT = "H:/Github/chan.py"
@@ -122,18 +122,15 @@ class ChanBspStrategy(CtaTemplate):
         self._chan = None
         self._wrapper = None
         self._extractor = None
+        self._decision_kernel = None
         self._exit_manager = None
         self._risk = None
         self._config = None
 
-        # Position tracking
-        self._entry_price = 0.0
-        self._entry_grade = ""
-        self._entry_direction_str = ""
-        self._entry_bar = 0
-        self._entry_volume = 0
+        self._position_context: PositionContext | None = None
+        self._pending_entry: PendingEntry | None = None
+        self._pending_reversal: PendingEntry | None = None
         self._trade_pnl_batch: list[float] = []
-        self._pending_entry_context = None
         self._previous_close: float | None = None
         self._true_ranges: list[float] = []
 
@@ -185,7 +182,7 @@ class ChanBspStrategy(CtaTemplate):
         """N-minute bar completed. Main strategy logic."""
         self.bars_processed += 1
 
-        if self._chan is None or self._wrapper is None:
+        if self._chan is None or self._decision_kernel is None:
             return
 
         # 1. Feed bar to CChan
@@ -207,6 +204,7 @@ class ChanBspStrategy(CtaTemplate):
         if self.pos != 0 and self._exit_manager is not None:
             exit_sig = self._check_exit(bar, price, timestamp)
             if exit_sig is not None:
+                self._pending_reversal = None
                 self.exit_reason = exit_sig.reason_code
                 self._close_existing(
                     bar, exit_sig.reason_code, price=exit_sig.exit_price
@@ -214,68 +212,41 @@ class ChanBspStrategy(CtaTemplate):
                 self.put_event()
                 return
 
-        # 4. Check entry signals
-        if self.pos == 0:
-            graded = self._wrapper.evaluate_bar(
-                chan=self._chan,
-                current_position=0,
-                price=price,
-                timestamp=timestamp,
-                active_symbol=bar.symbol,
-                lv_idx=0,
-                extractor=self._extractor,
-                account_equity=self._account_equity(),
-                atr=atr,
-            )
-            if graded is not None:
-                self.last_signal_grade = graded.grade
-                if not graded.accepted:
-                    reasons = ",".join(graded.decision.reason_codes)
-                    self.write_log(f"Decision rejected: {reasons}")
+        # 4. Evaluate the same TradeIntent whether flat or already positioned.
+        intent = self._decision_kernel.evaluate_bar(
+            chan=self._chan,
+            current_position=int(self.pos),
+            price=price,
+            timestamp=timestamp,
+            active_symbol=bar.symbol,
+            lv_idx=0,
+            account_equity=self._account_equity(),
+            atr=atr,
+        )
+        if intent is not None:
+            self.last_signal_grade = intent.grade
+            if not intent.accepted:
+                reasons = ",".join(intent.decision.reason_codes)
+                self.write_log(f"Decision rejected: {reasons}")
+                self.put_event()
+                return
+
+            signal = intent.signal
+            if self._risk is not None:
+                risk_decision = self._risk.approve(signal)
+                if not risk_decision.approved:
+                    self.write_log(f"Risk rejected: {risk_decision.reason}")
                     self.put_event()
                     return
 
-                planned_signal = graded.signal
-                planned_size = abs(planned_signal.target_position)
-                if planned_size <= 0:
-                    self.write_log("Decision rejected: position_size_zero")
-                    self.put_event()
-                    return
-
-                # Risk check
-                if self._risk is not None:
-                    decision = self._risk.approve(planned_signal)
-                    if not decision.approved:
-                        self.write_log(f"Risk rejected: {decision.reason}")
-                        self.put_event()
-                        return
-
-                # Determine direction
-                direction_str = self._get_signal_direction(planned_signal)
-                self._entry_grade = graded.grade
-                self._entry_direction_str = direction_str
-                self._entry_bar = self.bars_processed
-                self._pending_entry_context = graded
-
-                if direction_str == "long":
-                    order_ids = self.buy(price, planned_size)
-                elif direction_str == "short":
-                    order_ids = self.short(price, planned_size)
-                else:
-                    order_ids = []
-
-                if not order_ids:
-                    self._pending_entry_context = None
-
-                self.write_log(
-                    f"ENTRY: {graded.bsp_type} grade={graded.grade} "
-                    f"dir={direction_str} @ {price:.1f}"
-                )
-
-        # 5. Strategy reversal (opposite BSP)
-        elif self.pos != 0:
-            opposite = self._detect_opposite_signal()
-            if opposite:
+            if self.pos == 0:
+                self._submit_open_intent(intent)
+            elif signal.target_position == 0:
+                self._pending_reversal = None
+                self.exit_reason = "strategy_close"
+                self._close_existing(bar, "strategy_close")
+            elif (self.pos > 0) != (signal.target_position > 0):
+                self._pending_reversal = PendingEntry(intent)
                 self.exit_reason = "strategy_reverse"
                 self._close_existing(bar, "strategy_reverse")
 
@@ -288,55 +259,54 @@ class ChanBspStrategy(CtaTemplate):
     def on_trade(self, trade: TradeData):
         """Track PnL on close."""
         if trade.offset == Offset.OPEN:
-            previous_volume = self._entry_volume
             fill_volume = int(trade.volume)
-            total_volume = previous_volume + fill_volume
-            if total_volume > 0:
-                self._entry_price = (
-                    self._entry_price * previous_volume + float(trade.price) * fill_volume
-                ) / total_volume
-            self._entry_volume = total_volume
+            pending = self._pending_entry
+            if pending is None:
+                self.write_log("OPEN FILL IGNORED: missing TradeIntent")
+                self.put_event()
+                return
 
-            graded = self._pending_entry_context
-            event = graded.event if graded is not None else None
-            decision = graded.decision if graded is not None else None
+            opening_position = self._position_context is None
+            if opening_position:
+                self._position_context = pending.intent.position_from_fill(
+                    fill_price=float(trade.price),
+                    fill_volume=fill_volume,
+                    fill_time=getattr(trade, "datetime", None) or datetime.now(),
+                    entry_bar=self.bars_processed,
+                    active_symbol=getattr(trade, "symbol", None),
+                )
+            else:
+                self._position_context = self._position_context.merge_open_fill(
+                    fill_price=float(trade.price),
+                    fill_volume=fill_volume,
+                    fill_time=getattr(trade, "datetime", None),
+                )
+            self._pending_entry = pending.apply_fill(fill_volume)
+            if self._pending_entry.complete:
+                self._pending_entry = None
             if self._exit_manager is not None:
-                from signal_core.models import SignalDirection
-
-                direction = (
-                    SignalDirection.LONG
-                    if self._entry_direction_str == "long"
-                    else SignalDirection.SHORT
-                )
-                self._exit_manager.on_entry(
-                    direction=direction,
-                    entry_price=self._entry_price,
-                    bi_begin_price=event.bi_begin_price if event else None,
-                    zs_high=event.zs_high if event else None,
-                    zs_low=event.zs_low if event else None,
-                    initial_stop_price=(
-                        decision.execution_stop_price if decision else None
-                    ),
-                    invalidation_price=(
-                        decision.setup_invalidation_price if decision else None
-                    ),
-                    entry_grade=self._entry_grade,
-                )
+                if opening_position:
+                    self._exit_manager.on_position_opened(self._position_context)
+                else:
+                    self._exit_manager.on_position_updated(self._position_context)
             self.write_log(
                 f"OPEN FILLED: @ {trade.price:.1f} volume={fill_volume}"
             )
             self.put_event()
             return
 
-        if self._entry_price > 0 and trade.offset == Offset.CLOSE:
-            mult = 1 if self._entry_direction_str == "long" else -1
+        if self._position_context is not None and trade.offset == Offset.CLOSE:
             fill_volume = int(trade.volume)
             fee = self._config.execution.fee_points if self._config else 1.0
-            pnl = (mult * (trade.price - self._entry_price) - fee * 2) * fill_volume
+            pnl = self._position_context.pnl_points(
+                exit_price=float(trade.price),
+                fee_points=fee,
+                volume=fill_volume,
+            )
             self.total_pnl += pnl
             self.total_trades += 1
             self._trade_pnl_batch.append(pnl)
-            self._entry_volume = max(0, self._entry_volume - fill_volume)
+            self._position_context = self._position_context.reduce_volume(fill_volume)
 
             if self._risk is not None:
                 self._risk.on_fill(pnl_points=pnl, fill_time=datetime.now())
@@ -345,14 +315,17 @@ class ChanBspStrategy(CtaTemplate):
                 f"CLOSE: @ {trade.price:.1f} PnL={pnl:.0f}pts "
                 f"cumulative={self.total_pnl:.0f}pts trades={self.total_trades}"
             )
-            if self._entry_volume == 0:
-                self._entry_price = 0.0
-                self._entry_grade = ""
-                self._entry_direction_str = ""
-                self._pending_entry_context = None
+            if self._position_context is None:
+                self._pending_entry = None
                 self.exit_reason = ""
                 if self._exit_manager is not None:
                     self._exit_manager.on_close()
+                pending_reversal = self._pending_reversal
+                self._pending_reversal = None
+                if pending_reversal is not None:
+                    self._submit_open_intent(pending_reversal.intent)
+            elif self._exit_manager is not None:
+                self._exit_manager.on_position_updated(self._position_context)
 
         self.put_event()
 
@@ -376,10 +349,9 @@ class ChanBspStrategy(CtaTemplate):
             from chan_futures.config_loader import (
                 load_config,
                 make_exit_manager,
-                make_graded_strategy,
+                make_runtime_decision_kernel,
             )
             from chan_futures.risk import RiskConfig, RiskManager
-            from signal_core import SignalExtractor
         except ImportError as e:
             self.write_log(f"Import error: {e}. Check chan_project_path.")
             return
@@ -412,12 +384,15 @@ class ChanBspStrategy(CtaTemplate):
             autype=AUTYPE.NONE,
         )
 
-        # Shared decision strategy
-        self._wrapper = make_graded_strategy(cfg)
-
-        # SignalExtractor
+        # Shared decision kernel
         tf_str = kl_type.name.replace("K_", "").replace("M", "m")
-        self._extractor = SignalExtractor(symbol="RB", timeframe=tf_str)
+        self._decision_kernel = make_runtime_decision_kernel(
+            cfg,
+            symbol="RB",
+            timeframe=tf_str,
+        )
+        self._wrapper = self._decision_kernel.strategy
+        self._extractor = self._decision_kernel.extractor
 
         # ExitManager
         self._exit_manager = make_exit_manager(cfg)
@@ -477,9 +452,6 @@ class ChanBspStrategy(CtaTemplate):
         if self._exit_manager is None or not self._exit_manager.is_active:
             return None
 
-        from strategy_policy.exit_rules import SignalDirection as ExitSigDir
-        direction = ExitSigDir.LONG if self.pos > 0 else ExitSigDir.SHORT
-
         return self._exit_manager.check(
             bar_end_time=timestamp,
             open=float(bar.open_price),
@@ -499,6 +471,27 @@ class ChanBspStrategy(CtaTemplate):
             self.sell(order_price, abs(self.pos))
         elif self.pos < 0:
             self.cover(order_price, abs(self.pos))
+
+    def _submit_open_intent(self, intent: TradeIntent) -> None:
+        signal = intent.signal
+        planned_size = abs(signal.target_position)
+        if planned_size <= 0:
+            self.write_log("Decision rejected: position_size_zero")
+            return
+
+        self._pending_entry = PendingEntry(intent)
+        direction_str = self._get_signal_direction(signal)
+        if direction_str == "long":
+            order_ids = self.buy(signal.price, planned_size)
+        else:
+            order_ids = self.short(signal.price, planned_size)
+        if not order_ids:
+            self._pending_entry = None
+            return
+        self.write_log(
+            f"ENTRY: {intent.bsp_type} grade={intent.grade} "
+            f"dir={direction_str} @ {signal.price:.1f}"
+        )
 
     def _account_equity(self) -> float | None:
         fallback = self._config.sizing.capital if self._config else None
@@ -529,26 +522,15 @@ class ChanBspStrategy(CtaTemplate):
             return None
         return sum(self._true_ranges) / period
 
-    def _detect_opposite_signal(self) -> bool:
-        """Check if latest BSP signals a strategy reversal."""
-        try:
-            latest = self._chan.get_latest_bsp(idx=0, number=1)
-            if not latest or not latest[0]:
-                return False
-            bsp = latest[0]
-            inner = self._wrapper._inner
-            if inner._consumed_keys is not None:
-                key = (bsp.bi.idx, bsp.klu.idx, bsp.type2str(), bsp.is_buy)
-                if key in inner._consumed_keys:
-                    return False
-                inner._consumed_keys.add(key)
-            if self.pos > 0 and not bsp.is_buy:
-                return True
-            if self.pos < 0 and bsp.is_buy:
-                return True
-        except Exception:
-            pass
-        return False
+    @property
+    def position_context(self) -> PositionContext | None:
+        return self._position_context
+
+    @property
+    def decision_trace(self) -> tuple[DecisionTraceRecord, ...]:
+        if self._decision_kernel is None:
+            return ()
+        return self._decision_kernel.decision_trace
 
     # ============================================================
     # GUI variable update

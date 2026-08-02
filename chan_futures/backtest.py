@@ -6,7 +6,7 @@
   run_backtest(config) → BacktestResult
     └─ 每根 K 线：
        1. CChan.trigger_load(klu)
-       2. GradedChanStrategy.evaluate_bar() → SignalDecision
+       2. RuntimeDecisionKernel.evaluate_bar() → TradeIntent
        3. 如果有仓位：ExitManager.check(ctx) → 优先出场
        4. 如果 graded.accepted：RiskManager.approve() → execute()
        5. 统一 trade tracking
@@ -26,20 +26,21 @@ from ChanConfig import CChanConfig
 from Common.CEnum import AUTYPE, BSP_TYPE, DATA_SRC, KL_TYPE
 
 from .config import ExecutionParams, RiskParams, StrategyConfig
-from .config_loader import make_exit_manager, make_graded_strategy
+from .config_loader import make_exit_manager, make_runtime_decision_kernel
 from .execution import Fill, SimulatedExecutionEngine
 from .feed import prepare_ohlc_frame, row_to_klu
-from .graded_strategy import GradedChanStrategy
+from .runtime_kernel import RuntimeDecisionKernel
 from .risk import RiskConfig, RiskManager
 from .strategy import StrategySignal
-from signal_core import SignalExtractor
 from signal_core.models import SignalDecision, SignalDirection, SignalEvent
+from strategy_policy.position import PositionContext
 from strategy_policy.exit_rules import ExitManager, ExitSignal
 from strategy_policy.reporting import (
     StandardMetrics,
     compute_standard_metrics,
     save_standard_report,
 )
+from .trade_intent import DecisionTraceRecord
 
 
 _TYPE_STR_TO_BSP: dict[str, BSP_TYPE] = {
@@ -73,6 +74,7 @@ class BacktestResult:
     config: StrategyConfig        # 回测使用的配置 (只读)
     signal_events: list = field(default_factory=list)  # 全量 SignalEvent
     signal_decisions: list = field(default_factory=list)  # 含 rejected 的全量决策
+    decision_trace: list[DecisionTraceRecord] = field(default_factory=list)
 
     def save(self, output_dir: Path | str) -> None:
         """保存标准化报告。"""
@@ -101,6 +103,10 @@ class BacktestResult:
         if self.signal_decisions:
             pd.DataFrame([decision.to_dict() for decision in self.signal_decisions]).to_csv(
                 output_dir / "signal_decisions.csv", index=False, encoding="utf-8-sig"
+            )
+        if self.decision_trace:
+            pd.DataFrame([record.to_dict() for record in self.decision_trace]).to_csv(
+                output_dir / "decision_trace.csv", index=False, encoding="utf-8-sig"
             )
 
 
@@ -138,10 +144,13 @@ def run_backtest(
     # ── 构建 CChan ──
     chan = _new_chan(config, kl_type)
 
-    # ── 策略 (grade-filtered) ──
-    wrapper = make_graded_strategy(config)
+    # ── 三端共用决策内核 ──
     timeframe_str = kl_type.name.replace("K_", "").replace("M", "m")
-    extractor = SignalExtractor(symbol="RB", timeframe=timeframe_str)
+    decision_kernel = make_runtime_decision_kernel(
+        config,
+        symbol="RB",
+        timeframe=timeframe_str,
+    )
 
     # ── 出场规则 ──
     exit_manager = make_exit_manager(config)
@@ -171,12 +180,19 @@ def run_backtest(
         filter_ctx = pipeline.precompute(bars)
 
     # ── 回测循环 ──
-    records, fills_df, trades, exit_events, signal_events, signal_decisions = _run_loop(
+    (
+        records,
+        fills_df,
+        trades,
+        exit_events,
+        signal_events,
+        signal_decisions,
+        decision_trace,
+    ) = _run_loop(
         bars=bars,
         chan=chan,
         kl_type=kl_type,
-        wrapper=wrapper,
-        extractor=extractor,
+        decision_kernel=decision_kernel,
         exit_manager=exit_manager,
         use_exit_rules=use_exit_rules,
         risk=risk,
@@ -184,10 +200,6 @@ def run_backtest(
         config=config,
         filter_ctx=filter_ctx,
     )
-
-    # ── 处理末平仓 ──
-    if execution.state.position != 0:
-        _close_trade_at_end(trades, bars, execution, config)
 
     equity = pd.DataFrame(records)
     fills_df_final = pd.DataFrame([f.__dict__ for f in execution.fills])
@@ -202,6 +214,7 @@ def run_backtest(
         config=config,
         signal_events=signal_events,
         signal_decisions=signal_decisions,
+        decision_trace=decision_trace,
     )
 
 
@@ -215,8 +228,7 @@ def _run_loop(
     bars: pd.DataFrame,
     chan: CChan,
     kl_type: KL_TYPE,
-    wrapper: GradedChanStrategy,
-    extractor: SignalExtractor,
+    decision_kernel: RuntimeDecisionKernel,
     exit_manager: ExitManager,
     use_exit_rules: bool,
     risk: RiskManager,
@@ -230,6 +242,7 @@ def _run_loop(
     list[dict],
     list[SignalEvent],
     list[SignalDecision],
+    list[DecisionTraceRecord],
 ]:
     """每根 K 线的主循环。"""
 
@@ -238,39 +251,52 @@ def _run_loop(
     records: list[dict] = []
     exit_events: list[dict] = []
     trades: list[dict] = []
-    current_trade: dict | None = None
+    position_context: PositionContext | None = None
     atr_values = _calculate_atr(bars, config.sizing.atr_period)
     _bar_events: list[SignalEvent] = []
     _event_ids: set[str] = set()
     _decisions: list[SignalDecision] = []
+    extractor = decision_kernel.extractor
 
     def _close_trade(
         exit_bar: int, exit_price: float, exit_time,
         reason: str, rule_id: str = "strategy_reverse",
     ):
-        nonlocal current_trade
-        if current_trade is None:
+        nonlocal position_context
+        if position_context is None:
             return
-        lots = int(current_trade.get("lots", 1))
-        pnl = exit_price - current_trade["entry_price"]
-        if current_trade.get("direction") == "short":
-            pnl = -pnl
-        pnl = (pnl - fee_points * 2) * lots
-        current_trade.update({
+        entry_bar = position_context.entry_bar
+        pnl = position_context.pnl_points(
+            exit_price=exit_price,
+            fee_points=fee_points,
+        )
+        trade = {
+            "entry_bar": entry_bar,
+            "entry_price": position_context.entry_price,
+            "entry_time": position_context.entry_time,
+            "direction": position_context.direction.value,
+            "lots": position_context.volume,
+            "grade": position_context.entry_grade,
+            "active_symbol": position_context.active_symbol or "",
+            "event_id": position_context.event_id,
+            "signal_key": position_context.signal_key,
+            "decision_id": position_context.decision_id,
+            "setup_invalidation_price": position_context.setup_invalidation_price,
+            "execution_stop_price": position_context.execution_stop_price,
             "exit_bar": exit_bar, "exit_price": exit_price,
             "exit_time": exit_time,
-            "hold_bars": exit_bar - current_trade["entry_bar"],
+            "hold_bars": exit_bar - (entry_bar if entry_bar is not None else exit_bar),
             "pnl_points": round(pnl, 1),
             "exit_reason": reason, "exit_rule": rule_id,
-        })
-        trades.append(current_trade)
+        }
+        trades.append(trade)
         # 通知风控系统
         risk.on_fill(
             pnl_points=round(pnl, 1),
             fill_time=exit_time,
             current_equity=execution.mark_to_market(exit_price),
         )
-        current_trade = None
+        position_context = None
 
     for row_number, row in bars.iterrows():
         klu = row_to_klu(row, kl_type=kl_type)
@@ -325,12 +351,12 @@ def _run_loop(
 
         # ── 2. 检查入场信号 ──
         if exit_signal is None:
-            evaluated = wrapper.evaluate_bar(
+            evaluated = decision_kernel.evaluate_bar(
                 chan=chan,
                 current_position=execution.state.position,
                 price=price, timestamp=timestamp,
                 active_symbol=active_symbol_str,
-                lv_idx=0, extractor=extractor,
+                lv_idx=0,
                 account_equity=(
                     config.sizing.capital
                     + execution.mark_to_market(price)
@@ -345,7 +371,6 @@ def _run_loop(
                     _event_ids.add(evaluated.event.event_id)
             graded = evaluated if evaluated is not None and evaluated.accepted else None
             signal = graded.signal if graded is not None else None
-            grade_info = {"grade": graded.grade} if graded else None
 
             if signal is not None:
                 # ── 0. 过滤器检查 (DC + OBV + Volume) ──
@@ -384,33 +409,14 @@ def _run_loop(
                             )
                             exit_manager.on_close()
                         if fill is not None and fill.target_position != 0:
-                            direction = "long" if fill.target_position > 0 else "short"
-                            lots = abs(fill.target_position)
-                            event = graded.event
-                            signal_decision = graded.decision
-                            current_trade = {
-                                "entry_bar": row_number,
-                                "entry_price": fill.fill_price,
-                                "entry_time": timestamp,
-                                "direction": direction,
-                                "lots": lots,
-                                "grade": grade_info["grade"] if grade_info else "unknown",
-                                "active_symbol": active_symbol_str or "",
-                                "setup_invalidation_price": signal_decision.setup_invalidation_price,
-                                "execution_stop_price": signal_decision.execution_stop_price,
-                            }
-                            dir_enum = SignalDirection.LONG if direction == "long" else SignalDirection.SHORT
-                            eg = grade_info["grade"] if grade_info else None
-                            exit_manager.on_entry(
-                                direction=dir_enum,
-                                entry_price=fill.fill_price,
-                                bi_begin_price=event.bi_begin_price if event else None,
-                                zs_high=event.zs_high if event else None,
-                                zs_low=event.zs_low if event else None,
-                                initial_stop_price=signal_decision.execution_stop_price,
-                                invalidation_price=signal_decision.setup_invalidation_price,
-                                entry_grade=eg,
+                            position_context = graded.position_from_fill(
+                                fill_price=fill.fill_price,
+                                fill_volume=abs(fill.target_position),
+                                fill_time=timestamp,
+                                entry_bar=row_number,
+                                active_symbol=active_symbol_str,
                             )
+                            exit_manager.on_position_opened(position_context)
 
         # ── 3. 记录 bar-level 快照 ──
         records.append({
@@ -433,7 +439,54 @@ def _run_loop(
                         _bar_events.append(evt)
                         _event_ids.add(evt.event_id)
 
-    return records, pd.DataFrame(), trades, exit_events, _bar_events, _decisions
+    if position_context is not None and execution.state.position != 0 and records:
+        last_bar = bars.iloc[-1]
+        exit_price = float(last_bar["close"])
+        action = (
+            "close_long"
+            if position_context.direction == SignalDirection.LONG
+            else "close_short"
+        )
+        end_signal = StrategySignal(
+            timestamp=last_bar["datetime"],
+            action=action,
+            target_position=0,
+            price=exit_price,
+            reason="end_of_data",
+            bsp_type="exit",
+            bsp_bi_idx=-1,
+            bsp_klu_idx=-1,
+            active_symbol=position_context.active_symbol,
+        )
+        fill = execution.execute(end_signal)
+        executed_exit = fill.fill_price if fill is not None else exit_price
+        _close_trade(
+            exit_bar=len(bars) - 1,
+            exit_price=executed_exit,
+            exit_time=last_bar["datetime"],
+            reason="end_of_data",
+            rule_id="end_of_data",
+        )
+        exit_manager.on_close()
+        records[-1].update(
+            {
+                "position": execution.state.position,
+                "avg_price": execution.state.avg_price,
+                "realized_points": execution.state.realized_points,
+                "equity_points": execution.mark_to_market(exit_price),
+                "exit_reason": "end_of_data",
+            }
+        )
+
+    return (
+        records,
+        pd.DataFrame(),
+        trades,
+        exit_events,
+        _bar_events,
+        _decisions,
+        list(decision_kernel.decision_trace),
+    )
 
 
 # ════════════════════════════════════════════════════════════════
@@ -496,35 +549,6 @@ def _finite_or_none(value: object) -> float | None:
     if pd.isna(value):
         return None
     return float(value)
-
-
-def _close_trade_at_end(
-    trades: list[dict],
-    bars: pd.DataFrame,
-    execution: SimulatedExecutionEngine,
-    config: StrategyConfig,
-) -> None:
-    """以最后一根 bar 的收盘价平掉末平仓。"""
-    last_bar = bars.iloc[-1]
-    exit_price = float(last_bar["close"])
-    # Build an end-of-data trade record
-    trade = {
-        "entry_bar": len(bars) - 1,
-        "entry_price": exit_price,
-        "entry_time": last_bar["datetime"],
-        "exit_bar": len(bars) - 1,
-        "exit_price": exit_price,
-        "exit_time": last_bar["datetime"],
-        "exit_reason": "end_of_data",
-        "exit_rule": "end_of_data",
-        "direction": "long" if execution.state.position > 0 else "short",
-        "lots": abs(execution.state.position),
-        "pnl_points": 0.0,
-        "hold_bars": 0,
-        "grade": "unknown",
-        "active_symbol": "",
-    }
-    trades.append(trade)
 
 
 # ════════════════════════════════════════════════════════════════
