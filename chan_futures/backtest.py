@@ -213,6 +213,9 @@ def run_backtest(
     risk = RiskManager(RiskConfig(
         max_abs_position=config.risk.max_abs_position,
         max_loss_points=config.risk.max_loss_points,
+        daily_loss_limit=config.risk.daily_loss_limit,
+        max_consecutive_losses=config.risk.max_consecutive_losses,
+        max_drawdown_pct=config.risk.max_drawdown_pct,
     ))
     execution = SimulatedExecutionEngine(
         fee_points=config.execution.fee_points,

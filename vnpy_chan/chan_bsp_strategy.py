@@ -18,6 +18,7 @@ Ensure chan.py project is in PYTHONPATH.
 from __future__ import annotations
 
 import sys
+import json
 from datetime import datetime
 from pathlib import Path
 import pandas as pd
@@ -47,10 +48,16 @@ from chan_futures.trade_intent import DecisionTraceRecord, PendingEntry, TradeIn
 from chan_futures.execution import adverse_fill_price
 from signal_core import SignalDirection, SignalState
 from strategy_policy.position import PositionContext
+from vnpy_chan.order_state import CtaOrderStatusMachine
+from vnpy_chan.production_guard import (
+    DEFAULT_RISK_MANAGER_SETTING_PATH,
+    evaluate_production_gate,
+)
+from vnpy_chan.session_aggregator import RbSessionBarAggregator, SUPPORTED_WINDOWS
 
 # Config defaults
 DEFAULT_CHAN_PROJECT = "H:/Github/chan.py"
-DEFAULT_CONFIG_YAML = "configs/rb_15m_trend_ideal.yaml"
+DEFAULT_CONFIG_YAML = "configs/rb_15m_qingpai_strict.yaml"
 
 
 class ChanBspStrategy(CtaTemplate):
@@ -72,6 +79,11 @@ class ChanBspStrategy(CtaTemplate):
     kl_window = 15
     fixed_size = 1
     load_days = 30
+    production_ready = False
+    shadow_mode = True
+    forward_confirmed = False
+    risk_manager_confirmed = False
+    risk_manager_setting_path = str(DEFAULT_RISK_MANAGER_SETTING_PATH)
 
     # --- vnpy variables (displayed in GUI) ---
     bi_count = 0
@@ -85,6 +97,13 @@ class ChanBspStrategy(CtaTemplate):
     total_trades = 0
     total_pnl = 0.0
     peak_equity = 0.0
+    production_status = "not_initialized"
+    production_block_reason = ""
+    risk_status = "unknown"
+    order_status = "idle"
+    position_state_json = ""
+    risk_state_json = ""
+    order_state_json = ""
 
     parameters = [
         "chan_project_path",
@@ -92,6 +111,11 @@ class ChanBspStrategy(CtaTemplate):
         "kl_window",
         "fixed_size",
         "load_days",
+        "production_ready",
+        "shadow_mode",
+        "forward_confirmed",
+        "risk_manager_confirmed",
+        "risk_manager_setting_path",
     ]
     variables = [
         "bi_count",
@@ -105,6 +129,13 @@ class ChanBspStrategy(CtaTemplate):
         "total_trades",
         "total_pnl",
         "peak_equity",
+        "production_status",
+        "production_block_reason",
+        "risk_status",
+        "order_status",
+        "position_state_json",
+        "risk_state_json",
+        "order_state_json",
     ]
 
     # --- Constructor ---
@@ -117,10 +148,12 @@ class ChanBspStrategy(CtaTemplate):
             if p and Path(p).exists() and str(p) not in sys.path:
                 sys.path.insert(0, str(p))
 
-        # BarGenerator for N-minute bar synthesis
-        self.bg = BarGenerator(self.on_bar, self.kl_window, self._on_kl_bar)
-        self._parent_bg = None
-        self._child_bg = None
+        # BarGenerator is used only for tick -> 1m.  N-minute aggregation is
+        # session-aware and mirrors data_foundation historical replay rules.
+        self.bg = BarGenerator(self.on_bar)
+        self._kl_aggregator = self._make_session_aggregator(self.kl_window)
+        self._parent_aggregator = None
+        self._child_aggregator = None
         self._parent_kl_type = None
         self._child_kl_type = None
 
@@ -132,6 +165,9 @@ class ChanBspStrategy(CtaTemplate):
         self._exit_manager = None
         self._risk = None
         self._config = None
+        self._production_gate = None
+        self._order_state = CtaOrderStatusMachine()
+        self._runtime_state_restored = False
 
         self._position_context: PositionContext | None = None
         self._pending_entry: PendingEntry | None = None
@@ -148,6 +184,11 @@ class ChanBspStrategy(CtaTemplate):
         """Initialize: load historical bars and warm up CChan."""
         self.write_log(f"ChanBspStrategy init: {self.vt_symbol}")
         self._init_chan_pipeline()
+        gate = self._refresh_production_gate()
+        if not gate.ready and not self.shadow_mode:
+            message = f"Production gate blocked: {gate.reason_text}"
+            self.write_log(message)
+            raise RuntimeError(message)
 
         if self.load_days > 0:
             self.write_log(f"Loading {self.load_days} days of historical bars...")
@@ -163,7 +204,12 @@ class ChanBspStrategy(CtaTemplate):
 
     def on_start(self):
         """Start trading."""
-        self.write_log("ChanBspStrategy started")
+        self._restore_runtime_state()
+        gate = self._refresh_production_gate()
+        self.write_log(
+            f"ChanBspStrategy started mode={gate.mode} "
+            f"reason={gate.reason_text or 'ready'}"
+        )
 
     def on_stop(self):
         """Stop trading."""
@@ -184,11 +230,20 @@ class ChanBspStrategy(CtaTemplate):
         """1-min bar -> BarGenerator -> N-min bar."""
         # Complete child and parent bars first.  Evidence sharing the same
         # close timestamp is therefore visible to the current-level decision.
-        if self._child_bg is not None:
-            self._child_bg.update_bar(bar)
-        if self._parent_bg is not None:
-            self._parent_bg.update_bar(bar)
-        self.bg.update_bar(bar)
+        if self._child_aggregator is not None:
+            child_bar = self._child_aggregator.update_bar(bar)
+            if child_bar is not None:
+                self._on_child_bar(child_bar)
+        if self._parent_aggregator is not None:
+            parent_bar = self._parent_aggregator.update_bar(bar)
+            if parent_bar is not None:
+                self._on_parent_bar(parent_bar)
+        if self._kl_aggregator is None:
+            self._on_kl_bar(bar)
+            return
+        kl_bar = self._kl_aggregator.update_bar(bar)
+        if kl_bar is not None:
+            self._on_kl_bar(kl_bar)
 
     def _on_parent_bar(self, bar: BarData):
         if self._decision_kernel is None or self._parent_kl_type is None:
@@ -271,11 +326,16 @@ class ChanBspStrategy(CtaTemplate):
 
             signal = intent.signal
             if self._risk is not None:
-                risk_decision = self._risk.approve(signal)
+                risk_decision = self._risk.approve(
+                    signal,
+                    current_equity=self._account_equity(),
+                )
                 if not risk_decision.approved:
                     self.write_log(f"Risk rejected: {risk_decision.reason}")
+                    self.risk_status = risk_decision.reason
                     self.put_event()
                     return
+                self.risk_status = "approved"
 
             if self.pos == 0:
                 self._submit_open_intent(intent)
@@ -296,6 +356,9 @@ class ChanBspStrategy(CtaTemplate):
 
     def on_trade(self, trade: TradeData):
         """Track PnL on close."""
+        self._ensure_runtime_state_helpers()
+        self._order_state.on_trade(trade)
+        self.order_status = self._order_state.summary
         if trade.offset == Offset.OPEN:
             fill_volume = int(trade.volume)
             pending = self._pending_entry
@@ -330,6 +393,7 @@ class ChanBspStrategy(CtaTemplate):
             self.write_log(
                 f"OPEN FILLED: @ {trade.price:.1f} volume={fill_volume}"
             )
+            self._persist_runtime_state()
             self.put_event()
             return
 
@@ -347,7 +411,11 @@ class ChanBspStrategy(CtaTemplate):
             self._position_context = self._position_context.reduce_volume(fill_volume)
 
             if self._risk is not None:
-                self._risk.on_fill(pnl_points=pnl, fill_time=datetime.now())
+                self._risk.on_fill(
+                    pnl_points=pnl,
+                    fill_time=getattr(trade, "datetime", None) or datetime.now(),
+                    current_equity=self._account_equity(),
+                )
 
             self.write_log(
                 f"CLOSE: @ {trade.price:.1f} PnL={pnl:.0f}pts "
@@ -365,13 +433,24 @@ class ChanBspStrategy(CtaTemplate):
             elif self._exit_manager is not None:
                 self._exit_manager.on_position_updated(self._position_context)
 
+        self._persist_runtime_state()
         self.put_event()
 
     def on_order(self, order: OrderData):
-        pass
+        self._ensure_runtime_state_helpers()
+        tracked = self._order_state.on_order(order)
+        self.order_status = self._order_state.summary
+        if not tracked.active and tracked.role.startswith("open") and tracked.traded <= 0:
+            self._pending_entry = None
+        self._persist_runtime_state()
+        self.put_event()
 
     def on_stop_order(self, stop_order: StopOrder):
-        pass
+        self._ensure_runtime_state_helpers()
+        self._order_state.on_stop_order(stop_order)
+        self.order_status = self._order_state.summary
+        self._persist_runtime_state()
+        self.put_event()
 
     # ============================================================
     # Internal: initialize chan pipeline (lazy)
@@ -396,11 +475,11 @@ class ChanBspStrategy(CtaTemplate):
 
         # Load config
         config_path = Path(self.chan_project_path) / self.config_yaml
-        if config_path.exists():
-            self._config = load_config(str(config_path))
-        else:
-            from chan_futures.config import StrategyConfig
-            self._config = StrategyConfig()
+        if not config_path.is_file():
+            raise FileNotFoundError(
+                f"P7 strategy config not found: {config_path.resolve()}"
+            )
+        self._config = load_config(str(config_path))
 
         cfg = self._config
 
@@ -442,15 +521,11 @@ class ChanBspStrategy(CtaTemplate):
             }
             self._parent_kl_type = w2k[level_to_window[cfg.multi_level.parent_kl_type]]
             self._child_kl_type = w2k[level_to_window[cfg.multi_level.child_kl_type]]
-            self._parent_bg = BarGenerator(
-                self.on_bar,
+            self._parent_aggregator = self._make_session_aggregator(
                 level_to_window[cfg.multi_level.parent_kl_type],
-                self._on_parent_bar,
             )
-            self._child_bg = BarGenerator(
-                self.on_bar,
+            self._child_aggregator = self._make_session_aggregator(
                 level_to_window[cfg.multi_level.child_kl_type],
-                self._on_child_bar,
             )
 
         # ExitManager
@@ -463,6 +538,7 @@ class ChanBspStrategy(CtaTemplate):
                 max_loss_points=cfg.risk.max_loss_points,
                 daily_loss_limit=cfg.risk.daily_loss_limit,
                 max_consecutive_losses=cfg.risk.max_consecutive_losses,
+                max_drawdown_pct=cfg.risk.max_drawdown_pct,
             )
         )
 
@@ -521,16 +597,17 @@ class ChanBspStrategy(CtaTemplate):
 
     @staticmethod
     def _window_end_time(bar: BarData, kl_type) -> datetime:
-        from datetime import timedelta
+        return pd.Timestamp(bar.datetime).to_pydatetime()
 
-        minutes = {
-            "K_1M": 1,
-            "K_5M": 5,
-            "K_15M": 15,
-            "K_30M": 30,
-            "K_60M": 60,
-        }.get(kl_type.name, 1)
-        return pd.Timestamp(bar.datetime).to_pydatetime() + timedelta(minutes=minutes)
+    def _make_session_aggregator(self, window: int):
+        if int(window) == 1:
+            return None
+        if int(window) not in SUPPORTED_WINDOWS:
+            supported = ", ".join(str(value) for value in sorted(SUPPORTED_WINDOWS))
+            raise ValueError(
+                f"ChanBspStrategy supports session aggregation windows: {supported}"
+            )
+        return RbSessionBarAggregator(int(window))
 
     # ============================================================
     # Exit checking
@@ -578,9 +655,35 @@ class ChanBspStrategy(CtaTemplate):
         order_price = float(bar.close_price) if price is None else float(price)
         order_price = self._execution_price(order_price, -int(self.pos))
         if self.pos > 0:
-            self.sell(order_price, abs(self.pos))
+            order_ids = self._send_live_or_shadow(
+                "close",
+                lambda: self.sell(order_price, abs(self.pos)),
+                price=order_price,
+                volume=abs(self.pos),
+                closing=True,
+                reason=reason,
+            )
         elif self.pos < 0:
-            self.cover(order_price, abs(self.pos))
+            order_ids = self._send_live_or_shadow(
+                "close",
+                lambda: self.cover(order_price, abs(self.pos)),
+                price=order_price,
+                volume=abs(self.pos),
+                closing=True,
+                reason=reason,
+            )
+        else:
+            order_ids = []
+        if order_ids:
+            self._order_state.submit(
+                order_ids,
+                role="close",
+                price=order_price,
+                volume=abs(self.pos),
+                reason=reason,
+            )
+            self.order_status = "pending_close"
+            self._persist_runtime_state()
 
     def _submit_open_intent(self, intent: TradeIntent) -> None:
         signal = intent.signal
@@ -593,16 +696,68 @@ class ChanBspStrategy(CtaTemplate):
         direction_str = self._get_signal_direction(signal)
         order_price = self._execution_price(signal.price, signal.target_position)
         if direction_str == "long":
-            order_ids = self.buy(order_price, planned_size)
+            order_ids = self._send_live_or_shadow(
+                "open_long",
+                lambda: self.buy(order_price, planned_size),
+                price=order_price,
+                volume=planned_size,
+                closing=False,
+                reason=intent.event_id,
+            )
         else:
-            order_ids = self.short(order_price, planned_size)
+            order_ids = self._send_live_or_shadow(
+                "open_short",
+                lambda: self.short(order_price, planned_size),
+                price=order_price,
+                volume=planned_size,
+                closing=False,
+                reason=intent.event_id,
+            )
         if not order_ids:
             self._pending_entry = None
             return
+        self._order_state.submit(
+            order_ids,
+            role="open",
+            price=order_price,
+            volume=planned_size,
+            reason=intent.event_id,
+        )
+        self.order_status = "pending_open"
+        self._persist_runtime_state()
         self.write_log(
             f"ENTRY: {intent.bsp_type} grade={intent.grade} "
             f"dir={direction_str} @ {order_price:.1f}"
         )
+
+    def _send_live_or_shadow(
+        self,
+        action: str,
+        sender,
+        *,
+        price: float,
+        volume: int | float,
+        closing: bool,
+        reason: str,
+    ) -> list:
+        gate = self._refresh_production_gate()
+        if self.shadow_mode:
+            self.order_status = "shadow"
+            self.write_log(
+                f"SHADOW {action}: {self.vt_symbol} volume={volume} "
+                f"price={price:.1f} reason={reason}"
+            )
+            return []
+        if not closing and not gate.ready:
+            self.order_status = "blocked"
+            self.write_log(f"Order blocked by production gate: {gate.reason_text}")
+            return []
+        if closing and not gate.ready:
+            self.write_log(
+                "Risk-reducing close allowed while production gate is blocked: "
+                f"{gate.reason_text}"
+            )
+        return sender()
 
     def _execution_price(self, price: float, quantity_delta: int) -> float:
         config = getattr(self, "_config", None)
@@ -655,6 +810,77 @@ class ChanBspStrategy(CtaTemplate):
         if len(self._true_ranges) < period:
             return None
         return sum(self._true_ranges) / period
+
+    def _refresh_production_gate(self):
+        self._ensure_runtime_state_helpers()
+        gate = evaluate_production_gate(
+            config=self._config,
+            kl_window=int(self.kl_window),
+            production_ready=bool(self.production_ready),
+            shadow_mode=bool(self.shadow_mode),
+            forward_confirmed=bool(self.forward_confirmed),
+            risk_manager_confirmed=bool(self.risk_manager_confirmed),
+            risk_manager_setting_path=self.risk_manager_setting_path,
+            pending_order_count=self._order_state.active_count,
+        )
+        self._production_gate = gate
+        self.production_status = gate.mode if gate.ready else "blocked"
+        self.production_block_reason = gate.reason_text
+        return gate
+
+    def _persist_runtime_state(self) -> None:
+        self._ensure_runtime_state_helpers()
+        self.order_state_json = self._order_state.to_json()
+        risk = getattr(self, "_risk", None)
+        if risk is not None:
+            self.risk_state_json = json.dumps(
+                risk.get_state(),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        self.position_state_json = json.dumps(
+            _position_context_to_dict(getattr(self, "_position_context", None)),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    def _restore_runtime_state(self) -> None:
+        self._ensure_runtime_state_helpers()
+        if self._runtime_state_restored:
+            return
+        self._runtime_state_restored = True
+        if self.order_state_json:
+            try:
+                self._order_state = CtaOrderStatusMachine.from_json(
+                    self.order_state_json,
+                )
+                self.order_status = self._order_state.summary
+            except Exception as exc:
+                self.order_status = "recovery_error"
+                self.write_log(f"Order state restore failed: {exc}")
+        if self.risk_state_json and self._risk is not None:
+            try:
+                self._risk.load_state(json.loads(self.risk_state_json))
+                self.risk_status = "restored"
+            except Exception as exc:
+                self.risk_status = "restore_error"
+                self.write_log(f"Risk state restore failed: {exc}")
+        if self.position_state_json:
+            try:
+                restored = _position_context_from_dict(
+                    json.loads(self.position_state_json)
+                )
+                self._position_context = restored
+                if restored is not None and self._exit_manager is not None:
+                    self._exit_manager.on_position_opened(restored)
+            except Exception as exc:
+                self.write_log(f"Position state restore failed: {exc}")
+
+    def _ensure_runtime_state_helpers(self) -> None:
+        if not hasattr(self, "_order_state"):
+            self._order_state = CtaOrderStatusMachine()
+        if not hasattr(self, "_runtime_state_restored"):
+            self._runtime_state_restored = False
 
     @property
     def position_context(self) -> PositionContext | None:
@@ -714,3 +940,51 @@ def _confirmed_opposite(intent: TradeIntent | None, position: int) -> bool:
     return (
         position > 0 and intent.event.direction == SignalDirection.SHORT
     ) or (position < 0 and intent.event.direction == SignalDirection.LONG)
+
+
+def _position_context_to_dict(context: PositionContext | None) -> dict:
+    if context is None:
+        return {}
+    return {
+        "direction": context.direction.value,
+        "entry_price": context.entry_price,
+        "entry_time": str(context.entry_time) if context.entry_time is not None else "",
+        "entry_bar": context.entry_bar,
+        "volume": context.volume,
+        "entry_grade": context.entry_grade,
+        "event_id": context.event_id,
+        "signal_key": context.signal_key,
+        "decision_id": context.decision_id,
+        "policy_id": context.policy_id,
+        "bsp_type": context.bsp_type,
+        "active_symbol": context.active_symbol,
+        "bi_begin_price": context.bi_begin_price,
+        "zs_high": context.zs_high,
+        "zs_low": context.zs_low,
+        "setup_invalidation_price": context.setup_invalidation_price,
+        "execution_stop_price": context.execution_stop_price,
+    }
+
+
+def _position_context_from_dict(data: dict) -> PositionContext | None:
+    if not data:
+        return None
+    return PositionContext(
+        direction=SignalDirection(data["direction"]),
+        entry_price=float(data["entry_price"]),
+        entry_time=data.get("entry_time") or None,
+        entry_bar=data.get("entry_bar"),
+        volume=int(data["volume"]),
+        entry_grade=str(data.get("entry_grade", "standard")),
+        event_id=str(data.get("event_id", "")),
+        signal_key=str(data.get("signal_key", "")),
+        decision_id=str(data.get("decision_id", "")),
+        policy_id=str(data.get("policy_id", "")),
+        bsp_type=str(data.get("bsp_type", "")),
+        active_symbol=data.get("active_symbol"),
+        bi_begin_price=data.get("bi_begin_price"),
+        zs_high=data.get("zs_high"),
+        zs_low=data.get("zs_low"),
+        setup_invalidation_price=data.get("setup_invalidation_price"),
+        execution_stop_price=data.get("execution_stop_price"),
+    )

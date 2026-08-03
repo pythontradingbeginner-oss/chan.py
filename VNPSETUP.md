@@ -7,9 +7,28 @@ vnpy 的 CTA 策略管理器会扫描以下目录下的 `*.py` 文件，提取�
 1. **用户策略目录**：`C:\Users\Administrator\strategies\`
 2. **vnpy_ctastrategy 内置目录**：`vnpy_ctastrategy/strategies/`
 
-已创建的策略文件：
+P7 生产基线策略文件在本仓库内：
 ```
-C:\Users\Administrator\strategies\chan_bsp_strategy.py
+H:\Github\chan.py\vnpy_chan\chan_bsp_strategy.py
+```
+
+`C:\Users\Administrator\strategies\chan_bsp_strategy.py` 必须由上述仓库文件
+原字节部署，不能单独维护另一份实现。旧版文件已备份为
+`chan_bsp_strategy.py.legacy-20260713.bak`，该扩展名不会被 CTA 策略扫描器加载。
+
+部署后运行以下只读检查，校验仓库策略、用户目录策略、严格配置和
+RiskManager 发布模板的 SHA256：
+
+```powershell
+python scripts\verify_p7_release.py
+```
+
+正式冻结发布时使用更严格的检查；它还要求工作树干净、发布状态为
+`frozen`，并验证 `release_commit` 所指冻结实现提交中的策略、配置和
+RiskManager 模板哈希。允许当前 HEAD 是位于冻结实现提交之后的清单封印提交：
+
+```powershell
+python scripts\verify_p7_release.py --require-release-ready
 ```
 
 ## 第二步：确保 PYTHONPATH 包含 chan.py 项目
@@ -35,12 +54,16 @@ PYTHONPATH=H:\Github\chan.py
 3. 在策略管理器中选择 "ChanBspStrategy"
 4. 配置参数：
    - chan_project_path: H:/Github/chan.py
-   - config_yaml: configs/rb_15m_trend_ideal.yaml
+   - config_yaml: configs/rb_15m_qingpai_strict.yaml
    - kl_window: 15  (K 线周期，分钟)
    - fixed_size: 1  (固定手数)
    - load_days: 30  (初始化加载历史 K 线天数)
+   - shadow_mode: true  (默认影子运行，不真实下单)
+   - production_ready: false
+   - forward_confirmed: false
+   - risk_manager_confirmed: false
 5. 点击「初始化」
-6. 点击「启动」
+6. 点击「启动」后先观察影子日志，不会真实下单
 ```
 
 ## 策略参数说明
@@ -48,10 +71,15 @@ PYTHONPATH=H:\Github\chan.py
 | 参数 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | chan_project_path | str | H:/Github/chan.py | chan.py 项目根目录 |
-| config_yaml | str | configs/rb_15m_trend_ideal.yaml | 策略配置文件 (相对或绝对路径) |
-| kl_window | int | 15 | K 线周期 (分钟) |
+| config_yaml | str | configs/rb_15m_qingpai_strict.yaml | P7 生产候选策略配置 |
+| kl_window | int | 15 | K 线周期 (分钟)，实盘门禁支持 5/15/60 |
 | fixed_size | int | 1 | 固定开仓手数 |
 | load_days | int | 30 | 初始化时加载的历史数据天数 |
+| production_ready | bool | false | 真实下单人工确认 |
+| shadow_mode | bool | true | 影子运行；为 true 时只记录信号不发单 |
+| forward_confirmed | bool | false | 前向仿真/影子观察通过确认 |
+| risk_manager_confirmed | bool | false | VeighNa RiskManager 已启用确认 |
+| risk_manager_setting_path | str | C:/Users/Administrator/.vntrader/risk_manager_setting.json | RiskManager 配置检查路径 |
 
 ## GUI 实时监控变量
 
@@ -68,11 +96,18 @@ PYTHONPATH=H:\Github\chan.py
 | total_trades | 累计交易笔数 |
 | total_pnl | 累计盈亏 (点) |
 | peak_equity | 峰值权益 |
+| production_status | shadow / production / blocked |
+| production_block_reason | 实盘门禁阻断原因 |
+| risk_status | 策略内 RiskManager 状态 |
+| order_status | CTA 委托状态摘要 |
 
 ## 策略内部管线 (每个 15 分钟 bar 触发)
 
 ```
-BarData (vnpy CTP)
+1m BarData (vnpy CTP)
+    │
+    ▼
+RbSessionBarAggregator (RB 交易时段感知 5m/15m/60m)
     │
     ▼
 CKLine_Unit (chan.py)
@@ -97,22 +132,45 @@ GradeFilter (只通过 grade >= config.min_grade)
     │     ├── TrailingStopRule (跟踪止损)
     │     └── TimeStopRule (超时出场)
     │
-    ├── 如果无持仓 + grade 通过 → vnpy buy/short
+    ├── 如果无持仓 + grade 通过 + production gate ready → vnpy buy/short
     │
     └── 如果反向 BSP → vnpy sell/cover (策略反转)
 ```
+
+## P7 真实下单门禁
+
+默认 `shadow_mode=true`，策略只记录信号，不会真实下单。要允许真实开仓，
+必须同时满足：
+
+- `production_ready=true`
+- `shadow_mode=false`
+- `forward_confirmed=true`
+- `risk_manager_confirmed=true`
+- `risk_manager_setting_path` 指向的 VeighNa RiskManager 配置至少有一条启用规则
+- 策略配置中 `production.enabled=true` 且包含硬风控参数和出场规则
+- 当前没有待恢复活动委托
+
+发布参考文件：
+
+- `configs/p7_release_manifest.json`
+- `configs/veighna_risk_manager_setting.p7.json`
+
+当前清单若为 `candidate_uncommitted`，只表示部署候选物哈希一致，不表示
+已经通过正式发布门禁。
+
+当前用户目录下的 RiskManager 配置若全部 `active=false`，真实模式会被阻断。
 
 ## 修改策略参数
 
 策略参数在 `config_yaml` 指定的 YAML 文件中：
 ```yaml
-# configs/rb_15m_trend_ideal.yaml
+# configs/rb_15m_qingpai_strict.yaml
 code: RB_MAIN
 kl_type: K_15M
 allow_short: true
 
 grading:
-  min_grade: ideal     # 修改此处调整信号质量要求
+  min_grade: standard
 
 exits:
   - type: StructureStopRule
@@ -130,7 +188,8 @@ exits:
 
 risk:
   max_abs_position: 1
-  max_consecutive_losses: 5  # 修改此处调整连续亏损上限
+  max_loss_points: 600.0
+  max_consecutive_losses: 5
 
 execution:
   fee_points: 1.0     # 修改此处调整手续费假设

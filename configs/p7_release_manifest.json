@@ -1,0 +1,60 @@
+{
+  "phase": "P7",
+  "name": "VeighNa 实盘工程化与前向验证",
+  "release_status": "candidate_uncommitted",
+  "built_at": "2026-08-03T21:59:11+08:00",
+  "baseline_commit": "ab31edcdc2fca71c472b3ae7485266adee4de194",
+  "repository_head": "ab31edcdc2fca71c472b3ae7485266adee4de194",
+  "release_commit": null,
+  "source_tree_clean_at_build": false,
+  "production_host": "VeighNa CtaStrategyApp + vnpy_chan.chan_bsp_strategy.ChanBspStrategy",
+  "target_environment": {
+    "python": "3.13.8",
+    "veighna": "4.4.0",
+    "vnpy_ctastrategy": "1.4.1",
+    "vnpy_riskmanager": "2.0.0",
+    "vnpy_ctp": "6.7.11.3"
+  },
+  "strategy_config": "configs/rb_15m_qingpai_strict.yaml",
+  "risk_manager_setting": "configs/veighna_risk_manager_setting.p7.json",
+  "supported_realtime_windows": [5, 15, 60],
+  "default_runtime_mode": "shadow",
+  "config_summary": {
+    "code": "RB_MAIN",
+    "kl_type": "K_15M",
+    "entry_policy_id": "rb_15m_qingpai_strict_v1",
+    "entry_policy_mode": "qingpai_strict",
+    "minimum_grade": "standard",
+    "production_warmup_bars": 800,
+    "max_abs_position": 1,
+    "max_loss_points": 600.0,
+    "max_consecutive_losses": 5,
+    "max_margin_utilization": 0.5
+  },
+  "artifacts": {
+    "strategy_source": {
+      "path": "vnpy_chan/chan_bsp_strategy.py",
+      "sha256": "d5e683460a8598b0b66bfebecceacf4d12e506772f97bdc9b668dfc891914691"
+    },
+    "strategy_deployed": {
+      "path": "~/strategies/chan_bsp_strategy.py",
+      "sha256": "d5e683460a8598b0b66bfebecceacf4d12e506772f97bdc9b668dfc891914691"
+    },
+    "strategy_config": {
+      "path": "configs/rb_15m_qingpai_strict.yaml",
+      "sha256": "0c167994a42bc32b39d290dab7c4942b9318ca6bf7f74148b3024b9715a27037"
+    },
+    "risk_manager_profile": {
+      "path": "configs/veighna_risk_manager_setting.p7.json",
+      "sha256": "fcfbca4cee63d79e69af482d537805c0f671c3816867e9f7509751576b199c09"
+    }
+  },
+  "live_order_gate": [
+    "production_ready=true",
+    "shadow_mode=false",
+    "forward_confirmed=true",
+    "risk_manager_confirmed=true",
+    "VeighNa RiskManager setting has at least one active rule",
+    "strategy config has production.enabled=true and hard risk limits"
+  ]
+}

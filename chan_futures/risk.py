@@ -185,8 +185,25 @@ class RiskManager:
             "peak_equity": self._peak_equity,
             "total_fills": self._total_fills,
             "daily_realized": self._daily_realized,
+            "current_date": str(self._current_date) if self._current_date is not None else None,
             "consecutive_losses": self._consecutive_losses,
         }
+
+    def load_state(self, state: dict) -> None:
+        """Restore serialized risk counters after a CTA strategy restart."""
+        self._realized_points = float(state.get("realized_points", 0.0) or 0.0)
+        self._peak_equity = float(state.get("peak_equity", 0.0) or 0.0)
+        self._total_fills = int(state.get("total_fills", 0) or 0)
+        self._daily_realized = float(state.get("daily_realized", 0.0) or 0.0)
+        current_date = state.get("current_date")
+        if current_date:
+            try:
+                self._current_date = pd.Timestamp(current_date).date()
+            except Exception:
+                self._current_date = current_date
+        else:
+            self._current_date = None
+        self._consecutive_losses = int(state.get("consecutive_losses", 0) or 0)
 
     def summary(self) -> str:
         """返回可读的风控状态摘要。"""
@@ -216,6 +233,11 @@ def _resolve_date(fill_time: object) -> object:
     """从各种时间类型中解析日期。"""
     if isinstance(fill_time, pd.Timestamp):
         return fill_time.date()
+    if isinstance(fill_time, str):
+        try:
+            return pd.Timestamp(fill_time).date()
+        except Exception:
+            return fill_time
     if hasattr(fill_time, "date"):
         return fill_time.date()
     return fill_time

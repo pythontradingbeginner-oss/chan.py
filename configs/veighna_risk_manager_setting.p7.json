@@ -1,0 +1,33 @@
+{
+  "每日上限检查": {
+    "active": true,
+    "total_order_limit": 200,
+    "total_cancel_limit": 100,
+    "total_trade_limit": 100,
+    "contract_order_limit": 20,
+    "contract_cancel_limit": 10,
+    "contract_trade_limit": 50
+  },
+  "重复报单检查": {
+    "active": true,
+    "duplicate_order_limit": 3
+  },
+  "时间窗口流量检查": {
+    "active": true,
+    "order_limit": 20,
+    "cancel_limit": 10,
+    "window_seconds": 60
+  },
+  "活动委托检查": {
+    "active": true,
+    "active_order_limit": 3
+  },
+  "委托规模检查": {
+    "active": true,
+    "order_volume_limit": 1,
+    "order_value_limit": 80000.0
+  },
+  "委托指令检查": {
+    "active": true
+  }
+}

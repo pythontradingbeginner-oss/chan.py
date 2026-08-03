@@ -1,0 +1,170 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from chan_futures.config_loader import load_config
+from vnpy_chan.chan_bsp_strategy import ChanBspStrategy
+from vnpy_chan.production_guard import (
+    evaluate_production_gate,
+    inspect_risk_manager_setting,
+)
+
+
+def test_shadow_mode_passes_gate_without_live_confirmations(tmp_path) -> None:
+    result = evaluate_production_gate(
+        config=None,
+        kl_window=15,
+        production_ready=False,
+        shadow_mode=True,
+        forward_confirmed=False,
+        risk_manager_confirmed=False,
+        risk_manager_setting_path=tmp_path / "missing.json",
+    )
+
+    assert result.ready
+    assert result.mode == "shadow"
+
+
+def test_live_gate_blocks_when_veighna_risk_manager_rules_are_disabled(
+    tmp_path,
+) -> None:
+    disabled = tmp_path / "risk_manager_setting.json"
+    disabled.write_text(
+        json.dumps({"活动委托检查": {"active": False}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    config = load_config("configs/rb_15m_qingpai_strict.yaml")
+
+    result = evaluate_production_gate(
+        config=config,
+        kl_window=15,
+        production_ready=True,
+        shadow_mode=False,
+        forward_confirmed=True,
+        risk_manager_confirmed=True,
+        risk_manager_setting_path=disabled,
+    )
+
+    assert not result.ready
+    assert "veighna_risk_manager_setting_inactive" in result.reasons
+
+
+def test_live_gate_accepts_release_risk_manager_setting(tmp_path) -> None:
+    enabled = tmp_path / "risk_manager_setting.json"
+    enabled.write_text(
+        json.dumps({"活动委托检查": {"active": True}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    config = load_config("configs/rb_15m_qingpai_strict.yaml")
+
+    result = evaluate_production_gate(
+        config=config,
+        kl_window=15,
+        production_ready=True,
+        shadow_mode=False,
+        forward_confirmed=True,
+        risk_manager_confirmed=True,
+        risk_manager_setting_path=enabled,
+    )
+
+    assert result.ready
+    assert result.mode == "production"
+
+
+def test_live_gate_blocks_until_forward_simulation_is_confirmed(tmp_path) -> None:
+    enabled = tmp_path / "risk_manager_setting.json"
+    enabled.write_text(
+        json.dumps({"活动委托检查": {"active": True}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    config = load_config("configs/rb_15m_qingpai_strict.yaml")
+
+    result = evaluate_production_gate(
+        config=config,
+        kl_window=15,
+        production_ready=True,
+        shadow_mode=False,
+        forward_confirmed=False,
+        risk_manager_confirmed=True,
+        risk_manager_setting_path=enabled,
+    )
+
+    assert not result.ready
+    assert "forward_confirmed_false" in result.reasons
+
+
+def test_p7_risk_manager_release_profile_enables_rules() -> None:
+    status = inspect_risk_manager_setting(
+        Path("configs/veighna_risk_manager_setting.p7.json")
+    )
+
+    assert status.active
+    assert "活动委托检查" in status.enabled_rules
+    assert "委托规模检查" in status.enabled_rules
+
+
+def test_p7_release_manifest_matches_strategy_defaults() -> None:
+    manifest = json.loads(
+        Path("configs/p7_release_manifest.json").read_text(encoding="utf-8")
+    )
+
+    assert manifest["baseline_commit"].startswith("ab31edc")
+    assert manifest["strategy_config"] == ChanBspStrategy.config_yaml
+    assert manifest["default_runtime_mode"] == "shadow"
+    assert set(manifest["supported_realtime_windows"]) == {5, 15, 60}
+    assert Path(manifest["risk_manager_setting"]).exists()
+    artifacts = manifest["artifacts"]
+    for name in ["strategy_source", "strategy_config", "risk_manager_profile"]:
+        artifact = artifacts[name]
+        payload = Path(artifact["path"]).read_bytes()
+        assert hashlib.sha256(payload).hexdigest() == artifact["sha256"]
+    assert (
+        artifacts["strategy_deployed"]["sha256"]
+        == artifacts["strategy_source"]["sha256"]
+    )
+
+
+def test_strategy_shadow_sender_does_not_call_cta_order_function() -> None:
+    strategy = ChanBspStrategy.__new__(ChanBspStrategy)
+    strategy.shadow_mode = True
+    strategy.order_status = "idle"
+    strategy.vt_symbol = "RB2505.SHFE"
+    strategy.write_log = lambda message: None
+    strategy._refresh_production_gate = lambda: SimpleNamespace(
+        ready=True,
+        reason_text="shadow_mode_enabled",
+    )
+    called = False
+
+    def sender():
+        nonlocal called
+        called = True
+        return ["SIM.1"]
+
+    result = strategy._send_live_or_shadow(
+        "open_long",
+        sender,
+        price=3500,
+        volume=1,
+        closing=False,
+        reason="test",
+    )
+
+    assert result == []
+    assert not called
+    assert strategy.order_status == "shadow"
+
+
+def test_strategy_rejects_missing_release_config(tmp_path) -> None:
+    strategy = ChanBspStrategy.__new__(ChanBspStrategy)
+    strategy.chan_project_path = str(tmp_path)
+    strategy.config_yaml = "configs/missing.yaml"
+    strategy.write_log = lambda message: None
+
+    with pytest.raises(FileNotFoundError, match="P7 strategy config not found"):
+        strategy._init_chan_pipeline()
