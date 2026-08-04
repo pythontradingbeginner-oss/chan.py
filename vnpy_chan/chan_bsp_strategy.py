@@ -106,6 +106,7 @@ class ChanBspStrategy(CtaTemplate):
     risk_manager_setting_path = str(DEFAULT_RISK_MANAGER_SETTING_PATH)
     manual_halt = False
     minimum_equity = 0.0
+    active_main_contracts = ""
 
     # --- vnpy variables (displayed in GUI) ---
     bi_count = 0
@@ -154,6 +155,7 @@ class ChanBspStrategy(CtaTemplate):
         "risk_manager_setting_path",
         "manual_halt",
         "minimum_equity",
+        "active_main_contracts",
     ]
     variables = [
         "bi_count",
@@ -1269,6 +1271,7 @@ class ChanBspStrategy(CtaTemplate):
                 if risk_cfg is not None
                 else None
             ),
+            active_main_contracts=self._active_main_contracts(),
         )
         decision = evaluate_open_guard(state)
         self.hard_risk_status = "armed" if decision.allowed else "BLOCKED"
@@ -1291,6 +1294,16 @@ class ChanBspStrategy(CtaTemplate):
             return None
         state = getattr(risk, "get_state", lambda: {})()
         return float(state.get("daily_realized") or 0.0)
+
+    def _active_main_contracts(self) -> tuple[str, ...]:
+        raw = str(getattr(self, "active_main_contracts", "") or "").strip()
+        if not raw:
+            return ()
+        return tuple(
+            value.strip()
+            for value in raw.split(",")
+            if value.strip()
+        )
 
     def _risk_drawdown_pct(self) -> float | None:
         risk = getattr(self, "_risk", None)

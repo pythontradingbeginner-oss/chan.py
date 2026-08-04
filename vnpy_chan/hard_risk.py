@@ -52,6 +52,7 @@ class HardRiskState:
     daily_loss_limit: float | None = None
     drawdown_pct: float | None = None
     max_drawdown_pct: float | None = None
+    active_main_contracts: tuple[str, ...] = ()
 
 
 def evaluate_open_guard(state: HardRiskState) -> OpenDecision:
@@ -64,6 +65,14 @@ def evaluate_open_guard(state: HardRiskState) -> OpenDecision:
         c.isdigit() for c in base
     ):
         reasons.append(f"rb_contract_whitelist:{symbol}")
+
+    if state.active_main_contracts and base.upper() not in {
+        str(value).split(".")[0].upper() for value in state.active_main_contracts
+    }:
+        reasons.append(
+            f"contract_rollover_required:{base} not in "
+            f"{','.join(state.active_main_contracts)}"
+        )
 
     if state.planned_open_lots > 1:
         reasons.append(f"single_lot_limit:{state.planned_open_lots}>1")

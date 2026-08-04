@@ -4,8 +4,8 @@
   "release_status": "repair_candidate_uncommitted",
   "built_at": "2026-08-04T04:51:03+08:00",
   "baseline_commit": "ab31edcdc2fca71c472b3ae7485266adee4de194",
-  "repair_base_commit": "62463fc7bdcf9c110f9a44ac11c7a1946e1f58aa",
-  "repository_head": "62463fc7bdcf9c110f9a44ac11c7a1946e1f58aa",
+  "repair_base_commit": "4d97f2cc48229d1d959bbef241a95e589365932b",
+  "repository_head": "4d97f2cc48229d1d959bbef241a95e589365932b",
   "release_commit": null,
   "source_tree_clean_at_build": false,
   "production_host": "VeighNa CtaStrategyApp + vnpy_chan.chan_bsp_strategy.ChanBspStrategy",
@@ -56,11 +56,11 @@
   "artifacts": {
     "strategy_source": {
       "path": "vnpy_chan/chan_bsp_strategy.py",
-      "sha256": "48084dd5590ae3d64df76268ea4bed4616811465082a63af862ad3ff8e810146"
+      "sha256": "486387bbc6380cea9ac93ea9897ed01a627090479ca5ec6773354cf38aaa788a"
     },
     "strategy_deployed": {
       "path": "~/strategies/chan_bsp_strategy.py",
-      "sha256": "48084dd5590ae3d64df76268ea4bed4616811465082a63af862ad3ff8e810146"
+      "sha256": "486387bbc6380cea9ac93ea9897ed01a627090479ca5ec6773354cf38aaa788a"
     },
     "strategy_config": {
       "path": "configs/rb_15m_qingpai_strict.yaml",
