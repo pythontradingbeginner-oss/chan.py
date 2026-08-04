@@ -1107,6 +1107,21 @@ class ChanBspStrategy(CtaTemplate):
             self.write_log("Decision rejected: position_size_zero")
             return
 
+        if self._pending_entry is not None:
+            self.write_log(
+                "Decision rejected: one_active_open_intent (pending entry exists)"
+            )
+            return
+        active_open = any(
+            order.role.startswith("open") and order.active
+            for order in self._order_state.active.values()
+        )
+        if active_open:
+            self.write_log(
+                "Decision rejected: one_active_open_intent (active open order exists)"
+            )
+            return
+
         self._pending_entry = PendingEntry(intent)
         direction_str = self._get_signal_direction(signal)
         order_price = self._execution_price(signal.price, signal.target_position)

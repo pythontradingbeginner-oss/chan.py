@@ -48,11 +48,11 @@
   "artifacts": {
     "strategy_source": {
       "path": "vnpy_chan/chan_bsp_strategy.py",
-      "sha256": "cc68086be7988de3c997bc7d6da07e83293344bd44b0fb60f0986c10b9bfcca2"
+      "sha256": "56935f86cee2817f4628690ae8e0e91711394f5675b7a28956ac88497a0e3912"
     },
     "strategy_deployed": {
       "path": "~/strategies/chan_bsp_strategy.py",
-      "sha256": "cc68086be7988de3c997bc7d6da07e83293344bd44b0fb60f0986c10b9bfcca2"
+      "sha256": "56935f86cee2817f4628690ae8e0e91711394f5675b7a28956ac88497a0e3912"
     },
     "strategy_config": {
       "path": "configs/rb_15m_qingpai_strict.yaml",
