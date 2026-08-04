@@ -55,11 +55,17 @@ from signal_core import SignalDirection, SignalState
 from strategy_policy.position import PositionContext
 from vnpy_chan.converter import bars_to_ohlc_frame
 from vnpy_chan.order_state import CtaOrderStatusMachine
+from vnpy_chan.oms_reconciliation import reconcile as reconcile_oms
 from vnpy_chan.production_guard import (
     DEFAULT_RISK_MANAGER_SETTING_PATH,
     evaluate_production_gate,
 )
 from vnpy_chan.readiness import WarmupReadiness, WarmupValidationError
+from vnpy_chan.runtime_state import (
+    RuntimeStatePackage,
+    RuntimeStateVersionError,
+    STATE_VERSION,
+)
 from vnpy_chan.session_aggregator import (
     AggregationSequenceError,
     RbSessionBarAggregator,
@@ -114,9 +120,12 @@ class ChanBspStrategy(CtaTemplate):
     production_block_reason = ""
     risk_status = "unknown"
     order_status = "idle"
+    recovery_status = "not_checked"
+    recovery_reasons = ""
     position_state_json = ""
     risk_state_json = ""
     order_state_json = ""
+    runtime_state_json = ""
     initialization_status = "not_initialized"
     initialization_error = ""
     structure_ready = False
@@ -153,9 +162,12 @@ class ChanBspStrategy(CtaTemplate):
         "production_block_reason",
         "risk_status",
         "order_status",
+        "recovery_status",
+        "recovery_reasons",
         "position_state_json",
         "risk_state_json",
         "order_state_json",
+        "runtime_state_json",
         "production_ready",
         "initialization_status",
         "initialization_error",
@@ -198,6 +210,8 @@ class ChanBspStrategy(CtaTemplate):
         self._warmup_readiness = WarmupReadiness()
         self._order_state = CtaOrderStatusMachine()
         self._runtime_state_restored = False
+        self._recovery_required = False
+        self._recovery_result = None
 
         self._position_context: PositionContext | None = None
         self._pending_entry: PendingEntry | None = None
@@ -286,10 +300,14 @@ class ChanBspStrategy(CtaTemplate):
     def on_start(self):
         """Start trading."""
         self._restore_runtime_state()
+        self._check_oms_reconciliation()
         gate = self._refresh_production_gate()
-        self._runtime_started = bool(gate.ready and self.production_ready)
+        self._runtime_started = bool(
+            gate.ready and self.production_ready and not self._recovery_required
+        )
         self.write_log(
             f"ChanBspStrategy started mode={gate.mode} "
+            f"recovery={self.recovery_status} "
             f"reason={gate.reason_text or 'ready'}"
         )
 
@@ -1138,7 +1156,19 @@ class ChanBspStrategy(CtaTemplate):
         reason: str,
     ) -> list:
         gate = self._refresh_production_gate()
-        if self.shadow_mode:
+        if getattr(self, "_recovery_required", False):
+            if not closing:
+                self.order_status = "recovery_required"
+                self.write_log(
+                    "Open blocked by P7.2 recovery: "
+                    f"{self.recovery_reasons}"
+                )
+                return []
+            self.write_log(
+                "Risk-reducing close allowed during P7.2 recovery: "
+                f"{self.recovery_reasons}"
+            )
+        elif self.shadow_mode:
             if not gate.ready or not self.production_ready:
                 self.order_status = "blocked"
                 self.write_log(
@@ -1151,11 +1181,11 @@ class ChanBspStrategy(CtaTemplate):
                 f"price={price:.1f} reason={reason}"
             )
             return []
-        if not closing and not gate.ready:
+        elif not closing and not gate.ready:
             self.order_status = "blocked"
             self.write_log(f"Order blocked by production gate: {gate.reason_text}")
             return []
-        if closing and not gate.ready:
+        elif closing and not gate.ready:
             self.write_log(
                 "Risk-reducing close allowed while production gate is blocked: "
                 f"{gate.reason_text}"
@@ -1250,17 +1280,100 @@ class ChanBspStrategy(CtaTemplate):
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
+        position_payload = _position_context_to_dict(
+            getattr(self, "_position_context", None)
+        )
         self.position_state_json = json.dumps(
-            _position_context_to_dict(getattr(self, "_position_context", None)),
+            position_payload,
             ensure_ascii=False,
             separators=(",", ":"),
         )
+        self.runtime_state_json = self._build_runtime_state_package(
+            position_payload
+        ).to_json()
+
+    def _build_runtime_state_package(
+        self,
+        position_payload: dict[str, Any] | None,
+    ) -> RuntimeStatePackage:
+        decision_ids: list[str] = []
+        kernel = getattr(self, "_decision_kernel", None)
+        if kernel is not None:
+            decision_ids = [
+                str(record.decision_id) for record in kernel.decision_trace
+            ]
+        return RuntimeStatePackage(
+            strategy_id=self._runtime_strategy_id(),
+            position=position_payload,
+            exit_state=self._exit_state_snapshot(),
+            risk=json.loads(self.risk_state_json) if self.risk_state_json else {},
+            orders=json.loads(self.order_state_json) if self.order_state_json else {},
+            decision_ids=decision_ids,
+            trade_ids=self._trade_ids(),
+        )
+
+    def _runtime_strategy_id(self) -> str:
+        symbol = getattr(self, "vt_symbol", "")
+        return f"chan.py|{symbol}"
+
+    def _trade_ids(self) -> list[str]:
+        if not hasattr(self, "_order_state"):
+            return []
+        return [str(order.vt_orderid) for order in self._order_state.history]
+
+    def _exit_state_snapshot(self) -> dict[str, Any]:
+        manager = getattr(self, "_exit_manager", None)
+        if manager is None:
+            return {}
+        try:
+            payload = getattr(manager, "to_dict", None)
+            if callable(payload):
+                return dict(payload())
+        except Exception:
+            pass
+        return {}
 
     def _restore_runtime_state(self) -> None:
         self._ensure_runtime_state_helpers()
         if self._runtime_state_restored:
             return
         self._runtime_state_restored = True
+
+        if self.runtime_state_json:
+            try:
+                package = RuntimeStatePackage.from_json(
+                    self.runtime_state_json,
+                    expected_strategy_id=self._runtime_strategy_id(),
+                )
+                if package.position is not None and not self.position_state_json:
+                    self.position_state_json = json.dumps(
+                        package.position,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                if package.risk and not self.risk_state_json:
+                    self.risk_state_json = json.dumps(
+                        package.risk,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                if package.orders and not self.order_state_json:
+                    self.order_state_json = json.dumps(
+                        package.orders,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+            except (RuntimeStateVersionError, ValueError, TypeError) as exc:
+                self._recovery_required = True
+                self.recovery_status = "RECOVERY_REQUIRED"
+                self.recovery_reasons = (
+                    f"runtime_state_invalid:{getattr(exc, 'reason', type(exc).__name__)}"
+                )
+                self.write_log(
+                    f"Runtime state package invalid; recovery required: {exc}"
+                )
+                return
+
         if self.order_state_json:
             try:
                 self._order_state = CtaOrderStatusMachine.from_json(
@@ -1288,11 +1401,61 @@ class ChanBspStrategy(CtaTemplate):
             except Exception as exc:
                 self.write_log(f"Position state restore failed: {exc}")
 
+    def _check_oms_reconciliation(self) -> None:
+        """Query OMS actual positions/orders and enter recovery if mismatched."""
+        self._ensure_runtime_state_helpers()
+        main_engine = getattr(self.cta_engine, "main_engine", None)
+        symbol = str(self.vt_symbol).rsplit(".", 1)[0]
+        if main_engine is None:
+            self.recovery_status = "oms_unavailable"
+            self.recovery_reasons = "main_engine unavailable; recovery unchecked"
+            self._recovery_required = False
+            return
+        try:
+            oms = main_engine.get_engine("oms")
+            positions = oms.get_all_positions() if oms is not None else []
+            orders = oms.get_all_active_orders() if oms is not None else []
+        except Exception as exc:
+            self.recovery_status = "oms_query_error"
+            self.recovery_reasons = f"{type(exc).__name__}: {exc}"
+            self._recovery_required = True
+            self.write_log(f"OMS reconciliation query failed: {self.recovery_reasons}")
+            return
+
+        result = reconcile_oms(
+            oms_positions=positions,
+            oms_orders=orders,
+            symbol=symbol,
+            strategy_context=getattr(self, "_position_context", None),
+            strategy_active_order_ids=tuple(
+                self._order_state.active.keys()
+            ),
+        )
+        self._recovery_result = result
+        if result.recovery_required:
+            self._recovery_required = True
+            self.recovery_status = "RECOVERY_REQUIRED"
+        else:
+            self._recovery_required = False
+            self.recovery_status = "ALIGNED"
+        self.recovery_reasons = result.reason_text
+        self.write_log(
+            f"OMS reconciliation status={self.recovery_status} "
+            f"oms_pos={result.oms_net_position} "
+            f"strategy_pos={result.strategy_net_position} "
+            f"oms_active={len(result.oms_active_orders)} "
+            f"strategy_active={len(result.strategy_active_orders)}"
+        )
+
     def _ensure_runtime_state_helpers(self) -> None:
         if not hasattr(self, "_order_state"):
             self._order_state = CtaOrderStatusMachine()
         if not hasattr(self, "_runtime_state_restored"):
             self._runtime_state_restored = False
+        if not hasattr(self, "_recovery_required"):
+            self._recovery_required = False
+        if not hasattr(self, "_recovery_result"):
+            self._recovery_result = None
 
     @property
     def position_context(self) -> PositionContext | None:
