@@ -18,7 +18,11 @@
   },
   "strategy_config": "configs/rb_15m_qingpai_strict.yaml",
   "risk_manager_setting": "configs/veighna_risk_manager_setting.p7.json",
-  "supported_realtime_windows": [5, 15, 60],
+  "supported_realtime_windows": [
+    5,
+    15,
+    60
+  ],
   "calendar_valid_through": "2026-12-31",
   "default_runtime_mode": "shadow",
   "cta_strategy_setting": {
@@ -31,7 +35,9 @@
       "forward_confirmed": false,
       "risk_manager_confirmed": false
     },
-    "forbidden_setting": ["production_ready"]
+    "forbidden_setting": [
+      "production_ready"
+    ]
   },
   "config_summary": {
     "code": "RB_MAIN",
@@ -42,21 +48,23 @@
     "production_warmup_bars": 800,
     "max_abs_position": 1,
     "max_loss_points": 600.0,
+    "daily_loss_limit": 300.0,
     "max_consecutive_losses": 5,
+    "max_drawdown_pct": 0.031,
     "max_margin_utilization": 0.5
   },
   "artifacts": {
     "strategy_source": {
       "path": "vnpy_chan/chan_bsp_strategy.py",
-      "sha256": "56935f86cee2817f4628690ae8e0e91711394f5675b7a28956ac88497a0e3912"
+      "sha256": "48084dd5590ae3d64df76268ea4bed4616811465082a63af862ad3ff8e810146"
     },
     "strategy_deployed": {
       "path": "~/strategies/chan_bsp_strategy.py",
-      "sha256": "56935f86cee2817f4628690ae8e0e91711394f5675b7a28956ac88497a0e3912"
+      "sha256": "48084dd5590ae3d64df76268ea4bed4616811465082a63af862ad3ff8e810146"
     },
     "strategy_config": {
       "path": "configs/rb_15m_qingpai_strict.yaml",
-      "sha256": "0c167994a42bc32b39d290dab7c4942b9318ca6bf7f74148b3024b9715a27037"
+      "sha256": "1f6c6ad0ec589524eaa7bdf5cb52deae49739248df1b6aae67a46accc0501fbf"
     },
     "risk_manager_profile": {
       "path": "configs/veighna_risk_manager_setting.p7.json",

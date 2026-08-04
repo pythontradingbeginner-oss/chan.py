@@ -54,6 +54,7 @@ from data_foundation import (
 from signal_core import SignalDirection, SignalState
 from strategy_policy.position import PositionContext
 from vnpy_chan.converter import bars_to_ohlc_frame
+from vnpy_chan.hard_risk import HardRiskState, OpenDecision, evaluate_open_guard
 from vnpy_chan.order_state import CtaOrderStatusMachine
 from vnpy_chan.oms_reconciliation import reconcile as reconcile_oms
 from vnpy_chan.production_guard import (
@@ -103,6 +104,8 @@ class ChanBspStrategy(CtaTemplate):
     forward_confirmed = False
     risk_manager_confirmed = False
     risk_manager_setting_path = str(DEFAULT_RISK_MANAGER_SETTING_PATH)
+    manual_halt = False
+    minimum_equity = 0.0
 
     # --- vnpy variables (displayed in GUI) ---
     bi_count = 0
@@ -122,6 +125,10 @@ class ChanBspStrategy(CtaTemplate):
     order_status = "idle"
     recovery_status = "not_checked"
     recovery_reasons = ""
+    hard_risk_status = "armed"
+    hard_risk_reasons = ""
+    last_tick_time_text = ""
+    last_account_time_text = ""
     position_state_json = ""
     risk_state_json = ""
     order_state_json = ""
@@ -145,6 +152,8 @@ class ChanBspStrategy(CtaTemplate):
         "forward_confirmed",
         "risk_manager_confirmed",
         "risk_manager_setting_path",
+        "manual_halt",
+        "minimum_equity",
     ]
     variables = [
         "bi_count",
@@ -164,6 +173,10 @@ class ChanBspStrategy(CtaTemplate):
         "order_status",
         "recovery_status",
         "recovery_reasons",
+        "hard_risk_status",
+        "hard_risk_reasons",
+        "last_tick_time_text",
+        "last_account_time_text",
         "position_state_json",
         "risk_state_json",
         "order_state_json",
@@ -212,6 +225,8 @@ class ChanBspStrategy(CtaTemplate):
         self._runtime_state_restored = False
         self._recovery_required = False
         self._recovery_result = None
+        self._last_tick_time = None
+        self._last_account_time = None
 
         self._position_context: PositionContext | None = None
         self._pending_entry: PendingEntry | None = None
@@ -325,6 +340,8 @@ class ChanBspStrategy(CtaTemplate):
 
     def on_tick(self, tick: TickData):
         """Tick -> BarGenerator."""
+        self._last_tick_time = datetime.now()
+        self.last_tick_time_text = self._last_tick_time.isoformat(timespec="seconds")
         self.bg.update_tick(tick)
 
     def on_bar(self, bar: BarData):
@@ -1171,6 +1188,18 @@ class ChanBspStrategy(CtaTemplate):
         reason: str,
     ) -> list:
         gate = self._refresh_production_gate()
+        if not closing:
+            hard = self._evaluate_hard_risk(int(volume or 0))
+            if not hard.allowed:
+                self.order_status = "hard_risk_blocked"
+                self.hard_risk_status = "BLOCKED"
+                self.hard_risk_reasons = hard.reason_text
+                self.write_log(
+                    f"Open blocked by hard risk: {hard.reason_text}"
+                )
+                return []
+            self.hard_risk_status = "armed"
+            self.hard_risk_reasons = ""
         if getattr(self, "_recovery_required", False):
             if not closing:
                 self.order_status = "recovery_required"
@@ -1207,6 +1236,73 @@ class ChanBspStrategy(CtaTemplate):
             )
         return sender()
 
+    def _evaluate_hard_risk(self, planned_open_lots: int) -> OpenDecision:
+        config = getattr(self, "_config", None)
+        risk_cfg = getattr(config, "risk", None) if config is not None else None
+        state = HardRiskState(
+            vt_symbol=str(getattr(self, "vt_symbol", "")),
+            planned_open_lots=max(1, int(planned_open_lots)),
+            manual_halt=bool(getattr(self, "manual_halt", False)),
+            minimum_equity=float(getattr(self, "minimum_equity", 0.0) or 0.0),
+            account_equity=self._account_equity(),
+            last_tick_time=getattr(self, "_last_tick_time", None),
+            last_account_time=getattr(self, "_last_account_time", None),
+            tick_timeout_seconds=120.0,
+            account_timeout_seconds=30.0,
+            realized_day_loss=(
+                self._risk_day_loss()
+                if getattr(self, "_risk", None) is not None
+                else None
+            ),
+            daily_loss_limit=(
+                getattr(risk_cfg, "daily_loss_limit", None)
+                if risk_cfg is not None
+                else None
+            ),
+            drawdown_pct=(
+                self._risk_drawdown_pct()
+                if getattr(self, "_risk", None) is not None
+                else None
+            ),
+            max_drawdown_pct=(
+                getattr(risk_cfg, "max_drawdown_pct", None)
+                if risk_cfg is not None
+                else None
+            ),
+        )
+        decision = evaluate_open_guard(state)
+        self.hard_risk_status = "armed" if decision.allowed else "BLOCKED"
+        self.hard_risk_reasons = decision.reason_text
+        last_tick = getattr(self, "_last_tick_time", None)
+        last_account = getattr(self, "_last_account_time", None)
+        self.last_tick_time_text = (
+            last_tick.isoformat(timespec="seconds") if last_tick is not None else ""
+        )
+        self.last_account_time_text = (
+            last_account.isoformat(timespec="seconds")
+            if last_account is not None
+            else ""
+        )
+        return decision
+
+    def _risk_day_loss(self) -> float | None:
+        risk = getattr(self, "_risk", None)
+        if risk is None:
+            return None
+        state = getattr(risk, "get_state", lambda: {})()
+        return float(state.get("daily_realized") or 0.0)
+
+    def _risk_drawdown_pct(self) -> float | None:
+        risk = getattr(self, "_risk", None)
+        if risk is None:
+            return None
+        state = getattr(risk, "get_state", lambda: {})()
+        peak = float(state.get("peak_equity") or 0.0)
+        equity = self._account_equity()
+        if peak <= 0 or equity is None:
+            return None
+        return (peak - equity) / peak
+
     def _execution_price(self, price: float, quantity_delta: int) -> float:
         config = getattr(self, "_config", None)
         execution = config.execution if config is not None else None
@@ -1218,8 +1314,12 @@ class ChanBspStrategy(CtaTemplate):
         )
 
     def _account_equity(self) -> float | None:
-        fallback = self._config.sizing.capital if self._config else None
-        main_engine = getattr(self.cta_engine, "main_engine", None)
+        config = getattr(self, "_config", None)
+        sizing = getattr(config, "sizing", None) if config is not None else None
+        fallback = (
+            float(getattr(sizing, "capital", None)) if sizing is not None else None
+        )
+        main_engine = getattr(getattr(self, "cta_engine", None), "main_engine", None)
         if main_engine is None:
             return fallback
         try:
@@ -1232,7 +1332,7 @@ class ChanBspStrategy(CtaTemplate):
 
     def _account_available_funds(self) -> float | None:
         fallback = self._account_equity()
-        main_engine = getattr(self.cta_engine, "main_engine", None)
+        main_engine = getattr(getattr(self, "cta_engine", None), "main_engine", None)
         if main_engine is None:
             return fallback
         try:
@@ -1471,6 +1571,10 @@ class ChanBspStrategy(CtaTemplate):
             self._recovery_required = False
         if not hasattr(self, "_recovery_result"):
             self._recovery_result = None
+        if not hasattr(self, "_last_tick_time"):
+            self._last_tick_time = None
+        if not hasattr(self, "_last_account_time"):
+            self._last_account_time = None
 
     @property
     def position_context(self) -> PositionContext | None:

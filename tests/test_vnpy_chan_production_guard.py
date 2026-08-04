@@ -120,8 +120,8 @@ def test_p7_release_manifest_matches_strategy_defaults() -> None:
     )
 
     assert manifest["baseline_commit"].startswith("ab31edc")
-    assert manifest["repair_base_commit"].startswith("031911a")
-    assert manifest["repository_head"].startswith("031911a")
+    assert manifest["repair_base_commit"].startswith("719f83d")
+    assert manifest["repository_head"].startswith("719f83d")
     assert manifest["release_status"] == "repair_candidate_uncommitted"
     assert manifest["strategy_config"] == ChanBspStrategy.config_yaml
     assert manifest["default_runtime_mode"] == "shadow"
