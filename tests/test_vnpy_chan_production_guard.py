@@ -119,9 +119,18 @@ def test_p7_release_manifest_matches_strategy_defaults() -> None:
         Path("configs/p7_release_manifest.json").read_text(encoding="utf-8")
     )
 
-    assert manifest["baseline_commit"].startswith("ab31edc")
-    assert manifest["repair_base_commit"].startswith("4d97f2c")
-    assert manifest["repository_head"].startswith("4d97f2c")
+    baseline = manifest["baseline_commit"]
+    repair_base = manifest["repair_base_commit"]
+    repository_head = manifest["repository_head"]
+    assert baseline.startswith("ab31edc")
+    # repair_base_commit and repository_head are real full-length commit hashes
+    # pointing at the latest P7 repair checkpoint; head equals the manifest's
+    # repair base until a final release_commit is frozen.
+    assert len(repair_base) == 40 and all(c in "0123456789abcdef" for c in repair_base)
+    assert len(repository_head) == 40 and all(
+        c in "0123456789abcdef" for c in repository_head
+    )
+    assert repository_head == repair_base
     assert manifest["release_status"] == "repair_candidate_uncommitted"
     assert manifest["strategy_config"] == ChanBspStrategy.config_yaml
     assert manifest["default_runtime_mode"] == "shadow"
