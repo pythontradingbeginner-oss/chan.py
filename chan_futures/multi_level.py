@@ -39,6 +39,22 @@ class ParentDirection(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class MultiLevelReadiness:
+    """Read-only structural readiness for the live CTA adapter."""
+
+    parent_confirmed_segments: int
+    child_confirmed_bis: int
+
+    @property
+    def parent_ready(self) -> bool:
+        return self.parent_confirmed_segments > 0
+
+    @property
+    def child_ready(self) -> bool:
+        return self.child_confirmed_bis > 0
+
+
+@dataclass(frozen=True, slots=True)
 class ParentStructureSnapshot:
     """A parent structure and the instant it first became tradable knowledge."""
 
@@ -651,6 +667,17 @@ class MultiLevelDecisionEngine:
     @property
     def audit(self) -> tuple[MultiLevelDecisionContext, ...]:
         return tuple(self._audit)
+
+    @property
+    def readiness(self) -> MultiLevelReadiness:
+        parent_level = self._parent_chan[0]
+        child_level = self._child_chan[0]
+        return MultiLevelReadiness(
+            parent_confirmed_segments=sum(
+                bool(segment.is_sure) for segment in parent_level.seg_list
+            ),
+            child_confirmed_bis=sum(bool(bi.is_sure) for bi in child_level.bi_list),
+        )
 
     @staticmethod
     def _advance_frame(

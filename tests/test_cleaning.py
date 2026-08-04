@@ -172,8 +172,8 @@ def test_standard_minutes_count_matches_rb_sessions():
 
 def test_calendar_rejects_out_of_range_day():
     calendar = RBTradingCalendar.load_default()
-    with pytest.raises(ValueError, match="outside calendar range"):
-        calendar.expected_minutes(date(2026, 1, 1))
+    with pytest.raises(ValueError, match="calendar_out_of_range"):
+        calendar.expected_minutes(date(2027, 1, 1))
 
 
 def test_calendar_models_covid_night_suspension_and_2024_exchange_closure():

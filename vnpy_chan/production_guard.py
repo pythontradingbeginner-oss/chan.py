@@ -44,6 +44,7 @@ def evaluate_production_gate(
     config: Any,
     kl_window: int,
     production_ready: bool,
+    operator_confirmed: bool,
     shadow_mode: bool,
     forward_confirmed: bool,
     risk_manager_confirmed: bool,
@@ -53,25 +54,11 @@ def evaluate_production_gate(
     risk_setting = inspect_risk_manager_setting(
         risk_manager_setting_path or DEFAULT_RISK_MANAGER_SETTING_PATH
     )
-    if shadow_mode:
-        return ProductionGateResult(
-            ready=True,
-            mode="shadow",
-            reasons=("shadow_mode_enabled",),
-            risk_manager_setting=risk_setting,
-        )
-
     reasons: list[str] = []
     if not production_ready:
         reasons.append("production_ready_false")
-    if not forward_confirmed:
-        reasons.append("forward_confirmed_false")
-    if not risk_manager_confirmed:
-        reasons.append("risk_manager_confirmed_false")
     if int(kl_window) not in SUPPORTED_PRODUCTION_WINDOWS:
         reasons.append(f"unsupported_kl_window:{kl_window}")
-    if pending_order_count > 0:
-        reasons.append(f"pending_order_recovery_required:{pending_order_count}")
     if config is None:
         reasons.append("strategy_config_unavailable")
     else:
@@ -84,6 +71,23 @@ def evaluate_production_gate(
         exits = getattr(config, "exits", ())
         if not exits:
             reasons.append("exit_rules_missing")
+
+    if shadow_mode:
+        return ProductionGateResult(
+            ready=not reasons,
+            mode="shadow" if not reasons else "blocked",
+            reasons=tuple(reasons or ["shadow_mode_enabled"]),
+            risk_manager_setting=risk_setting,
+        )
+
+    if not operator_confirmed:
+        reasons.append("operator_confirmed_false")
+    if not forward_confirmed:
+        reasons.append("forward_confirmed_false")
+    if not risk_manager_confirmed:
+        reasons.append("risk_manager_confirmed_false")
+    if pending_order_count > 0:
+        reasons.append(f"pending_order_recovery_required:{pending_order_count}")
     if not risk_setting.active:
         reasons.append("veighna_risk_manager_setting_inactive")
 

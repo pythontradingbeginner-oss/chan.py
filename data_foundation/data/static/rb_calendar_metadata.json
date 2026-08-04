@@ -1,0 +1,14 @@
+{
+  "calendar_id": "SHFE_RB_END_LABEL_V1_2026",
+  "generated_at": "2026-08-03T20:29:08+00:00",
+  "valid_from": "2018-01-15",
+  "valid_through": "2026-12-31",
+  "minute_label_convention": "bar_end",
+  "timezone": "Asia/Shanghai",
+  "session_rule_id": "RB_V1",
+  "source_urls": [
+    "https://www.shfe.com.cn/publicnotice/notice/202412/t20241223_824109.html",
+    "https://www.shfe.com.cn/services/calenderandholidays/holiday/"
+  ],
+  "review_required": "Verify SHFE special closures before extending valid_through."
+}

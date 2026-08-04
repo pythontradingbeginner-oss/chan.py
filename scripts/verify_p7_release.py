@@ -11,6 +11,15 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = PROJECT_ROOT / "configs" / "p7_release_manifest.json"
+REQUIRED_ARTIFACTS = {
+    "strategy_source",
+    "strategy_deployed",
+    "strategy_config",
+    "risk_manager_profile",
+    "rb_trading_days",
+    "session_rules",
+    "calendar_metadata",
+}
 
 
 def file_sha256(path: Path) -> str:
@@ -66,6 +75,9 @@ def verify_release(
     errors: list[str] = []
 
     artifacts = manifest.get("artifacts", {})
+    missing_artifacts = REQUIRED_ARTIFACTS - set(artifacts)
+    if missing_artifacts:
+        errors.append(f"manifest missing artifacts: {sorted(missing_artifacts)}")
     for name, artifact in artifacts.items():
         if name == "strategy_deployed" and not include_deployed:
             continue
@@ -81,6 +93,19 @@ def verify_release(
             )
         else:
             print(f"OK {name}: {actual}  {path}")
+
+    source = artifacts.get("strategy_source")
+    deployed = artifacts.get("strategy_deployed")
+    if source and deployed and include_deployed:
+        source_path = resolve_artifact_path(str(source["path"]))
+        deployed_path = resolve_artifact_path(str(deployed["path"]))
+        if source_path.is_file() and deployed_path.is_file():
+            if source_path.read_bytes() != deployed_path.read_bytes():
+                errors.append("strategy_deployed: bytes differ from strategy_source")
+
+    _verify_calendar_metadata(manifest, artifacts, errors)
+    _verify_risk_profile(artifacts, errors)
+    _verify_cta_setting(manifest, errors)
 
     release_status = str(manifest.get("release_status", ""))
     head = git_output("rev-parse", "HEAD")
@@ -137,6 +162,72 @@ def verify_release(
             errors.append("repository worktree is not clean")
 
     return errors
+
+
+def _verify_calendar_metadata(
+    manifest: dict,
+    artifacts: dict,
+    errors: list[str],
+) -> None:
+    artifact = artifacts.get("calendar_metadata")
+    if not artifact:
+        return
+    path = resolve_artifact_path(str(artifact["path"]))
+    if not path.is_file():
+        return
+    metadata = json.loads(path.read_text(encoding="utf-8"))
+    expected = str(manifest.get("calendar_valid_through", ""))
+    if metadata.get("valid_through") != expected:
+        errors.append(
+            "calendar_metadata: valid_through mismatch: "
+            f"expected={expected} actual={metadata.get('valid_through')}"
+        )
+    if metadata.get("minute_label_convention") != "bar_end":
+        errors.append("calendar_metadata: minute_label_convention must be bar_end")
+    if not metadata.get("source_urls"):
+        errors.append("calendar_metadata: source_urls must not be empty")
+
+
+def _verify_risk_profile(artifacts: dict, errors: list[str]) -> None:
+    artifact = artifacts.get("risk_manager_profile")
+    if not artifact:
+        return
+    path = resolve_artifact_path(str(artifact["path"]))
+    if not path.is_file():
+        return
+    profile = json.loads(path.read_text(encoding="utf-8"))
+    if not any(
+        isinstance(value, dict) and bool(value.get("active"))
+        for value in profile.values()
+    ):
+        errors.append("risk_manager_profile: no active hard-risk rule")
+
+
+def _verify_cta_setting(manifest: dict, errors: list[str]) -> None:
+    spec = manifest.get("cta_strategy_setting")
+    if not isinstance(spec, dict):
+        errors.append("cta_strategy_setting specification is missing")
+        return
+    path = resolve_artifact_path(str(spec.get("path", "")))
+    if not path.is_file():
+        errors.append(f"cta_strategy_setting: missing file: {path}")
+        return
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    strategy_name = str(spec.get("strategy_name", ""))
+    strategy = payload.get(strategy_name)
+    if not isinstance(strategy, dict):
+        errors.append(f"cta_strategy_setting: missing strategy {strategy_name}")
+        return
+    setting = strategy.get("setting", {})
+    for name, expected in spec.get("required_setting", {}).items():
+        actual = setting.get(name)
+        if actual != expected:
+            errors.append(
+                f"cta_strategy_setting.{name}: expected={expected!r} actual={actual!r}"
+            )
+    for name in spec.get("forbidden_setting", []):
+        if name in setting:
+            errors.append(f"cta_strategy_setting: forbidden legacy key {name}")
 
 
 def main() -> int:

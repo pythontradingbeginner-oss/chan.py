@@ -15,19 +15,22 @@ from vnpy_chan.production_guard import (
 )
 
 
-def test_shadow_mode_passes_gate_without_live_confirmations(tmp_path) -> None:
+def test_shadow_mode_still_requires_core_initialization(tmp_path) -> None:
     result = evaluate_production_gate(
         config=None,
         kl_window=15,
         production_ready=False,
+        operator_confirmed=False,
         shadow_mode=True,
         forward_confirmed=False,
         risk_manager_confirmed=False,
         risk_manager_setting_path=tmp_path / "missing.json",
     )
 
-    assert result.ready
-    assert result.mode == "shadow"
+    assert not result.ready
+    assert result.mode == "blocked"
+    assert "production_ready_false" in result.reasons
+    assert "strategy_config_unavailable" in result.reasons
 
 
 def test_live_gate_blocks_when_veighna_risk_manager_rules_are_disabled(
@@ -44,6 +47,7 @@ def test_live_gate_blocks_when_veighna_risk_manager_rules_are_disabled(
         config=config,
         kl_window=15,
         production_ready=True,
+        operator_confirmed=True,
         shadow_mode=False,
         forward_confirmed=True,
         risk_manager_confirmed=True,
@@ -66,6 +70,7 @@ def test_live_gate_accepts_release_risk_manager_setting(tmp_path) -> None:
         config=config,
         kl_window=15,
         production_ready=True,
+        operator_confirmed=True,
         shadow_mode=False,
         forward_confirmed=True,
         risk_manager_confirmed=True,
@@ -88,6 +93,7 @@ def test_live_gate_blocks_until_forward_simulation_is_confirmed(tmp_path) -> Non
         config=config,
         kl_window=15,
         production_ready=True,
+        operator_confirmed=True,
         shadow_mode=False,
         forward_confirmed=False,
         risk_manager_confirmed=True,
@@ -114,12 +120,22 @@ def test_p7_release_manifest_matches_strategy_defaults() -> None:
     )
 
     assert manifest["baseline_commit"].startswith("ab31edc")
+    assert manifest["repair_base_commit"].startswith("98b457f")
+    assert manifest["repository_head"].startswith("98b457f")
+    assert manifest["release_status"] == "repair_candidate_uncommitted"
     assert manifest["strategy_config"] == ChanBspStrategy.config_yaml
     assert manifest["default_runtime_mode"] == "shadow"
     assert set(manifest["supported_realtime_windows"]) == {5, 15, 60}
     assert Path(manifest["risk_manager_setting"]).exists()
     artifacts = manifest["artifacts"]
-    for name in ["strategy_source", "strategy_config", "risk_manager_profile"]:
+    for name in [
+        "strategy_source",
+        "strategy_config",
+        "risk_manager_profile",
+        "rb_trading_days",
+        "session_rules",
+        "calendar_metadata",
+    ]:
         artifact = artifacts[name]
         payload = Path(artifact["path"]).read_bytes()
         assert hashlib.sha256(payload).hexdigest() == artifact["sha256"]
@@ -127,11 +143,15 @@ def test_p7_release_manifest_matches_strategy_defaults() -> None:
         artifacts["strategy_deployed"]["sha256"]
         == artifacts["strategy_source"]["sha256"]
     )
+    assert "production_ready" not in ChanBspStrategy.parameters
+    assert "operator_confirmed" in ChanBspStrategy.parameters
+    assert ChanBspStrategy.load_days == 100
 
 
 def test_strategy_shadow_sender_does_not_call_cta_order_function() -> None:
     strategy = ChanBspStrategy.__new__(ChanBspStrategy)
     strategy.shadow_mode = True
+    strategy.production_ready = True
     strategy.order_status = "idle"
     strategy.vt_symbol = "RB2505.SHFE"
     strategy.write_log = lambda message: None

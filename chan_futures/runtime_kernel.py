@@ -13,7 +13,11 @@ from strategy_policy.qingpai_decomposition import (
 
 from .graded_strategy import GradedChanStrategy
 from .exit_snapshot import ChanExitSnapshotBuilder
-from .multi_level import MultiLevelDecisionContext, MultiLevelDecisionEngine
+from .multi_level import (
+    MultiLevelDecisionContext,
+    MultiLevelDecisionEngine,
+    MultiLevelReadiness,
+)
 from .qingpai_momentum import QingpaiMomentumAnalyzer
 from .trade_intent import DecisionTraceRecord, TradeIntent
 
@@ -137,6 +141,10 @@ class RuntimeDecisionKernel:
     @property
     def multi_level_audit(self) -> tuple[MultiLevelDecisionContext, ...]:
         return self.multi_level.audit if self.multi_level is not None else ()
+
+    @property
+    def multi_level_readiness(self) -> MultiLevelReadiness | None:
+        return self.multi_level.readiness if self.multi_level is not None else None
 
     def reset_contract_state(
         self,

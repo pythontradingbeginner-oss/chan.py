@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
+import json
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -11,6 +13,11 @@ STATIC_DIR = Path(__file__).with_name("static")
 TRADING_DAYS_PATH = STATIC_DIR / "rb_trading_days.csv"
 SESSION_RULES_PATH = STATIC_DIR / "session_rules.csv"
 LIMIT_RULES_PATH = STATIC_DIR / "limit_rules.csv"
+CALENDAR_METADATA_PATH = STATIC_DIR / "rb_calendar_metadata.json"
+
+
+class CalendarCoverageError(ValueError):
+    """Raised when runtime data falls outside the reviewed calendar horizon."""
 
 
 @dataclass
@@ -19,18 +26,23 @@ class RBTradingCalendar:
 
     trading_days: pd.DataFrame
     session_rules: pd.DataFrame
+    metadata: dict[str, Any] = field(default_factory=dict)
     _expected_cache: dict[pd.Timestamp, pd.DataFrame] = field(
         default_factory=dict, init=False, repr=False
     )
+    _minute_lookup_cache: dict[
+        pd.Timestamp, dict[pd.Timestamp, tuple[pd.Timestamp, str, int]]
+    ] = field(default_factory=dict, init=False, repr=False)
 
     @classmethod
     def load_default(cls) -> "RBTradingCalendar":
         days = pd.read_csv(TRADING_DAYS_PATH, parse_dates=["trading_day", "night_session_date"])
         rules = pd.read_csv(SESSION_RULES_PATH, parse_dates=["valid_from", "valid_to"])
+        metadata = json.loads(CALENDAR_METADATA_PATH.read_text(encoding="utf-8"))
         days["trading_day"] = days["trading_day"].dt.normalize()
         days["night_session_date"] = days["night_session_date"].dt.normalize()
         days["has_night_session"] = days["has_night_session"].astype(bool)
-        calendar = cls(days, rules)
+        calendar = cls(days, rules, metadata)
         calendar.validate()
         return calendar
 
@@ -39,6 +51,7 @@ class RBTradingCalendar:
         cls,
         trading_days: pd.DataFrame,
         session_rules: pd.DataFrame,
+        metadata: dict[str, Any] | None = None,
     ) -> "RBTradingCalendar":
         days = trading_days.copy()
         rules = session_rules.copy()
@@ -46,7 +59,7 @@ class RBTradingCalendar:
             days[column] = pd.to_datetime(days[column]).dt.normalize()
         for column in ["valid_from", "valid_to"]:
             rules[column] = pd.to_datetime(rules[column]).dt.normalize()
-        calendar = cls(days, rules)
+        calendar = cls(days, rules, dict(metadata or {}))
         calendar.validate()
         return calendar
 
@@ -57,6 +70,15 @@ class RBTradingCalendar:
     @property
     def last_day(self) -> pd.Timestamp:
         return pd.Timestamp(self.trading_days["trading_day"].max())
+
+    @property
+    def calendar_id(self) -> str:
+        return str(self.metadata.get("calendar_id", ""))
+
+    @property
+    def valid_through(self) -> pd.Timestamp:
+        value = self.metadata.get("valid_through")
+        return pd.Timestamp(value).normalize() if value else self.last_day
 
     def validate(self) -> None:
         day_required = {
@@ -80,6 +102,13 @@ class RBTradingCalendar:
             raise ValueError(f"session rules missing columns: {sorted(missing)}")
         if self.trading_days["trading_day"].duplicated().any():
             raise ValueError("duplicate trading_day in calendar")
+        if self.metadata:
+            if self.metadata.get("minute_label_convention") != "bar_end":
+                raise ValueError("RB calendar must use bar_end minute labels")
+            if self.valid_through != self.last_day:
+                raise ValueError(
+                    "calendar metadata valid_through does not match trading-day data"
+                )
         for row in self.session_rules.itertuples(index=False):
             actual = len(_minute_times(_parse_time(row.start_time), _parse_time(row.end_time)))
             if actual != int(row.minute_count):
@@ -140,6 +169,70 @@ class RBTradingCalendar:
         frames = [self.expected_minutes(day) for day in days]
         return pd.concat(frames, ignore_index=True) if frames else _empty_expected_minutes()
 
+    def validate_coverage(
+        self,
+        start: date | pd.Timestamp,
+        end: date | pd.Timestamp,
+    ) -> None:
+        """Validate an inclusive date span against the reviewed horizon."""
+        start_day = pd.Timestamp(start).normalize()
+        end_day = pd.Timestamp(end).normalize()
+        if end_day < start_day:
+            raise CalendarCoverageError(
+                f"calendar_out_of_range: invalid range {start_day.date()}..{end_day.date()}"
+            )
+        if start_day < self.first_day or end_day > self.valid_through:
+            raise CalendarCoverageError(
+                "calendar_out_of_range: requested "
+                f"{start_day.date()}..{end_day.date()}, reviewed "
+                f"{self.first_day.date()}..{self.valid_through.date()}"
+            )
+
+    def next_trading_day(
+        self,
+        value: date | pd.Timestamp,
+        *,
+        inclusive: bool = False,
+    ) -> pd.Timestamp:
+        day = pd.Timestamp(value).normalize()
+        mask = (
+            self.trading_days["trading_day"].ge(day)
+            if inclusive
+            else self.trading_days["trading_day"].gt(day)
+        )
+        candidates = self.trading_days.loc[mask, "trading_day"]
+        if candidates.empty:
+            raise CalendarCoverageError(
+                "calendar_out_of_range: no reviewed next trading day after "
+                f"{day.date()} (valid_through={self.valid_through.date()})"
+            )
+        return pd.Timestamp(candidates.iloc[0]).normalize()
+
+    def latest_complete_session_end(
+        self,
+        value: datetime | pd.Timestamp,
+    ) -> pd.Timestamp:
+        """Return the latest RB session end strictly before ``value``."""
+        timestamp = _timestamp_naive(pd.Timestamp(value))
+        self.validate_coverage(timestamp, timestamp)
+        lower = max(self.first_day, timestamp.normalize() - pd.Timedelta(days=10))
+        expected = self.expected_minutes_between(lower, timestamp.normalize())
+        if expected.empty:
+            raise CalendarCoverageError(
+                f"calendar_out_of_range: no complete session before {timestamp}"
+            )
+        session_ends = expected.groupby(
+            ["trading_day", "session"], as_index=False
+        )["calendar_datetime"].max()
+        completed = session_ends[
+            session_ends["calendar_datetime"].map(_timestamp_naive) < timestamp
+        ]
+        if completed.empty:
+            raise CalendarCoverageError(
+                f"calendar_out_of_range: no complete session before {timestamp}"
+            )
+        return pd.Timestamp(completed["calendar_datetime"].max())
+
     def map_datetimes(self, values: pd.Series) -> pd.DataFrame:
         if values.empty:
             return pd.DataFrame(
@@ -151,12 +244,18 @@ class RBTradingCalendar:
             naive = naive.dt.tz_localize(None)
         lower = naive.min().normalize()
         upper = naive.max().normalize()
+        if lower < self.first_day - pd.Timedelta(days=3) or upper > self.valid_through:
+            raise CalendarCoverageError(
+                "calendar_out_of_range: timestamps requested for "
+                f"{lower.date()}..{upper.date()}, reviewed through "
+                f"{self.valid_through.date()}"
+            )
         candidate_days = self.trading_days[
             (self.trading_days["trading_day"] >= lower - pd.Timedelta(days=10))
             & (self.trading_days["trading_day"] <= upper + pd.Timedelta(days=10))
         ]["trading_day"]
         if candidate_days.empty:
-            raise ValueError(
+            raise CalendarCoverageError(
                 f"timestamps outside calendar range {self.first_day.date()}..{self.last_day.date()}"
             )
         expected = pd.concat(
@@ -167,11 +266,50 @@ class RBTradingCalendar:
         mapped.index = values.index
         return mapped
 
+    def map_datetime(
+        self,
+        value: datetime | pd.Timestamp,
+    ) -> tuple[pd.Timestamp, str, int] | None:
+        """Map one minute using cached trading-day lookup tables."""
+        timestamp = _timestamp_naive(pd.Timestamp(value))
+        lower = timestamp.normalize()
+        if lower < self.first_day - pd.Timedelta(days=3) or lower > self.valid_through:
+            raise CalendarCoverageError(
+                "calendar_out_of_range: timestamp requested for "
+                f"{timestamp}, reviewed through {self.valid_through.date()}"
+            )
+        candidates = self.trading_days.loc[
+            self.trading_days["trading_day"].between(
+                lower,
+                lower + pd.Timedelta(days=10),
+            ),
+            "trading_day",
+        ]
+        for value_day in candidates:
+            trading_day = pd.Timestamp(value_day).normalize()
+            lookup = self._minute_lookup_cache.get(trading_day)
+            if lookup is None:
+                expected = self.expected_minutes(trading_day)
+                lookup = {
+                    _timestamp_naive(pd.Timestamp(row.calendar_datetime)): (
+                        trading_day,
+                        str(row.session),
+                        int(row.session_minute_index),
+                    )
+                    for row in expected.itertuples(index=False)
+                }
+                self._minute_lookup_cache[trading_day] = lookup
+            mapped = lookup.get(timestamp)
+            if mapped is not None:
+                return mapped
+        return None
+
     def _ensure_in_range(self, day: pd.Timestamp) -> None:
         if day < self.first_day or day > self.last_day:
-            raise ValueError(
-                f"trading day {day.date()} outside calendar range "
-                f"{self.first_day.date()}..{self.last_day.date()}"
+            raise CalendarCoverageError(
+                "calendar_out_of_range: trading day "
+                f"{day.date()} outside calendar range "
+                f"{self.first_day.date()}..{self.valid_through.date()}"
             )
 
 
@@ -205,3 +343,9 @@ def _empty_expected_minutes() -> pd.DataFrame:
             "session_minute_index",
         ]
     )
+
+
+def _timestamp_naive(value: pd.Timestamp) -> pd.Timestamp:
+    if value.tzinfo is not None:
+        return value.tz_convert("Asia/Shanghai").tz_localize(None)
+    return value

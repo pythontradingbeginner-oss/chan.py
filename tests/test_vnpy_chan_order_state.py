@@ -96,6 +96,7 @@ def test_pending_order_count_blocks_live_production_gate(tmp_path) -> None:
         config=config,
         kl_window=15,
         production_ready=True,
+        operator_confirmed=True,
         shadow_mode=False,
         forward_confirmed=True,
         risk_manager_confirmed=True,

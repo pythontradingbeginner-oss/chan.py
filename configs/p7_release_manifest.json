@@ -1,10 +1,11 @@
 {
   "phase": "P7",
   "name": "VeighNa 实盘工程化与前向验证",
-  "release_status": "candidate_uncommitted",
-  "built_at": "2026-08-03T21:59:11+08:00",
+  "release_status": "repair_candidate_uncommitted",
+  "built_at": "2026-08-04T04:51:03+08:00",
   "baseline_commit": "ab31edcdc2fca71c472b3ae7485266adee4de194",
-  "repository_head": "ab31edcdc2fca71c472b3ae7485266adee4de194",
+  "repair_base_commit": "98b457fb9a411c38a0bacf9777aeb2d747be38dd",
+  "repository_head": "98b457fb9a411c38a0bacf9777aeb2d747be38dd",
   "release_commit": null,
   "source_tree_clean_at_build": false,
   "production_host": "VeighNa CtaStrategyApp + vnpy_chan.chan_bsp_strategy.ChanBspStrategy",
@@ -18,7 +19,20 @@
   "strategy_config": "configs/rb_15m_qingpai_strict.yaml",
   "risk_manager_setting": "configs/veighna_risk_manager_setting.p7.json",
   "supported_realtime_windows": [5, 15, 60],
+  "calendar_valid_through": "2026-12-31",
   "default_runtime_mode": "shadow",
+  "cta_strategy_setting": {
+    "path": "~/.vntrader/cta_strategy_setting.json",
+    "strategy_name": "chan.py",
+    "required_setting": {
+      "load_days": 100,
+      "operator_confirmed": false,
+      "shadow_mode": true,
+      "forward_confirmed": false,
+      "risk_manager_confirmed": false
+    },
+    "forbidden_setting": ["production_ready"]
+  },
   "config_summary": {
     "code": "RB_MAIN",
     "kl_type": "K_15M",
@@ -34,11 +48,11 @@
   "artifacts": {
     "strategy_source": {
       "path": "vnpy_chan/chan_bsp_strategy.py",
-      "sha256": "d5e683460a8598b0b66bfebecceacf4d12e506772f97bdc9b668dfc891914691"
+      "sha256": "b9495470bdb1e77f67d2b7531714ab09acba79634b62d282f1b0d00f52f7ac6a"
     },
     "strategy_deployed": {
       "path": "~/strategies/chan_bsp_strategy.py",
-      "sha256": "d5e683460a8598b0b66bfebecceacf4d12e506772f97bdc9b668dfc891914691"
+      "sha256": "b9495470bdb1e77f67d2b7531714ab09acba79634b62d282f1b0d00f52f7ac6a"
     },
     "strategy_config": {
       "path": "configs/rb_15m_qingpai_strict.yaml",
@@ -47,11 +61,24 @@
     "risk_manager_profile": {
       "path": "configs/veighna_risk_manager_setting.p7.json",
       "sha256": "fcfbca4cee63d79e69af482d537805c0f671c3816867e9f7509751576b199c09"
+    },
+    "rb_trading_days": {
+      "path": "data_foundation/data/static/rb_trading_days.csv",
+      "sha256": "3c4fe4b333aa33edf07e3b1343fa1ca0700963c6f5c538ee1440a38ced21a074"
+    },
+    "session_rules": {
+      "path": "data_foundation/data/static/session_rules.csv",
+      "sha256": "9c7079d1e7cbc4232b4ba873252e56ceac8afd86132b0aa971abbabfc91ab612"
+    },
+    "calendar_metadata": {
+      "path": "data_foundation/data/static/rb_calendar_metadata.json",
+      "sha256": "bdfbe7d33139872bd4b818227a4feda3d2593e6393703f3df8adb8b4cf941d9c"
     }
   },
   "live_order_gate": [
-    "production_ready=true",
+    "computed production_ready=true",
     "shadow_mode=false",
+    "operator_confirmed=true",
     "forward_confirmed=true",
     "risk_manager_confirmed=true",
     "VeighNa RiskManager setting has at least one active rule",

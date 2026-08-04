@@ -9,7 +9,11 @@ import pytest
 
 from data_foundation import RBTradingCalendar, aggregate_continuous_1m_to_Nm
 from vnpy_chan.converter import bars_to_ohlc_frame
-from vnpy_chan.session_aggregator import RbSessionBarAggregator
+from vnpy_chan.session_aggregator import (
+    AggregationSequenceError,
+    RbSessionBarAggregator,
+    normalize_realtime_bar,
+)
 
 
 class _Exchange(Enum):
@@ -98,6 +102,58 @@ def test_live_aggregator_fails_fast_on_active_symbol_change_inside_window() -> N
     with pytest.raises(ValueError, match="ACTIVE_SYMBOL_INVARIANT_BROKEN"):
         for bar in bars:
             aggregator.update_bar(bar)
+
+
+def test_realtime_minute_start_label_is_copied_and_shifted_to_end() -> None:
+    source = next(
+        _bars_from_frame(pd.DataFrame([_row("2026-08-04 09:00", 1)]))
+    )
+
+    normalized = normalize_realtime_bar(source)
+
+    assert source.datetime == datetime(2026, 8, 4, 9, 0)
+    assert normalized is not source
+    assert normalized.datetime == datetime(2026, 8, 4, 9, 1)
+
+
+@pytest.mark.parametrize(
+    ("timestamps", "reason"),
+    [
+        (["2026-08-04 09:01", "2026-08-04 09:01"], "DUPLICATE_MINUTE"),
+        (["2026-08-04 09:02", "2026-08-04 09:01"], "OUT_OF_ORDER_MINUTE"),
+        (["2026-08-04 09:01", "2026-08-04 09:03"], "MISSING_MINUTE"),
+    ],
+)
+def test_live_aggregator_hard_fails_invalid_sequence(timestamps, reason) -> None:
+    aggregator = RbSessionBarAggregator(5)
+    bars = _bars_from_frame(
+        pd.DataFrame([_row(timestamp, index) for index, timestamp in enumerate(timestamps)])
+    )
+
+    with pytest.raises(AggregationSequenceError, match=reason):
+        for bar in bars:
+            aggregator.update_bar(bar)
+
+
+def test_live_aggregator_accepts_reviewed_session_break() -> None:
+    aggregator = RbSessionBarAggregator(5)
+    frame = pd.DataFrame(
+        [
+            *[_row(value, index) for index, value in enumerate(pd.date_range("2026-08-04 10:11", "2026-08-04 10:15", freq="min"))],
+            *[_row(value, index) for index, value in enumerate(pd.date_range("2026-08-04 10:31", "2026-08-04 10:35", freq="min"), start=10)],
+        ]
+    )
+
+    emitted = [
+        result
+        for bar in _bars_from_frame(frame)
+        if (result := aggregator.update_bar(bar)) is not None
+    ]
+
+    assert [bar.datetime for bar in emitted] == [
+        datetime(2026, 8, 4, 10, 15),
+        datetime(2026, 8, 4, 10, 35),
+    ]
 
 
 def _bars_from_frame(frame: pd.DataFrame):
