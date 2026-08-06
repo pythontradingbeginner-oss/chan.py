@@ -53,6 +53,7 @@ class HardRiskState:
     drawdown_pct: float | None = None
     max_drawdown_pct: float | None = None
     active_main_contracts: tuple[str, ...] = ()
+    require_main_contract_confirm: bool = False
 
 
 def evaluate_open_guard(state: HardRiskState) -> OpenDecision:
@@ -72,6 +73,13 @@ def evaluate_open_guard(state: HardRiskState) -> OpenDecision:
         reasons.append(
             f"contract_rollover_required:{base} not in "
             f"{','.join(state.active_main_contracts)}"
+        )
+    elif state.require_main_contract_confirm and not state.active_main_contracts:
+        # P7-R6A: production must fail-closed when the main-contract
+        # confirmation list is empty (no automatic main detection/rollover).
+        reasons.append(
+            "main_contract_confirmation_missing:"
+            f"production requires active_main_contracts"
         )
 
     if state.planned_open_lots > 1:

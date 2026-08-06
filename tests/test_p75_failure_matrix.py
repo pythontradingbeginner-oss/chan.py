@@ -32,6 +32,9 @@ def _order(vt_orderid: str, status: str, volume: float = 1, traded: float = 0):
     return SimpleNamespace(
         vt_orderid=vt_orderid,
         orderid=vt_orderid,
+        symbol="rb2610",
+        exchange="SHFE",
+        gateway_name="CTP",
         price=3500,
         volume=volume,
         traded=traded,
@@ -226,13 +229,15 @@ def test_restart_with_position_restores_and_aligns() -> None:
     source._build_runtime_state_package = (
         ChanBspStrategy._build_runtime_state_package.__get__(source)
     )
-    source._runtime_strategy_id = ChanBspStrategy._runtime_strategy_id.__get__(source)
+    source._config_sha256 = lambda: "abc123"
     source._exit_state_snapshot = lambda: {}
     source._trade_ids = lambda: []
     source._persist_runtime_state()
     package = RuntimeStatePackage.from_json(
         source.runtime_state_json,
-        expected_strategy_id="chan.py|rb2610.SHFE",
+        expected_strategy_name="ChanBspStrategy",
+        expected_vt_symbol="rb2610.SHFE",
+        expected_config_sha256="abc123",
     )
     assert package.position is not None
 
@@ -240,6 +245,7 @@ def test_restart_with_position_restores_and_aligns() -> None:
         oms_positions=[_position("LONG", 1)],
         oms_orders=[],
         symbol="rb2610",
+        self_pos=1,
         strategy_context=_context(),
         strategy_active_order_ids=(),
     )

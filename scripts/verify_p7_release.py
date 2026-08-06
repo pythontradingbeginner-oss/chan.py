@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -16,10 +18,19 @@ REQUIRED_ARTIFACTS = {
     "strategy_deployed",
     "strategy_config",
     "risk_manager_profile",
+    "risk_manager_custom_rule_source",
+    "risk_manager_custom_rule_deployed",
     "rb_trading_days",
     "session_rules",
     "calendar_metadata",
 }
+
+
+DEPLOYED_ARTIFACTS = {
+    "strategy_deployed",
+    "risk_manager_custom_rule_deployed",
+}
+GIT = os.environ.get("GIT_EXECUTABLE") or shutil.which("git") or "git"
 
 
 def file_sha256(path: Path) -> str:
@@ -39,7 +50,7 @@ def resolve_artifact_path(raw_path: str) -> Path:
 
 def git_output(*args: str) -> str:
     completed = subprocess.run(
-        ["git", "-C", str(PROJECT_ROOT), *args],
+        [GIT, "-C", str(PROJECT_ROOT), *args],
         check=True,
         capture_output=True,
         text=True,
@@ -49,7 +60,7 @@ def git_output(*args: str) -> str:
 
 def git_bytes(*args: str) -> bytes:
     completed = subprocess.run(
-        ["git", "-C", str(PROJECT_ROOT), *args],
+        [GIT, "-C", str(PROJECT_ROOT), *args],
         check=True,
         capture_output=True,
     )
@@ -58,7 +69,7 @@ def git_bytes(*args: str) -> bytes:
 
 def git_succeeds(*args: str) -> bool:
     completed = subprocess.run(
-        ["git", "-C", str(PROJECT_ROOT), *args],
+        [GIT, "-C", str(PROJECT_ROOT), *args],
         check=False,
         capture_output=True,
     )
@@ -79,7 +90,7 @@ def verify_release(
     if missing_artifacts:
         errors.append(f"manifest missing artifacts: {sorted(missing_artifacts)}")
     for name, artifact in artifacts.items():
-        if name == "strategy_deployed" and not include_deployed:
+        if name in DEPLOYED_ARTIFACTS and not include_deployed:
             continue
         path = resolve_artifact_path(str(artifact["path"]))
         if not path.is_file():
@@ -102,6 +113,28 @@ def verify_release(
         if source_path.is_file() and deployed_path.is_file():
             if source_path.read_bytes() != deployed_path.read_bytes():
                 errors.append("strategy_deployed: bytes differ from strategy_source")
+            else:
+                print("OK strategy_deployed matches strategy_source")
+        elif not deployed_path.is_file():
+            errors.append("strategy_deployed: missing deployed copy (deployment pending)")
+
+    rule_source = artifacts.get("risk_manager_custom_rule_source")
+    rule_deployed = artifacts.get("risk_manager_custom_rule_deployed")
+    if rule_source and rule_deployed and include_deployed:
+        source_path = resolve_artifact_path(str(rule_source["path"]))
+        deployed_path = resolve_artifact_path(str(rule_deployed["path"]))
+        if source_path.is_file() and deployed_path.is_file():
+            if source_path.read_bytes() != deployed_path.read_bytes():
+                errors.append(
+                    "risk_manager_custom_rule_deployed: bytes differ from source"
+                )
+            else:
+                print("OK risk_manager_custom_rule_deployed matches source")
+        elif not deployed_path.is_file():
+            errors.append(
+                "risk_manager_custom_rule_deployed: missing deployed copy "
+                "(deployment pending)"
+            )
 
     _verify_calendar_metadata(manifest, artifacts, errors)
     _verify_risk_profile(artifacts, errors)
@@ -109,11 +142,17 @@ def verify_release(
 
     release_status = str(manifest.get("release_status", ""))
     head = git_output("rev-parse", "HEAD")
-    expected_head = str(manifest.get("repository_head", ""))
-    if release_status != "frozen" and head != expected_head:
-        errors.append(f"repository_head: expected={expected_head} actual={head}")
+    impl_base = str(manifest.get("implementation_base_commit", ""))
+    if impl_base:
+        if git_succeeds("rev-parse", "--verify", f"{impl_base}^{{commit}}"):
+            print(f"OK implementation_base_commit: {impl_base}")
+        else:
+            errors.append(f"implementation_base_commit is not a valid commit: {impl_base}")
     else:
-        print(f"OK repository_head: current={head} build={expected_head}")
+        errors.append("implementation_base_commit is required")
+    candidate_worktree = str(manifest.get("candidate_worktree", ""))
+    if not candidate_worktree:
+        errors.append("candidate_worktree must be set (e.g. 'uncommitted')")
 
     if require_release_ready:
         if release_status != "frozen":
@@ -136,7 +175,7 @@ def verify_release(
         if resolved_commit:
             for name, artifact in artifacts.items():
                 raw_path = str(artifact["path"])
-                if name == "strategy_deployed" or Path(raw_path).expanduser().is_absolute():
+                if name in DEPLOYED_ARTIFACTS or Path(raw_path).expanduser().is_absolute():
                     continue
                 try:
                     payload = git_bytes("show", f"{resolved_commit}:{raw_path}")
@@ -196,6 +235,10 @@ def _verify_risk_profile(artifacts: dict, errors: list[str]) -> None:
     if not path.is_file():
         return
     profile = json.loads(path.read_text(encoding="utf-8"))
+    # P7-R10: must have "缠论开仓守卫" active, not just any rule
+    guard = profile.get("缠论开仓守卫")
+    if not isinstance(guard, dict) or not bool(guard.get("active")):
+        errors.append("risk_manager_profile: 缠论开仓守卫 must be active")
     if not any(
         isinstance(value, dict) and bool(value.get("active"))
         for value in profile.values()

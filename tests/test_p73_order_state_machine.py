@@ -97,9 +97,16 @@ def test_timeout_archives_order() -> None:
     )
     timed_out = machine.check_timeouts("2026-08-04T10:31:00")
 
+    # P7-R4: timeout enters CANCELLING and requests a real cancel; it is NOT
+    # archived until the exchange reports a terminal status.
     assert timed_out == ["SIM.1"]
+    assert machine.summary == "CANCELLING:1"
+    assert machine.pending_cancel_orderids == ["SIM.1"]
+
+    # Terminal report (e.g. CANCELLED) archives the order
+    machine.on_order(_order("SIM.1", "CANCELLED"))
     assert machine.summary == "idle"
-    assert machine.history[-1].status == "TIMEDOUT"
+    assert machine.history[-1].status == "CANCELLED"
 
 
 def test_consumed_trade_ids_survive_json_roundtrip() -> None:
@@ -222,6 +229,9 @@ def test_reversal_waits_for_zero_position() -> None:
         reason_text="shadow_mode_enabled",
     )
     strategy._order_state.consumed_trade_ids = set()
+    # Register the close order so the close fill is ACCEPTED under R4
+    strategy._order_state.submit(["SIM.1"], role="close", price=3500, volume=1)
+    strategy._order_state.set_close_intent("SIM.1")
 
     # simulate close fill that brings position to zero
     from vnpy.trader.constant import Offset
@@ -229,6 +239,7 @@ def test_reversal_waits_for_zero_position() -> None:
     strategy.on_trade(
         SimpleNamespace(
             vt_orderid="SIM.1",
+            vt_tradeid="CLOSE-T1",
             offset=Offset.CLOSE,
             price=3500,
             volume=1,

@@ -2,10 +2,10 @@
   "phase": "P7",
   "name": "VeighNa 实盘工程化与前向验证",
   "release_status": "repair_candidate_uncommitted",
-  "built_at": "2026-08-04T04:51:03+08:00",
+  "built_at": "2026-08-05T08:00:00+08:00",
   "baseline_commit": "ab31edcdc2fca71c472b3ae7485266adee4de194",
-  "repair_base_commit": "077e2b2a193561a83b4017f93021d307a3665008",
-  "repository_head": "077e2b2a193561a83b4017f93021d307a3665008",
+  "implementation_base_commit": "6708093df37fc387eeba7276927cb612639b488d",
+  "candidate_worktree": "uncommitted",
   "release_commit": null,
   "source_tree_clean_at_build": false,
   "production_host": "VeighNa CtaStrategyApp + vnpy_chan.chan_bsp_strategy.ChanBspStrategy",
@@ -56,11 +56,11 @@
   "artifacts": {
     "strategy_source": {
       "path": "vnpy_chan/chan_bsp_strategy.py",
-      "sha256": "486387bbc6380cea9ac93ea9897ed01a627090479ca5ec6773354cf38aaa788a"
+      "sha256": "b682672871900552ddac61c2e04dc0c85c44464d1d75d6ab0a66d7ddf7d5a373"
     },
     "strategy_deployed": {
       "path": "~/strategies/chan_bsp_strategy.py",
-      "sha256": "486387bbc6380cea9ac93ea9897ed01a627090479ca5ec6773354cf38aaa788a"
+      "sha256": "0d3bcffc477c35fe75ad199e001f872d2a2f0b05905a65f9928152192fec7ad5"
     },
     "strategy_config": {
       "path": "configs/rb_15m_qingpai_strict.yaml",
@@ -68,7 +68,16 @@
     },
     "risk_manager_profile": {
       "path": "configs/veighna_risk_manager_setting.p7.json",
-      "sha256": "fcfbca4cee63d79e69af482d537805c0f671c3816867e9f7509751576b199c09"
+      "sha256": "a8195ad5b5e6fb147e904a51b6d86c291fb312264f2ccd9a59663213aca64a07"
+    },
+    "risk_manager_custom_rule_source": {
+      "path": "rules/chan_open_guard_rule.py",
+      "sha256": "776298227e021a47c89c02326dc110b1d9a866dad7aee95fc72369f22215628a",
+      "class_name": "ChanOpenGuardRule"
+    },
+    "risk_manager_custom_rule_deployed": {
+      "path": "~/rules/chan_open_guard_rule.py",
+      "sha256": "0b5874a91ff8944129ac5d46b664a96dac797036786407bcd0417d4aad8d3a74"
     },
     "rb_trading_days": {
       "path": "data_foundation/data/static/rb_trading_days.csv",
@@ -89,7 +98,7 @@
     "operator_confirmed=true",
     "forward_confirmed=true",
     "risk_manager_confirmed=true",
-    "VeighNa RiskManager setting has at least one active rule",
+    "VeighNa RiskManager 缠论开仓守卫 active=true",
     "strategy config has production.enabled=true and hard risk limits"
   ]
 }

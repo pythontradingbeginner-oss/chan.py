@@ -21,11 +21,17 @@ from vnpy_chan.runtime_state import (
 
 
 def _position(direction: str, volume: int):
-    return SimpleNamespace(symbol="rb2610", direction=direction, volume=volume)
+    return SimpleNamespace(
+        symbol="rb2610", exchange="SHFE", gateway_name="CTP",
+        direction=direction, volume=volume,
+    )
 
 
 def _order(vt_orderid: str, status: str):
-    return SimpleNamespace(vt_orderid=vt_orderid, orderid=vt_orderid, status=status)
+    return SimpleNamespace(
+        vt_orderid=vt_orderid, orderid=vt_orderid, symbol="rb2610",
+        exchange="SHFE", gateway_name="CTP", status=status,
+    )
 
 
 def _context() -> PositionContext:
@@ -137,7 +143,9 @@ def test_unattributed_position_never_autoclaimed() -> None:
 
 def test_runtime_state_package_roundtrip() -> None:
     package = RuntimeStatePackage(
-        strategy_id="chan.py|rb2610.SHFE",
+        strategy_name="ChanBspStrategy",
+        vt_symbol="rb2610.SHFE",
+        config_sha256="abc123",
         position={"volume": 1},
         risk={"realized_points": -50},
         orders={"active": []},
@@ -146,7 +154,9 @@ def test_runtime_state_package_roundtrip() -> None:
     )
     restored = RuntimeStatePackage.from_json(
         package.to_json(),
-        expected_strategy_id="chan.py|rb2610.SHFE",
+        expected_strategy_name="ChanBspStrategy",
+        expected_vt_symbol="rb2610.SHFE",
+        expected_config_sha256="abc123",
     )
     assert restored.position == {"volume": 1}
     assert restored.risk == {"realized_points": -50}
@@ -157,19 +167,19 @@ def test_runtime_state_package_roundtrip() -> None:
 def test_runtime_state_package_rejects_wrong_version() -> None:
     payload = {
         "state_version": STATE_VERSION + 1,
-        "strategy_id": "chan.py|rb2610.SHFE",
+        "strategy_name": "ChanBspStrategy",
         "persisted_at": "",
     }
     with pytest.raises(RuntimeStateVersionError, match="state_version_mismatch"):
         RuntimeStatePackage.from_dict(payload)
 
 
-def test_runtime_state_package_rejects_wrong_strategy_id() -> None:
-    package = RuntimeStatePackage(strategy_id="chan.py|rb2605.SHFE")
-    with pytest.raises(RuntimeStateVersionError, match="strategy_id_mismatch"):
+def test_runtime_state_package_rejects_wrong_strategy_name() -> None:
+    package = RuntimeStatePackage(strategy_name="OtherStrategy")
+    with pytest.raises(RuntimeStateVersionError, match="strategy_name_mismatch"):
         RuntimeStatePackage.from_json(
             package.to_json(),
-            expected_strategy_id="chan.py|rb2610.SHFE",
+            expected_strategy_name="ChanBspStrategy",
         )
 
 
@@ -260,7 +270,7 @@ def test_oms_query_error_forces_recovery() -> None:
 
     strategy._check_oms_reconciliation()
 
-    assert strategy.recovery_status == "oms_query_error"
+    assert strategy.recovery_status == "RECOVERY_REQUIRED"
     assert strategy._recovery_required is True
 
 
@@ -270,12 +280,16 @@ def test_oms_reconciliation_wiring() -> None:
 
     strategy = ChanBspStrategy.__new__(ChanBspStrategy)
     strategy.vt_symbol = "rb2610.SHFE"
+    strategy.pos = 1  # engine-derived net position matches PositionContext
+    # P7-R10: _check_oms_reconciliation now resolves gateway via get_contract
+    contract = SimpleNamespace(gateway_name="CTP")
     strategy.cta_engine = SimpleNamespace(
         main_engine=SimpleNamespace(
             get_engine=lambda name: SimpleNamespace(
                 get_all_positions=lambda: [_position("LONG", 1)],
                 get_all_active_orders=lambda: [],
-            )
+            ),
+            get_contract=lambda vt_symbol: contract,
         )
     )
     strategy._order_state = CtaOrderStatusMachine()

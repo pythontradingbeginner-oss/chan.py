@@ -107,6 +107,7 @@ class ChanBspStrategy(CtaTemplate):
     manual_halt = False
     minimum_equity = 0.0
     active_main_contracts = ""
+    order_timeout_seconds = 30
 
     # --- vnpy variables (displayed in GUI) ---
     bi_count = 0
@@ -156,6 +157,7 @@ class ChanBspStrategy(CtaTemplate):
         "manual_halt",
         "minimum_equity",
         "active_main_contracts",
+        "order_timeout_seconds",
     ]
     variables = [
         "bi_count",
@@ -316,9 +318,19 @@ class ChanBspStrategy(CtaTemplate):
 
     def on_start(self):
         """Start trading."""
+        # VeighNa restores persisted variables AFTER on_init (CtaEngine
+        # _init_strategy: call on_init, then setattr each variable from
+        # strategy_data).  Re-apply this run's private warmup snapshot so
+        # stale disk values cannot flip the readiness gate.
+        self._reapply_warmup_readiness()
         self._restore_runtime_state()
         self._check_oms_reconciliation()
-        gate = self._refresh_production_gate()
+        try:
+            self._register_live_events()
+            gate = self._refresh_production_gate()
+        except Exception:
+            self._unregister_live_events()
+            raise
         self._runtime_started = bool(
             gate.ready and self.production_ready and not self._recovery_required
         )
@@ -328,9 +340,97 @@ class ChanBspStrategy(CtaTemplate):
             f"reason={gate.reason_text or 'ready'}"
         )
 
+    def _register_live_events(self) -> None:
+        """Register EVENT_TIMER and EVENT_ACCOUNT for realtime safety.
+
+        CtaEngine does NOT register EVENT_TIMER, so CtaTemplate.on_timer
+        is never called.  We register our own bridge via the engine's
+        EventEngine to drive order timeouts even when the market is
+        disconnected.
+
+        Registration is idempotent (second call cancels the first).  The
+        EventEngine callbacks funnel through call_strategy_func to retain
+        VeighNa's exception safe-stop semantics.
+        """
+        try:
+            event_engine = getattr(self.cta_engine, "event_engine", None)
+        except Exception:
+            event_engine = None
+        if event_engine is None:
+            self.write_log("No EventEngine available; timer/account events not registered")
+            return
+
+        handler = getattr(self, "_live_timer_handler", None)
+        if handler is not None:
+            self._unregister_live_events()
+
+        try:
+            from vnpy.trader.event import EVENT_ACCOUNT, EVENT_TIMER
+        except ImportError:
+            return
+
+        def _timer_handler(event):
+            try:
+                self.cta_engine.call_strategy_func(self, self.on_timer)
+            except Exception:
+                pass
+
+        def _account_handler(event):
+            try:
+                data = getattr(event, "data", None)
+                if data is None:
+                    return
+                # P7-R11: only update heartbeat when the account event's
+                # gateway matches this strategy's gateway.  Otherwise a
+                # different gateway's account update would spuriously keep
+                # the heartbeat alive.
+                strategy_gateway = getattr(self, "_resolved_gateway", "")
+                if not strategy_gateway:
+                    strategy_gateway = self._resolve_gateway(
+                        getattr(self.cta_engine, "main_engine", None),
+                        str(getattr(self, "vt_symbol", "")),
+                    )
+                    if not strategy_gateway:
+                        return
+                    self._resolved_gateway = strategy_gateway
+                evt_gw = str(getattr(data, "gateway_name", "") or "")
+                if not evt_gw or evt_gw.upper() != strategy_gateway.upper():
+                    return
+                self._last_account_time = datetime.now()
+                self.last_account_time_text = (
+                    self._last_account_time.isoformat(timespec="seconds")
+                )
+            except Exception:
+                pass
+
+        self._live_timer_handler = _timer_handler
+        self._live_account_handler = _account_handler
+        event_engine.register(EVENT_TIMER, _timer_handler)
+        event_engine.register(EVENT_ACCOUNT, _account_handler)
+
+    def _unregister_live_events(self) -> None:
+        handler = getattr(self, "_live_timer_handler", None)
+        acc_handler = getattr(self, "_live_account_handler", None)
+        try:
+            event_engine = getattr(self.cta_engine, "event_engine", None)
+        except Exception:
+            event_engine = None
+        if event_engine is not None:
+            try:
+                from vnpy.trader.event import EVENT_ACCOUNT, EVENT_TIMER
+            except ImportError:
+                return
+            if handler is not None:
+                event_engine.unregister(EVENT_TIMER, handler)
+            if acc_handler is not None:
+                event_engine.unregister(EVENT_ACCOUNT, acc_handler)
+        self._live_timer_handler = None
+        self._live_account_handler = None
+
     def on_stop(self):
         """Stop trading."""
         self._runtime_started = False
+        self._unregister_live_events()
         self.write_log(
             f"ChanBspStrategy stopped: "
             f"trades={self.total_trades} pnl={self.total_pnl:.0f}pts"
@@ -514,10 +614,22 @@ class ChanBspStrategy(CtaTemplate):
     # ============================================================
 
     def on_trade(self, trade: TradeData):
-        """Track PnL on close."""
+        """Track PnL on close.
+
+        Only an ACCEPTED disposition updates PositionContext / risk / PnL.
+        duplicate/late/unknown/invalid_transition fills never touch business
+        state, so a restart replay or out-of-order report cannot double-count.
+        """
         self._ensure_runtime_state_helpers()
-        self._order_state.on_trade(trade)
+        result = self._order_state.on_trade(trade)
         self.order_status = self._order_state.summary
+        if not result.accepted:
+            self.write_log(
+                f"Trade ignored disposition={result.disposition.value} "
+                f"vt_tradeid={getattr(trade, 'vt_tradeid', '')}"
+            )
+            self.put_event()
+            return
         if trade.offset == Offset.OPEN:
             fill_volume = int(trade.volume)
             pending = self._pending_entry
@@ -599,8 +711,14 @@ class ChanBspStrategy(CtaTemplate):
         self._ensure_runtime_state_helpers()
         tracked = self._order_state.on_order(order)
         self.order_status = self._order_state.summary
-        if not tracked.active and tracked.role.startswith("open") and tracked.traded <= 0:
-            self._pending_entry = None
+        vt_orderid = str(getattr(order, "vt_orderid", ""))
+        if not tracked.active:
+            if tracked.role.startswith("open") and tracked.traded <= 0:
+                self._pending_entry = None
+            if (
+                self._order_state.close_intent_orderid == vt_orderid
+            ):
+                self._order_state.clear_close_intent()
         self._persist_runtime_state()
         self.put_event()
 
@@ -610,6 +728,22 @@ class ChanBspStrategy(CtaTemplate):
         self.order_status = self._order_state.summary
         self._persist_runtime_state()
         self.put_event()
+
+    def on_timer(self):
+        """Reliable timer path: drive order timeouts even when the market is
+        disconnected.  Timeout first requests a REAL cancel (CANCELLING) and
+        only archives after the exchange reports a terminal status."""
+        self._ensure_runtime_state_helpers()
+        if not self._runtime_started:
+            return
+        try:
+            cancelling = self._order_state.check_timeouts()
+        except Exception as exc:
+            self.write_log(f"Order timeout check failed: {exc}")
+            return
+        for vt_orderid in cancelling:
+            self.cancel_order(vt_orderid)
+            self.write_log(f"Order timed out, cancelling: {vt_orderid}")
 
     # ============================================================
     # Internal: deterministic warmup and readiness
@@ -829,6 +963,36 @@ class ChanBspStrategy(CtaTemplate):
             ensure_ascii=False,
             separators=(",", ":"),
         )
+
+    def _reapply_warmup_readiness(self) -> None:
+        """Re-derive order-safety flags from the private snapshot.
+
+        VeighNa restores persisted variables (including production_ready,
+        initialization_status, warmup_*) over the strategy AFTER on_init.
+        Those GUI variables are display-only; the private _warmup_readiness
+        snapshot is the single source of truth for the order gate.  This must
+        run in on_start, after the engine's variable restore.
+        """
+        snapshot = self._warmup_readiness
+        if snapshot.ready:
+            if self.initialization_status not in {
+                "shadow_only_stale",
+                "market_data_blocked",
+                "failed",
+            }:
+                self.initialization_status = "ready"
+                self.production_ready = True
+        else:
+            self.production_ready = False
+            if self.initialization_status == "ready":
+                self.initialization_status = "blocked"
+                self.initialization_error = (
+                    self.initialization_error
+                    or ";".join(snapshot.reasons)
+                )
+        self.warmup_fresh = snapshot.fresh
+        self.warmup_bar_count = snapshot.bar_15m_count
+        self.structure_ready = snapshot.structure_ready
 
     def _block_initialization(
         self,
@@ -1085,7 +1249,17 @@ class ChanBspStrategy(CtaTemplate):
     def _close_existing(
         self, bar: BarData, reason: str, *, price: float | None = None
     ):
-        """Close current position."""
+        """Close current position.
+
+        Enforces a single active close intent: consecutive bars must not pile
+        up duplicate close orders before the first reaches a terminal report.
+        """
+        if self._order_state.has_active_close_intent():
+            self.write_log(
+                "Close skipped: single_active_close_intent "
+                f"(existing {self._order_state.close_intent_orderid})"
+            )
+            return
         order_price = float(bar.close_price) if price is None else float(price)
         order_price = self._execution_price(order_price, -int(self.pos))
         if self.pos > 0:
@@ -1116,6 +1290,8 @@ class ChanBspStrategy(CtaTemplate):
                 volume=abs(self.pos),
                 reason=reason,
             )
+            if order_ids:
+                self._order_state.set_close_intent(order_ids[0])
             self.order_status = "pending_close"
             self._persist_runtime_state()
 
@@ -1171,6 +1347,7 @@ class ChanBspStrategy(CtaTemplate):
             price=order_price,
             volume=planned_size,
             reason=intent.event_id,
+            timeout_at=self._order_timeout_at(),
         )
         self.order_status = "pending_open"
         self._persist_runtime_state()
@@ -1272,6 +1449,7 @@ class ChanBspStrategy(CtaTemplate):
                 else None
             ),
             active_main_contracts=self._active_main_contracts(),
+            require_main_contract_confirm=not bool(getattr(self, "shadow_mode", True)),
         )
         decision = evaluate_open_guard(state)
         self.hard_risk_status = "armed" if decision.allowed else "BLOCKED"
@@ -1326,6 +1504,13 @@ class ChanBspStrategy(CtaTemplate):
             price_tick=(execution.price_tick if execution else 1.0),
         )
 
+    def _order_timeout_at(self) -> str:
+        """ISO deadline for a fresh order (default 30s), used by on_timer."""
+        from datetime import timedelta
+
+        seconds = int(getattr(self, "order_timeout_seconds", 30) or 30)
+        return (datetime.now() + timedelta(seconds=seconds)).isoformat(timespec="seconds")
+
     def _account_equity(self) -> float | None:
         config = getattr(self, "_config", None)
         sizing = getattr(config, "sizing", None) if config is not None else None
@@ -1372,18 +1557,37 @@ class ChanBspStrategy(CtaTemplate):
             return None
         return sum(self._true_ranges) / period
 
+    def _snapshot_production_ready(self) -> bool:
+        """Authoritative readiness from the private snapshot (not GUI vars).
+
+        VeighNa can overwrite production_ready via disk variable restore; the
+        private _warmup_readiness snapshot is the only order-safety truth.
+        """
+        snapshot = getattr(self, "_warmup_readiness", None)
+        if snapshot is None:
+            return bool(self.production_ready)
+        if snapshot.ready:
+            return self.initialization_status not in {
+                "shadow_only_stale",
+                "market_data_blocked",
+                "failed",
+            }
+        return False
+
     def _refresh_production_gate(self):
         self._ensure_runtime_state_helpers()
+        live_risk_status = self._query_live_risk_status()
         gate = evaluate_production_gate(
             config=self._config,
             kl_window=int(self.kl_window),
-            production_ready=bool(self.production_ready),
+            production_ready=self._snapshot_production_ready(),
             operator_confirmed=bool(self.operator_confirmed),
             shadow_mode=bool(self.shadow_mode),
             forward_confirmed=bool(self.forward_confirmed),
             risk_manager_confirmed=bool(self.risk_manager_confirmed),
             risk_manager_setting_path=self.risk_manager_setting_path,
             pending_order_count=self._order_state.active_count,
+            live_risk_status=live_risk_status,
         )
         self._production_gate = gate
         if self.initialization_status in {
@@ -1397,6 +1601,15 @@ class ChanBspStrategy(CtaTemplate):
         reasons = [self.initialization_error, gate.reason_text]
         self.production_block_reason = ";".join(reason for reason in reasons if reason)
         return gate
+
+    def _query_live_risk_status(self):
+        """Query the actual RiskEngine state from the live MainEngine."""
+        from vnpy_chan.production_guard import inspect_live_risk_engine
+
+        main_engine = getattr(getattr(self, "cta_engine", None), "main_engine", None)
+        if main_engine is None:
+            return None
+        return inspect_live_risk_engine(main_engine)
 
     def _persist_runtime_state(self) -> None:
         self._ensure_runtime_state_helpers()
@@ -1430,19 +1643,39 @@ class ChanBspStrategy(CtaTemplate):
             decision_ids = [
                 str(record.decision_id) for record in kernel.decision_trace
             ]
+        order_state = (
+            json.loads(self.order_state_json) if self.order_state_json else {}
+        )
         return RuntimeStatePackage(
-            strategy_id=self._runtime_strategy_id(),
+            strategy_name=self.__class__.__name__,
+            vt_symbol=getattr(self, "vt_symbol", ""),
+            config_sha256=self._config_sha256(),
             position=position_payload,
             exit_state=self._exit_state_snapshot(),
             risk=json.loads(self.risk_state_json) if self.risk_state_json else {},
-            orders=json.loads(self.order_state_json) if self.order_state_json else {},
+            orders=order_state,
             decision_ids=decision_ids,
             trade_ids=self._trade_ids(),
+            vt_tradeids=sorted(self._order_state.consumed_trade_ids),
         )
+
+    def _config_sha256(self) -> str:
+        config = getattr(self, "_config", None)
+        if config is None:
+            return ""
+        path = getattr(config, "source_path", "") or ""
+        if path:
+            import hashlib
+            from pathlib import Path
+
+            p = Path(path)
+            if p.is_file():
+                return hashlib.sha256(p.read_bytes()).hexdigest()
+        return ""
 
     def _runtime_strategy_id(self) -> str:
         symbol = getattr(self, "vt_symbol", "")
-        return f"chan.py|{symbol}"
+        return f"{self.__class__.__name__}|{symbol}"
 
     def _trade_ids(self) -> list[str]:
         if not hasattr(self, "_order_state"):
@@ -1454,9 +1687,9 @@ class ChanBspStrategy(CtaTemplate):
         if manager is None:
             return {}
         try:
-            payload = getattr(manager, "to_dict", None)
-            if callable(payload):
-                return dict(payload())
+            snapshot = getattr(manager, "snapshot_state", None)
+            if callable(snapshot):
+                return dict(snapshot())
         except Exception:
             pass
         return {}
@@ -1471,7 +1704,9 @@ class ChanBspStrategy(CtaTemplate):
             try:
                 package = RuntimeStatePackage.from_json(
                     self.runtime_state_json,
-                    expected_strategy_id=self._runtime_strategy_id(),
+                    expected_strategy_name=self.__class__.__name__,
+                    expected_vt_symbol=getattr(self, "vt_symbol", ""),
+                    expected_config_sha256=self._config_sha256(),
                 )
                 if package.position is not None and not self.position_state_json:
                     self.position_state_json = json.dumps(
@@ -1491,14 +1726,19 @@ class ChanBspStrategy(CtaTemplate):
                         ensure_ascii=False,
                         separators=(",", ":"),
                     )
+                # Persist vt_tradeids for post-restore merge (H1 fix: the
+                # order_state_json rebuild would overwrite consumed ids).
+                self._restored_vt_tradeids = list(package.vt_tradeids or [])
+                # Also seed the current machine immediately so that the
+                # dedup is already in effect before any order_state restore.
+                if package.vt_tradeids:
+                    self._order_state.consumed_trade_ids.update(package.vt_tradeids)
+                self._restored_exit_state = dict(package.exit_state or {})
+                self._restored_decision_ids = list(package.decision_ids or [])
+                self._restored_trade_ids = list(package.trade_ids or [])
             except (RuntimeStateVersionError, ValueError, TypeError) as exc:
-                self._recovery_required = True
-                self.recovery_status = "RECOVERY_REQUIRED"
-                self.recovery_reasons = (
+                self._accumulate_recovery(
                     f"runtime_state_invalid:{getattr(exc, 'reason', type(exc).__name__)}"
-                )
-                self.write_log(
-                    f"Runtime state package invalid; recovery required: {exc}"
                 )
                 return
 
@@ -1510,13 +1750,22 @@ class ChanBspStrategy(CtaTemplate):
                 self.order_status = self._order_state.summary
             except Exception as exc:
                 self.order_status = "recovery_error"
+                self._accumulate_recovery(f"order_state_invalid:{type(exc).__name__}")
                 self.write_log(f"Order state restore failed: {exc}")
+        # P7-R9: merge vt_tradeids AFTER order_state restore so that any
+        # consumed ids from the runtime package survive an empty order_state.
+        if (
+            hasattr(self, "_restored_vt_tradeids")
+            and self._restored_vt_tradeids
+        ):
+            self._order_state.consumed_trade_ids.update(self._restored_vt_tradeids)
         if self.risk_state_json and self._risk is not None:
             try:
                 self._risk.load_state(json.loads(self.risk_state_json))
                 self.risk_status = "restored"
             except Exception as exc:
                 self.risk_status = "restore_error"
+                self._accumulate_recovery(f"risk_state_invalid:{type(exc).__name__}")
                 self.write_log(f"Risk state restore failed: {exc}")
         if self.position_state_json:
             try:
@@ -1526,50 +1775,110 @@ class ChanBspStrategy(CtaTemplate):
                 self._position_context = restored
                 if restored is not None and self._exit_manager is not None:
                     self._exit_manager.on_position_opened(restored)
+                    self._restore_exit_manager_state()
             except Exception as exc:
+                self._accumulate_recovery(f"position_state_invalid:{type(exc).__name__}")
                 self.write_log(f"Position state restore failed: {exc}")
 
+    def _restore_exit_manager_state(self) -> None:
+        """Apply the restored exit_state to the ExitManager after re-open.
+
+        Uses the public snapshot/restore contract added for P7-R3; the
+        strategy never touches ExitManager private fields directly.
+        """
+        manager = getattr(self, "_exit_manager", None)
+        payload = getattr(self, "_restored_exit_state", None)
+        if manager is None or not payload:
+            return
+        try:
+            restore = getattr(manager, "restore_state", None)
+            if callable(restore):
+                restore(dict(payload))
+        except Exception as exc:
+            self.write_log(f"ExitManager state restore failed: {exc}")
+
+    def _accumulate_recovery(self, reason: str) -> None:
+        """Accumulate a hard recovery reason; never cleared by later ALIGNED."""
+        self._recovery_required = True
+        current = self.recovery_reasons or ""
+        reasons = [r for r in current.split(";") if r]
+        if reason not in reasons:
+            reasons.append(reason)
+        self.recovery_reasons = ";".join(reasons)
+        self.recovery_status = "RECOVERY_REQUIRED"
+
     def _check_oms_reconciliation(self) -> None:
-        """Query OMS actual positions/orders and enter recovery if mismatched."""
+        """Query OMS actual positions/orders and enter recovery if mismatched.
+
+        Three-way comparison: self.pos vs PositionContext vs OMS, filtered by
+        symbol/exchange/gateway.  OMS absent or unqueryable fails closed, and
+        this never clears hard recovery reasons accumulated earlier.
+
+        P7-R10: resolve exchange and gateway from structured vt_symbol parsing
+        and MainEngine.get_contract so that positions/orders from other
+        exchanges or gateways never affect this strategy's reconciliation.
+        """
         self._ensure_runtime_state_helpers()
         main_engine = getattr(self.cta_engine, "main_engine", None)
-        symbol = str(self.vt_symbol).rsplit(".", 1)[0]
+        vt_symbol = str(getattr(self, "vt_symbol", ""))
+        if not vt_symbol or "." not in vt_symbol:
+            self._accumulate_recovery(
+                f"oms_invalid_vt_symbol:{vt_symbol or 'empty'}"
+            )
+            return
+
+        symbol, exchange = self._parse_vt_symbol(vt_symbol)
+        gateway = self._resolve_gateway(main_engine, vt_symbol)
+
+        if not exchange:
+            self._accumulate_recovery("oms_exchange_unknown")
+            return
+        if main_engine is not None and not gateway:
+            self._accumulate_recovery("oms_gateway_unknown")
+            return
+
         if main_engine is None:
-            self.recovery_status = "oms_unavailable"
-            self.recovery_reasons = "main_engine unavailable; recovery unchecked"
-            self._recovery_required = False
+            self._accumulate_recovery("oms_unavailable:main_engine")
             return
         try:
             oms = main_engine.get_engine("oms")
-            positions = oms.get_all_positions() if oms is not None else []
-            orders = oms.get_all_active_orders() if oms is not None else []
         except Exception as exc:
-            self.recovery_status = "oms_query_error"
-            self.recovery_reasons = f"{type(exc).__name__}: {exc}"
-            self._recovery_required = True
-            self.write_log(f"OMS reconciliation query failed: {self.recovery_reasons}")
+            self._accumulate_recovery(f"oms_query_error:{type(exc).__name__}")
+            return
+        if oms is None:
+            self._accumulate_recovery("oms_unavailable:no_oms_engine")
+            return
+        try:
+            positions = oms.get_all_positions()
+            orders = oms.get_all_active_orders()
+        except Exception as exc:
+            self._accumulate_recovery(f"oms_query_error:{type(exc).__name__}")
             return
 
         result = reconcile_oms(
-            oms_positions=positions,
-            oms_orders=orders,
+            oms_positions=positions or [],
+            oms_orders=orders or [],
             symbol=symbol,
+            self_pos=int(getattr(self, "pos", 0) or 0),
             strategy_context=getattr(self, "_position_context", None),
-            strategy_active_order_ids=tuple(
-                self._order_state.active.keys()
-            ),
+            strategy_active_order_ids=tuple(self._order_state.active.keys()),
+            exchange=exchange,
+            gateway=gateway,
         )
         self._recovery_result = result
         if result.recovery_required:
-            self._recovery_required = True
-            self.recovery_status = "RECOVERY_REQUIRED"
+            self._accumulate_recovery(result.reason_text)
         else:
-            self._recovery_required = False
-            self.recovery_status = "ALIGNED"
-        self.recovery_reasons = result.reason_text
+            # Only a fresh aligned result on a clean (non-accumulated) state
+            # may clear recovery.  Hard reasons from restore/query survive.
+            if not self.recovery_reasons:
+                self._recovery_required = False
+                self.recovery_status = "ALIGNED"
+            self.recovery_reasons = result.reason_text or self.recovery_reasons
         self.write_log(
             f"OMS reconciliation status={self.recovery_status} "
             f"oms_pos={result.oms_net_position} "
+            f"self_pos={result.self_net_position} "
             f"strategy_pos={result.strategy_net_position} "
             f"oms_active={len(result.oms_active_orders)} "
             f"strategy_active={len(result.strategy_active_orders)}"
@@ -1588,6 +1897,45 @@ class ChanBspStrategy(CtaTemplate):
             self._last_tick_time = None
         if not hasattr(self, "_last_account_time"):
             self._last_account_time = None
+        if not hasattr(self, "recovery_reasons"):
+            self.recovery_reasons = ""
+        if not hasattr(self, "recovery_status"):
+            self.recovery_status = "not_checked"
+        if not hasattr(self, "_restored_exit_state"):
+            self._restored_exit_state = {}
+        if not hasattr(self, "_restored_decision_ids"):
+            self._restored_decision_ids = []
+        if not hasattr(self, "_restored_trade_ids"):
+            self._restored_trade_ids = []
+
+    @staticmethod
+    def _parse_vt_symbol(vt_symbol: str) -> tuple[str, str]:
+        """Parse 'RB2610.SHFE' → ('RB2610', 'SHFE').
+
+        Normalises Enum.value to plain string for consistent comparison.
+        """
+        part = vt_symbol.rsplit(".", 1)
+        symbol = part[0]
+        exchange = part[1] if len(part) == 2 else ""
+        # Canonicalize: strip Enum wrapper if caller passed raw Exchange object value
+        if hasattr(exchange, "value"):
+            exchange = exchange.value
+        return symbol.upper(), exchange.upper()
+
+    def _resolve_gateway(self, main_engine, vt_symbol: str) -> str:
+        """Resolve gateway_name from MainEngine for a vt_symbol.
+
+        Returns empty string if unresolvable.
+        """
+        if main_engine is None:
+            return ""
+        try:
+            contract = main_engine.get_contract(vt_symbol)
+        except Exception:
+            return ""
+        if contract is None:
+            return ""
+        return str(getattr(contract, "gateway_name", "") or "")
 
     @property
     def position_context(self) -> PositionContext | None:

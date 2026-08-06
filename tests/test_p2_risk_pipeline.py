@@ -255,7 +255,17 @@ def test_cta_open_fill_installs_the_same_decision_anchors() -> None:
     strategy.write_log = lambda message: None
     strategy.put_event = lambda: None
 
-    strategy.on_trade(SimpleNamespace(offset=Offset.OPEN, volume=3, price=100.0))
+    # P7-R4: a fill is ACCEPTED only for a registered order with vt_tradeid.
+    from vnpy_chan.order_state import CtaOrderStatusMachine
+
+    strategy._order_state = CtaOrderStatusMachine()
+    strategy._order_state.submit(["SIM.1"], role="open", price=100.0, volume=3)
+    strategy.on_trade(
+        SimpleNamespace(
+            offset=Offset.OPEN, volume=3, price=100.0,
+            vt_orderid="SIM.1", vt_tradeid="T-OPEN-1", symbol="rb2610",
+        )
+    )
 
     assert strategy.position_context.volume == 3
     assert strategy.position_context.execution_stop_price == 90.0

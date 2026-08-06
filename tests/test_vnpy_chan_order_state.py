@@ -8,6 +8,7 @@ from strategy_policy.position import PositionContext
 from vnpy_chan.chan_bsp_strategy import ChanBspStrategy
 from vnpy_chan.order_state import CtaOrderStatusMachine
 from vnpy_chan.production_guard import evaluate_production_gate
+from vnpy_chan.production_guard import RiskEngineLiveStatus
 
 
 class _ExitManagerCapture:
@@ -80,7 +81,10 @@ def test_strategy_rejected_open_order_clears_pending_entry() -> None:
 
 def test_pending_order_count_blocks_live_production_gate(tmp_path) -> None:
     enabled = tmp_path / "risk_manager_setting.json"
-    enabled.write_text('{"活动委托检查":{"active":true}}', encoding="utf-8")
+    enabled.write_text(
+        '{"活动委托检查":{"active":true},"缠论开仓守卫":{"active":true}}',
+        encoding="utf-8",
+    )
     config = SimpleNamespace(
         production=SimpleNamespace(enabled=True),
         risk=SimpleNamespace(
@@ -102,6 +106,13 @@ def test_pending_order_count_blocks_live_production_gate(tmp_path) -> None:
         risk_manager_confirmed=True,
         risk_manager_setting_path=enabled,
         pending_order_count=1,
+        live_risk_status=RiskEngineLiveStatus(
+            risk_manager_app_loaded=True,
+            risk_engine_present=True,
+            send_order_patched=True,
+            loaded_rules=("活动委托检查", "缠论开仓守卫"),
+            active_rules=("活动委托检查", "缠论开仓守卫"),
+        ),
     )
 
     assert not result.ready

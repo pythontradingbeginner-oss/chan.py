@@ -3,13 +3,36 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from enum import StrEnum
 from typing import Any
 
 
-TERMINAL_STATUSES = {"ALLTRADED", "CANCELLED", "REJECTED", "TRIGGERED"}
+TERMINAL_STATUSES = {"ALLTRADED", "CANCELLED", "REJECTED", "TRIGGERED", "TIMEDOUT"}
 CANCELLING_STATUS = "CANCELLING"
 EMPTY_ORDER_ID = ""
 RISK_REJECTED_ROLE = "risk_rejected_or_submit_failed"
+
+
+class TradeDisposition(StrEnum):
+    """Outcome of feeding one trade to the order state machine.
+
+    The strategy updates PositionContext / risk / PnL ONLY on ACCEPTED.
+    """
+    ACCEPTED = "accepted"
+    DUPLICATE = "duplicate"      # vt_tradeid already consumed
+    LATE = "late"                # order already terminal (out-of-order report)
+    UNKNOWN = "unknown"          # no tracked order for this vt_orderid
+    INVALID_TRANSITION = "invalid_transition"
+
+
+@dataclass(frozen=True, slots=True)
+class TradeDispositionResult:
+    disposition: TradeDisposition
+    tracked: "CtaTrackedOrder | None" = None
+
+    @property
+    def accepted(self) -> bool:
+        return self.disposition == TradeDisposition.ACCEPTED
 
 
 def _now_text() -> str:
@@ -36,19 +59,27 @@ class CtaTrackedOrder:
 
 
 class CtaOrderStatusMachine:
-    """CTA order state machine with fill dedup, cancellation and timeout.
+    """CTA order state machine with explicit trade dispositions.
 
-    P7.3 hardening:
-      - duplicate fills are detected and dropped via consumed trade ids
-      - a terminal order never accepts a later trade (out-of-order report)
-      - CANCELLING is tracked as a live (non-terminal) status
-      - empty order ids record risk_rejected_or_submit_failed
+    P7-R4 hardening:
+      - on_trade() returns TradeDispositionResult (accepted/duplicate/late/
+        unknown/invalid_transition); strategy updates business state only on
+        ACCEPTED.
+      - idempotency key is vt_tradeid (survives restart), not bare tradeid.
+      - TIMEDOUT is a terminal status; timeout first requests a real cancel
+        (CANCELLING + pending_cancel_orderids) and archives only on a
+        terminal report.
+      - single active close intent prevents duplicate close orders across bars.
     """
+
+    TERMINAL_STATUSES = TERMINAL_STATUSES
 
     def __init__(self) -> None:
         self.active: dict[str, CtaTrackedOrder] = {}
         self.history: list[CtaTrackedOrder] = []
         self.consumed_trade_ids: set[str] = set()
+        self.pending_cancel_orderids: list[str] = []
+        self._close_intent: str | None = None
 
     @property
     def active_count(self) -> int:
@@ -62,6 +93,21 @@ class CtaOrderStatusMachine:
         for order in self.active.values():
             counts[order.status] = counts.get(order.status, 0) + 1
         return ",".join(f"{key}:{counts[key]}" for key in sorted(counts))
+
+    # ── single active close intent ──
+
+    def set_close_intent(self, vt_orderid: str) -> None:
+        self._close_intent = vt_orderid
+
+    def clear_close_intent(self) -> None:
+        self._close_intent = None
+
+    def has_active_close_intent(self) -> bool:
+        return self._close_intent is not None
+
+    @property
+    def close_intent_orderid(self) -> str | None:
+        return self._close_intent
 
     def submit(
         self,
@@ -148,37 +194,52 @@ class CtaOrderStatusMachine:
             self._archive(vt_orderid)
         return tracked
 
-    def on_trade(self, trade: Any) -> CtaTrackedOrder | None:
+    def on_trade(self, trade: Any) -> TradeDispositionResult:
+        """Feed one fill; returns an explicit disposition.
+
+        Idempotency key is vt_tradeid (survives restart).  The strategy only
+        updates PositionContext / risk / PnL when disposition is ACCEPTED.
+        """
+        vt_tradeid = str(getattr(trade, "vt_tradeid", "") or getattr(trade, "tradeid", ""))
+        if vt_tradeid and vt_tradeid in self.consumed_trade_ids:
+            return TradeDispositionResult(TradeDisposition.DUPLICATE)
+
         vt_orderid = str(getattr(trade, "vt_orderid", ""))
-        trade_id = str(getattr(trade, "tradeid", ""))
-        if trade_id in self.consumed_trade_ids:
-            return None
         tracked = self.active.get(vt_orderid)
         if tracked is None:
-            return None
+            # Distinguish "was tracked but now terminal" (LATE) from a fill
+            # that never belonged to any tracked order (UNKNOWN).
+            if any(h.vt_orderid == vt_orderid for h in self.history):
+                return TradeDispositionResult(TradeDisposition.LATE)
+            return TradeDispositionResult(TradeDisposition.UNKNOWN)
         if tracked.status in TERMINAL_STATUSES:
-            # Out-of-order report: a terminal order cannot fill again.
-            return tracked
+            return TradeDispositionResult(TradeDisposition.LATE)
+
         volume = float(getattr(trade, "volume", 0) or 0)
         if volume <= 0:
-            return tracked
+            return TradeDispositionResult(TradeDisposition.INVALID_TRANSITION, tracked)
+
         tracked.traded += volume
         tracked.updated_at = _now_text()
-        if trade_id:
-            tracked.trade_ids.append(trade_id)
-            self.consumed_trade_ids.add(trade_id)
+        if vt_tradeid:
+            tracked.trade_ids.append(vt_tradeid)
+            self.consumed_trade_ids.add(vt_tradeid)
         if tracked.volume > 0 and tracked.traded >= tracked.volume:
             tracked.status = "ALLTRADED"
             self._archive(vt_orderid)
         elif tracked.traded > 0:
             tracked.status = "PARTTRADED"
-        return tracked
+        return TradeDispositionResult(TradeDisposition.ACCEPTED, tracked)
 
     def check_timeouts(self, now: str | None = None) -> list[str]:
-        """Return ids whose timeout_at has passed and archive them as timed out."""
+        """Mark timed-out orders CANCELLING and request a real cancel.
+
+        Does NOT archive: the order archives only after the exchange reports
+        a terminal status.  Returns order ids that entered CANCELLING.
+        """
         now_text = now or _now_text()
         now_ts = datetime.fromisoformat(now_text)
-        timed_out: list[str] = []
+        cancelling: list[str] = []
         for order_id, tracked in list(self.active.items()):
             if not tracked.timeout_at:
                 continue
@@ -186,18 +247,21 @@ class CtaOrderStatusMachine:
                 deadline = datetime.fromisoformat(tracked.timeout_at)
             except ValueError:
                 continue
-            if now_ts >= deadline:
-                tracked.status = "TIMEDOUT"
+            if now_ts >= deadline and tracked.status != CANCELLING_STATUS:
+                tracked.status = CANCELLING_STATUS
                 tracked.updated_at = now_text
-                timed_out.append(order_id)
-                self._archive(order_id)
-        return timed_out
+                if order_id not in self.pending_cancel_orderids:
+                    self.pending_cancel_orderids.append(order_id)
+                cancelling.append(order_id)
+        return cancelling
 
     def to_json(self) -> str:
         payload = {
             "active": [asdict(order) for order in self.active.values()],
             "history": [asdict(order) for order in self.history[-30:]],
             "consumed_trade_ids": sorted(self.consumed_trade_ids),
+            "pending_cancel_orderids": list(self.pending_cancel_orderids),
+            "close_intent": self._close_intent,
         }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
@@ -216,6 +280,8 @@ class CtaOrderStatusMachine:
         for data in payload.get("history", []):
             machine.history.append(CtaTrackedOrder(**data))
         machine.consumed_trade_ids = set(payload.get("consumed_trade_ids") or [])
+        machine.pending_cancel_orderids = list(payload.get("pending_cancel_orderids") or [])
+        machine._close_intent = payload.get("close_intent")
         return machine
 
     def _archive(self, vt_orderid: str) -> None:

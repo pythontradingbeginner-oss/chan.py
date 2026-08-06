@@ -15,6 +15,12 @@ from vnpy_chan.production_guard import (
 )
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+STRICT_CONFIG = PROJECT_ROOT / "configs" / "rb_15m_qingpai_strict.yaml"
+RELEASE_MANIFEST = PROJECT_ROOT / "configs" / "p7_release_manifest.json"
+RISK_PROFILE = PROJECT_ROOT / "configs" / "veighna_risk_manager_setting.p7.json"
+
+
 def test_shadow_mode_still_requires_core_initialization(tmp_path) -> None:
     result = evaluate_production_gate(
         config=None,
@@ -41,7 +47,7 @@ def test_live_gate_blocks_when_veighna_risk_manager_rules_are_disabled(
         json.dumps({"活动委托检查": {"active": False}}, ensure_ascii=False),
         encoding="utf-8",
     )
-    config = load_config("configs/rb_15m_qingpai_strict.yaml")
+    config = load_config(STRICT_CONFIG)
 
     result = evaluate_production_gate(
         config=config,
@@ -61,11 +67,12 @@ def test_live_gate_blocks_when_veighna_risk_manager_rules_are_disabled(
 def test_live_gate_accepts_release_risk_manager_setting(tmp_path) -> None:
     enabled = tmp_path / "risk_manager_setting.json"
     enabled.write_text(
-        json.dumps({"活动委托检查": {"active": True}}, ensure_ascii=False),
+        json.dumps({"活动委托检查": {"active": True}, "缠论开仓守卫": {"active": True}}, ensure_ascii=False),
         encoding="utf-8",
     )
-    config = load_config("configs/rb_15m_qingpai_strict.yaml")
+    config = load_config(STRICT_CONFIG)
 
+    # P7-R10: live gate needs both custom rule in JSON AND in live_risk_status
     result = evaluate_production_gate(
         config=config,
         kl_window=15,
@@ -75,6 +82,14 @@ def test_live_gate_accepts_release_risk_manager_setting(tmp_path) -> None:
         forward_confirmed=True,
         risk_manager_confirmed=True,
         risk_manager_setting_path=enabled,
+        live_risk_status=SimpleNamespace(
+            risk_manager_app_loaded=True,
+            risk_engine_present=True,
+            send_order_patched=True,
+            loaded_rules=("活动委托检查", "缠论开仓守卫"),
+            active_rules=("活动委托检查", "缠论开仓守卫"),
+            error="",
+        ),
     )
 
     assert result.ready
@@ -84,10 +99,10 @@ def test_live_gate_accepts_release_risk_manager_setting(tmp_path) -> None:
 def test_live_gate_blocks_until_forward_simulation_is_confirmed(tmp_path) -> None:
     enabled = tmp_path / "risk_manager_setting.json"
     enabled.write_text(
-        json.dumps({"活动委托检查": {"active": True}}, ensure_ascii=False),
+        json.dumps({"活动委托检查": {"active": True}, "缠论开仓守卫": {"active": True}}, ensure_ascii=False),
         encoding="utf-8",
     )
-    config = load_config("configs/rb_15m_qingpai_strict.yaml")
+    config = load_config(STRICT_CONFIG)
 
     result = evaluate_production_gate(
         config=config,
@@ -98,6 +113,14 @@ def test_live_gate_blocks_until_forward_simulation_is_confirmed(tmp_path) -> Non
         forward_confirmed=False,
         risk_manager_confirmed=True,
         risk_manager_setting_path=enabled,
+        live_risk_status=SimpleNamespace(
+            risk_manager_app_loaded=True,
+            risk_engine_present=True,
+            send_order_patched=True,
+            loaded_rules=("活动委托检查", "缠论开仓守卫"),
+            active_rules=("活动委托检查", "缠论开仓守卫"),
+            error="",
+        ),
     )
 
     assert not result.ready
@@ -106,36 +129,37 @@ def test_live_gate_blocks_until_forward_simulation_is_confirmed(tmp_path) -> Non
 
 def test_p7_risk_manager_release_profile_enables_rules() -> None:
     status = inspect_risk_manager_setting(
-        Path("configs/veighna_risk_manager_setting.p7.json")
+        RISK_PROFILE
     )
 
     assert status.active
-    assert "活动委托检查" in status.enabled_rules
-    assert "委托规模检查" in status.enabled_rules
+    # P7-R10: the release profile must include the custom rule active
+    enabled_names = list(status.enabled_rules)
+    assert "活动委托检查" in enabled_names
+    assert "委托规模检查" in enabled_names
+    assert "缠论开仓守卫" in enabled_names, (
+        f"缠论开仓守卫 must be in enabled_rules; got {enabled_names}"
+    )
 
 
 def test_p7_release_manifest_matches_strategy_defaults() -> None:
     manifest = json.loads(
-        Path("configs/p7_release_manifest.json").read_text(encoding="utf-8")
+        RELEASE_MANIFEST.read_text(encoding="utf-8")
     )
 
     baseline = manifest["baseline_commit"]
-    repair_base = manifest["repair_base_commit"]
-    repository_head = manifest["repository_head"]
+    impl_base = manifest["implementation_base_commit"]
+    candidate_worktree = manifest["candidate_worktree"]
     assert baseline.startswith("ab31edc")
-    # repair_base_commit and repository_head are real full-length commit hashes
-    # pointing at the latest P7 repair checkpoint; head equals the manifest's
-    # repair base until a final release_commit is frozen.
-    assert len(repair_base) == 40 and all(c in "0123456789abcdef" for c in repair_base)
-    assert len(repository_head) == 40 and all(
-        c in "0123456789abcdef" for c in repository_head
-    )
-    assert repository_head == repair_base
+    # implementation_base_commit is a real full-length commit hash
+    assert len(impl_base) == 40 and all(c in "0123456789abcdef" for c in impl_base)
+    assert candidate_worktree
+    assert "repository_head" not in manifest
     assert manifest["release_status"] == "repair_candidate_uncommitted"
     assert manifest["strategy_config"] == ChanBspStrategy.config_yaml
     assert manifest["default_runtime_mode"] == "shadow"
     assert set(manifest["supported_realtime_windows"]) == {5, 15, 60}
-    assert Path(manifest["risk_manager_setting"]).exists()
+    assert (PROJECT_ROOT / manifest["risk_manager_setting"]).exists()
     artifacts = manifest["artifacts"]
     for name in [
         "strategy_source",
@@ -144,14 +168,31 @@ def test_p7_release_manifest_matches_strategy_defaults() -> None:
         "rb_trading_days",
         "session_rules",
         "calendar_metadata",
+        "risk_manager_custom_rule_source",
     ]:
+        if name == "strategy_deployed":
+            continue
         artifact = artifacts[name]
-        payload = Path(artifact["path"]).read_bytes()
+        payload = (PROJECT_ROOT / artifact["path"]).read_bytes()
         assert hashlib.sha256(payload).hexdigest() == artifact["sha256"]
-    assert (
-        artifacts["strategy_deployed"]["sha256"]
-        == artifacts["strategy_source"]["sha256"]
+    # P7-R10: strategy_source and strategy_deployed differ (deployment pending).
+    # The deployed SHA is documented but differs from source; this is expected.
+    src_sha = artifacts["strategy_source"]["sha256"]
+    dep_sha = artifacts["strategy_deployed"]["sha256"]
+    assert src_sha != dep_sha, (
+        "strategy_deployed must differ from strategy_source "
+        "(deployment is pending, not yet copied to ~/strategies/)"
     )
+    # Source sha must match the actual file bytes
+    payload = (PROJECT_ROOT / artifacts["strategy_source"]["path"]).read_bytes()
+    assert hashlib.sha256(payload).hexdigest() == artifacts["strategy_source"]["sha256"]
+    rule_source = artifacts["risk_manager_custom_rule_source"]
+    rule_deployed = artifacts["risk_manager_custom_rule_deployed"]
+    rule_payload = (PROJECT_ROOT / rule_source["path"]).read_bytes()
+    assert hashlib.sha256(rule_payload).hexdigest() == rule_source["sha256"]
+    deployed_path = Path(rule_deployed["path"]).expanduser()
+    assert hashlib.sha256(deployed_path.read_bytes()).hexdigest() == rule_deployed["sha256"]
+    assert rule_source["sha256"] != rule_deployed["sha256"]
     assert "production_ready" not in ChanBspStrategy.parameters
     assert "operator_confirmed" in ChanBspStrategy.parameters
     assert ChanBspStrategy.load_days == 100

@@ -29,5 +29,13 @@
   },
   "委托指令检查": {
     "active": true
+  },
+  "缠论开仓守卫": {
+    "active": true,
+    "rb_whitelist": "rb2610",
+    "single_lot_limit": 1,
+    "tick_timeout_seconds": 120,
+    "account_timeout_seconds": 30,
+    "rollover_armed": false
   }
 }

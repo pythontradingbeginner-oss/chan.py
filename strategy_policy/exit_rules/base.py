@@ -439,6 +439,37 @@ class ExitManager:
         self._tracking.reset()
         self._position = None
 
+    def snapshot_state(self) -> dict:
+        """返回可恢复的跟踪状态（供带仓重启持久化）。
+
+        P7-R3 公共接口：策略通过该接口读取 ExitManager 跟踪状态，
+        不得直接拼接私有字段。包含 bars_since_entry / MFE / MAE。
+        """
+        return {
+            "bars_since_entry": self._tracking.bars_since_entry,
+            "mfe": self._tracking.best_favorable_move,
+            "mae": self._tracking.worst_adverse_move,
+        }
+
+    def restore_state(self, payload: dict) -> None:
+        """从快照恢复跟踪状态。
+
+        P7-R3 公共接口：带仓重启后，在 on_position_opened() 之后调用，
+        恢复 bars_since_entry / MFE / MAE，使退出跟踪与重启前一致。
+        空快照或非法字段忽略（保持 fail-closed 语义）。
+        """
+        if not isinstance(payload, dict):
+            return
+        try:
+            bars = int(payload.get("bars_since_entry", 0))
+            mfe = float(payload.get("mfe", 0.0))
+            mae = float(payload.get("mae", 0.0))
+        except (TypeError, ValueError):
+            return
+        self._tracking.bars_since_entry = max(0, bars)
+        self._tracking.best_favorable_move = max(0.0, mfe)
+        self._tracking.worst_adverse_move = min(0.0, mae)
+
     def check(
         self,
         *,

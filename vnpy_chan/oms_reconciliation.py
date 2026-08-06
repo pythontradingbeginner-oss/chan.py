@@ -1,17 +1,23 @@
-"""OMS reconciliation for P7.2 restart recovery.
+"""OMS reconciliation for P7.2/P7.3 restart recovery.
 
-Compares the CTA strategy's in-memory state (PositionContext + order machine)
-against the actual OMS positions and active orders reported by the gateway.
+Compares the CTA strategy's in-memory state (self.pos + PositionContext +
+order machine) against the actual OMS positions and active orders reported by
+the gateway.
 
-Outcomes are a strict lattice:
-  ALIGNED                    -> everything matches, normal operation
-  POSITION_MISMATCH          -> strategy position differs from OMS
-  ACTIVE_ORDER_MISMATCH      -> active orders differ from OMS
-  UNATTRIBUTED_POSITION      -> OMS holds a position the strategy never opened
-  RECOVERY_REQUIRED          -> any mismatch above; open blocked, close allowed
+P7-R3 three-way reconciliation compares:
+  self.pos (engine-derived net position)
+  PositionContext signed volume (fill-derived canonical state)
+  OMS position (broker-reported)
 
-The strategy must never auto-claim a position it cannot attribute to one of its
-own fills.  An UNATTRIBUTED_POSITION therefore forces RECOVERY_REQUIRED.
+Positions/orders are filtered by symbol, exchange AND gateway so that other
+contracts or other gateways never raise false alarms.
+
+Outcomes:
+  ALIGNED           -> all three agree, normal operation
+  RECOVERY_REQUIRED -> any mismatch; open blocked, close allowed
+
+The strategy must never auto-claim a position it cannot attribute to one of
+its own fills.  An UNATTRIBUTED_POSITION therefore forces RECOVERY_REQUIRED.
 """
 
 from __future__ import annotations
@@ -26,6 +32,7 @@ from strategy_policy.position import PositionContext
 class ReconciliationResult:
     status: str
     oms_net_position: int
+    self_net_position: int
     strategy_net_position: int
     oms_active_orders: tuple[str, ...] = ()
     strategy_active_orders: tuple[str, ...] = ()
@@ -53,12 +60,33 @@ class ReconciliationResult:
         return ";".join(self.reasons)
 
 
-def oms_net_position(positions: list[Any], symbol: str) -> int:
-    """Signed net position for ``symbol`` from a list of OMS PositionData."""
+def _matches(
+    obj: Any,
+    symbol: str,
+    exchange: str = "",
+    gateway: str = "",
+) -> bool:
+    """Match an OMS object on symbol plus optional exchange and gateway."""
+    if str(getattr(obj, "symbol", "")).lower() != symbol.lower():
+        return False
+    if exchange and str(getattr(obj, "exchange", "")).lower() != exchange.lower():
+        return False
+    if gateway and str(getattr(obj, "gateway_name", "")).lower() != gateway.lower():
+        return False
+    return True
+
+
+def oms_net_position(
+    positions: list[Any],
+    symbol: str,
+    *,
+    exchange: str = "",
+    gateway: str = "",
+) -> int:
+    """Signed net position for ``symbol`` from OMS PositionData."""
     net = 0
-    symbol = symbol.lower()
     for position in positions:
-        if str(getattr(position, "symbol", "")).lower() != symbol:
+        if not _matches(position, symbol, exchange, gateway):
             continue
         volume = int(getattr(position, "volume", 0) or 0)
         direction = str(getattr(position, "direction", ""))
@@ -69,11 +97,19 @@ def oms_net_position(positions: list[Any], symbol: str) -> int:
     return net
 
 
-def oms_active_order_ids(orders: list[Any]) -> tuple[str, ...]:
-    """Order ids still active (not terminal) reported by OMS."""
+def oms_active_order_ids(
+    orders: list[Any],
+    *,
+    symbol: str = "",
+    exchange: str = "",
+    gateway: str = "",
+) -> tuple[str, ...]:
+    """Active (non-terminal) order ids reported by OMS, filtered by scope."""
     terminal = {"ALLTRADED", "CANCELLED", "REJECTED", "TRIGGERED"}
     active: list[str] = []
     for order in orders:
+        if symbol and not _matches(order, symbol, exchange, gateway):
+            continue
         status = str(getattr(order, "status", "")).upper()
         if status in terminal:
             continue
@@ -98,15 +134,26 @@ def reconcile(
     oms_positions: list[Any],
     oms_orders: list[Any],
     symbol: str,
+    self_pos: int | None = None,
     strategy_context: PositionContext | None,
     strategy_active_order_ids: tuple[str, ...] = (),
+    exchange: str = "",
+    gateway: str = "",
 ) -> ReconciliationResult:
-    """Build the reconciliation outcome for one restart."""
-    oms_pos = oms_net_position(oms_positions, symbol)
+    """Build the three-way reconciliation outcome for one restart."""
+    oms_pos = oms_net_position(oms_positions, symbol, exchange=exchange, gateway=gateway)
     strategy_pos = signed_volume(strategy_context)
-    oms_active = oms_active_order_ids(oms_orders)
+    self_net = 0 if self_pos is None else int(self_pos)
+    oms_active = oms_active_order_ids(
+        oms_orders, symbol=symbol, exchange=exchange, gateway=gateway
+    )
     strategy_active = tuple(sorted(strategy_active_order_ids))
     reasons: list[str] = []
+
+    if self_pos is not None and self_net != strategy_pos:
+        reasons.append(
+            f"self_pos_mismatch:self={self_net} position_context={strategy_pos}"
+        )
 
     if oms_pos != strategy_pos:
         reasons.append(
@@ -129,6 +176,7 @@ def reconcile(
         return ReconciliationResult(
             status="RECOVERY_REQUIRED",
             oms_net_position=oms_pos,
+            self_net_position=self_net,
             strategy_net_position=strategy_pos,
             oms_active_orders=oms_active,
             strategy_active_orders=strategy_active,
@@ -138,6 +186,7 @@ def reconcile(
     return ReconciliationResult(
         status="ALIGNED",
         oms_net_position=oms_pos,
+        self_net_position=self_net,
         strategy_net_position=strategy_pos,
         oms_active_orders=oms_active,
         strategy_active_orders=strategy_active,
