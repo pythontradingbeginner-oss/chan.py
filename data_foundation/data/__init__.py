@@ -8,7 +8,12 @@ from .loader import (
     load_raw_from_vnpy,
     load_switch_log,
 )
-from .quality_report import generate_quality_report
+
+
+def generate_quality_report(*args, **kwargs):
+    from .quality_report import generate_quality_report as implementation
+
+    return implementation(*args, **kwargs)
 
 __all__ = [
     "CleaningLog",

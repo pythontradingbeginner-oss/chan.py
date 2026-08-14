@@ -1,8 +1,3 @@
-from .charts import (
-    load_replay_bars_jsonl,
-    plot_dc_peak_valley_chart,
-    plot_strategy_trade_year_charts,
-)
 from .data import (
     CleaningLog,
     aggregate_continuous_1m_to_5m,
@@ -26,6 +21,24 @@ from .pivots import (
     add_dc_pivots,
     detect_dc_pivots,
 )
+
+
+def load_replay_bars_jsonl(*args, **kwargs):
+    from .charts import load_replay_bars_jsonl as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def plot_dc_peak_valley_chart(*args, **kwargs):
+    from .charts import plot_dc_peak_valley_chart as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def plot_strategy_trade_year_charts(*args, **kwargs):
+    from .charts import plot_strategy_trade_year_charts as implementation
+
+    return implementation(*args, **kwargs)
 
 __all__ = [
     "CleaningLog",

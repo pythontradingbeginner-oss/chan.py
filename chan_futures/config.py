@@ -9,6 +9,14 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Literal
 
+from .risk_policy import (
+    RiskGateMode,
+    RiskProfile,
+    normalize_gate_mode,
+    normalize_risk_profile,
+    resolve_gate_modes,
+)
+
 
 # ═══════════════════════════════════════════
 # 嵌套参数 dataclass
@@ -82,6 +90,34 @@ class RiskParams:
     daily_loss_limit: float | None = None          # 日内累计亏损超限则暂停开仓
     max_consecutive_losses: int | None = None       # 连续亏损笔数超限则暂停
     max_drawdown_pct: float | None = None            # 从权益峰值回撤超限则暂停
+    profile: RiskProfile = RiskProfile.CURRENT_ENFORCED
+    max_loss_points_mode: RiskGateMode | None = None
+    daily_loss_limit_mode: RiskGateMode | None = None
+    max_consecutive_losses_mode: RiskGateMode | None = None
+    max_drawdown_pct_mode: RiskGateMode | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "profile", normalize_risk_profile(self.profile))
+        for field_name in (
+            "max_loss_points_mode",
+            "daily_loss_limit_mode",
+            "max_consecutive_losses_mode",
+            "max_drawdown_pct_mode",
+        ):
+            value = getattr(self, field_name)
+            if value is not None:
+                object.__setattr__(self, field_name, normalize_gate_mode(value))
+
+    def gate_modes(self) -> dict[str, RiskGateMode]:
+        return resolve_gate_modes(
+            self.profile,
+            {
+                "max_loss_points": self.max_loss_points_mode,
+                "daily_loss_limit": self.daily_loss_limit_mode,
+                "max_consecutive_losses": self.max_consecutive_losses_mode,
+                "max_drawdown_pct": self.max_drawdown_pct_mode,
+            },
+        )
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> RiskParams:

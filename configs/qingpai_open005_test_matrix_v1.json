@@ -1,0 +1,448 @@
+{
+  "matrix_id": "qingpai_open005_test_matrix_v1",
+  "version": "1.3.0",
+  "status": "frozen_for_research_implementation",
+  "contract_id": "qingpai_open005_machine_contract_v1",
+  "as_of": "2026-08-14",
+  "result_status_enum": [
+    "not_implemented",
+    "passing",
+    "failing",
+    "blocked"
+  ],
+  "tests": [
+    {
+      "id": "OPEN005-CONTRACT-001",
+      "phase": "contract",
+      "level": "unit",
+      "contract_refs": [
+        "OPEN005-UNIT-001",
+        "OPEN005-GATE-001",
+        "OPEN005-D-001"
+      ],
+      "scenario": "machine contract and test matrix are valid, uniquely identified and cross-referenced",
+      "assertions": [
+        "all clause IDs are unique",
+        "all test IDs are unique",
+        "every contract_ref resolves",
+        "all profile gate modes use the declared enum"
+      ],
+      "required_before": "implementation",
+      "current_status": "passing"
+    },
+    {
+      "id": "OPEN005-RA-001",
+      "phase": "risk_accounting",
+      "level": "unit",
+      "contract_refs": [
+        "OPEN005-RA-001"
+      ],
+      "scenario": "the same close fill is delivered three times",
+      "assertions": [
+        "only the first delivery mutates state",
+        "realized_points and daily_realized increment once",
+        "the position aggregator contains one fill ID"
+      ],
+      "required_before": "B0_B1_run",
+      "current_status": "passing"
+    },
+    {
+      "id": "OPEN005-ID-001",
+      "phase": "risk_accounting",
+      "level": "unit",
+      "contract_refs": [
+        "OPEN005-ID-001"
+      ],
+      "scenario": "the same replay inputs are evaluated with different random decision UUIDs",
+      "assertions": [
+        "position_id remains identical",
+        "a different logical entry receives a different position_id",
+        "runtime position_id is deterministic from the first accepted open-fill identity",
+        "backtest trades export position_id, close_fill_id and close_order_id for future cross-run parity"
+      ],
+      "required_before": "B0_B1_run",
+      "current_status": "passing"
+    },
+    {
+      "id": "OPEN005-RA-002",
+      "phase": "risk_accounting",
+      "level": "integration",
+      "contract_refs": [
+        "OPEN005-RA-001",
+        "OPEN005-RA-002"
+      ],
+      "scenario": "a multi-lot position closes through multiple fills",
+      "assertions": [
+        "every fill updates realized and session PnL",
+        "streak does not update before post-fill quantity reaches zero",
+        "finalize occurs exactly once after quantity reaches zero",
+        "the position result uses normalized sum of raw fill PnL"
+      ],
+      "runtime_coverage": "RiskManager unit path plus CTA partial-close and reversal-checkpoint integration path",
+      "required_before": "B0_B1_run",
+      "current_status": "passing"
+    },
+    {
+      "id": "OPEN005-RA-003",
+      "phase": "risk_accounting",
+      "level": "unit",
+      "contract_refs": [
+        "OPEN005-RA-001",
+        "OPEN005-RA-002"
+      ],
+      "scenario": "partial close fills for one position occur in two RB risk sessions",
+      "assertions": [
+        "each fill is assigned to its own session",
+        "daily_realized resets before the later-session fill is applied",
+        "position PnL aggregates across both sessions",
+        "streak updates once at finalization"
+      ],
+      "required_before": "B0_B1_run",
+      "current_status": "passing"
+    },
+    {
+      "id": "OPEN005-RA-004",
+      "phase": "risk_accounting",
+      "level": "unit",
+      "contract_refs": [
+        "OPEN005-UNIT-001",
+        "OPEN005-RA-002"
+      ],
+      "scenario": "rounding boundaries and aggregation order",
+      "assertions": [
+        "round(10.34, 1) is 10.3",
+        "aggregate raw PnL 0.04 plus 0.04 normalizes to 0.1 and classifies win",
+        "aggregate raw PnL in the closed interval [-0.04, 0.04] normalizes to flat",
+        "slippage represented in fill prices is not deducted again"
+      ],
+      "required_before": "B0_B1_run",
+      "current_status": "passing"
+    },
+    {
+      "id": "OPEN005-RA-005",
+      "phase": "risk_accounting",
+      "level": "integration",
+      "contract_refs": [
+        "OPEN005-PERSIST-001",
+        "OPEN005-RA-001",
+        "OPEN005-RA-002"
+      ],
+      "scenario": "restart after partial close and before position finalization",
+      "assertions": [
+        "processed fill IDs and active aggregator restore",
+        "a replayed fill is ignored",
+        "a later fill completes the position and finalizes once",
+        "streak and PnL equal a no-restart reference run"
+      ],
+      "required_before": "B0_B1_run",
+      "current_status": "passing"
+    },
+    {
+      "id": "OPEN005-PERSIST-002",
+      "phase": "risk_accounting",
+      "level": "unit",
+      "contract_refs": [
+        "OPEN005-PERSIST-001",
+        "OPEN005-D-001"
+      ],
+      "scenario": "an Option D runtime snapshot mutates accounting fields but violates a state-machine invariant",
+      "assertions": [
+        "load_state rejects the snapshot",
+        "the previously running RiskManager state remains field-for-field equivalent",
+        "no mixed accounting and Option D state is observable"
+      ],
+      "required_before": "Option_D_review",
+      "current_status": "passing"
+    },
+    {
+      "id": "OPEN005-GATE-001",
+      "phase": "gate_modes",
+      "level": "unit",
+      "contract_refs": [
+        "OPEN005-GATE-001"
+      ],
+      "scenario": "multiple state gates breach in one evaluation",
+      "assertions": [
+        "all enabled gates are evaluated",
+        "all enforced and observed breaches are emitted",
+        "legacy reason equals the first enforced breach in stable order"
+      ],
+      "required_before": "B0_B1_run",
+      "current_status": "passing"
+    },
+    {
+      "id": "OPEN005-GATE-002",
+      "phase": "gate_modes",
+      "level": "unit",
+      "contract_refs": [
+        "OPEN005-GATE-001",
+        "OPEN005-PROFILE-B0"
+      ],
+      "scenario": "B0 observes four simultaneous state-gate breaches",
+      "assertions": [
+        "the exposure-increasing leg is approved when hard prerequisites pass",
+        "four observed breaches and zero enforced breaches are emitted",
+        "existing execution shadow_mode is unchanged"
+      ],
+      "required_before": "B0_B1_run",
+      "current_status": "passing"
+    },
+    {
+      "id": "OPEN005-GATE-003",
+      "phase": "gate_modes",
+      "level": "unit",
+      "contract_refs": [
+        "OPEN005-GATE-001",
+        "OPEN005-PROFILE-B1"
+      ],
+      "scenario": "B1 reaches the consecutive-loss threshold while no other gate breaches",
+      "assertions": [
+        "no consecutive-loss breach is evaluated or emitted",
+        "the exposure-increasing leg is approved",
+        "daily, cumulative and drawdown gates remain enforced"
+      ],
+      "required_before": "B0_B1_run",
+      "current_status": "passing"
+    },
+    {
+      "id": "OPEN005-GATE-004",
+      "phase": "gate_modes",
+      "level": "unit",
+      "contract_refs": [
+        "OPEN005-GATE-001",
+        "OPEN005-PROFILE-B0"
+      ],
+      "scenario": "B0 is missing a required risk session or drawdown equity observation",
+      "assertions": [
+        "hard prerequisite failure blocks the open leg",
+        "observe mode never converts invalid input into approval"
+      ],
+      "required_before": "B0_B1_run",
+      "current_status": "passing"
+    },
+    {
+      "id": "OPEN005-EXPOSURE-001",
+      "phase": "position_transition",
+      "level": "unit",
+      "contract_refs": [
+        "OPEN005-EXPOSURE-001"
+      ],
+      "scenario": "position transitions 0 to 1, 2 to 1, 1 to 2 and 2 to -1",
+      "assertions": [
+        "0 to 1 is one open leg",
+        "2 to 1 is one close leg",
+        "1 to 2 is one open leg",
+        "2 to -1 is close 2 to zero followed by separately approved open 1 short"
+      ],
+      "required_before": "Option_D_run",
+      "current_status": "passing"
+    },
+    {
+      "id": "OPEN005-D-001",
+      "phase": "option_d",
+      "level": "unit",
+      "contract_refs": [
+        "OPEN005-D-001",
+        "OPEN005-D-T01",
+        "OPEN005-D-T02"
+      ],
+      "scenario": "a normal position loss reaches threshold and the next valid RB session arrives",
+      "assertions": [
+        "state moves from ACTIVE to PAUSED_UNTIL_NEXT_SESSION",
+        "same-session open attempts remain blocked",
+        "state becomes PROBE_AVAILABLE only at eligible_from_session"
+      ],
+      "required_before": "Option_D_run",
+      "current_status": "passing"
+    },
+    {
+      "id": "OPEN005-D-PROFILE-001",
+      "phase": "option_d",
+      "level": "contract",
+      "contract_refs": [
+        "OPEN005-PROFILE-B1",
+        "OPEN005-PROFILE-D",
+        "OPEN005-D-001"
+      ],
+      "scenario": "D experiment profile is compared with B1",
+      "assertions": [
+        "D and B1 have identical gate modes",
+        "D adds only the frozen consecutive-loss probe policy",
+        "B1 is the declared direct control"
+      ],
+      "required_before": "Option_D_run",
+      "current_status": "passing"
+    },
+    {
+      "id": "OPEN005-D-002",
+      "phase": "option_d",
+      "level": "integration",
+      "contract_refs": [
+        "OPEN005-D-T03",
+        "OPEN005-D-T04",
+        "OPEN005-D-T05",
+        "OPEN005-PERSIST-001"
+      ],
+      "scenario": "probe reservation, zero-fill cancellation, partial fill and restart",
+      "assertions": [
+        "only one reservation exists per probe epoch",
+        "zero-fill terminal orders release reservation without consuming availability",
+        "first open fill enters PROBE_IN_FLIGHT",
+        "partial fill followed by cancellation remains PROBE_IN_FLIGHT",
+        "intent, probe identity, order IDs and position restore after restart"
+      ],
+      "required_before": "Option_D_run",
+      "current_status": "passing"
+    },
+    {
+      "id": "OPEN005-D-003",
+      "phase": "option_d",
+      "level": "unit",
+      "contract_refs": [
+        "OPEN005-D-T06",
+        "OPEN005-D-T07",
+        "OPEN005-D-T08"
+      ],
+      "scenario": "probe finalizes as win, loss or flat",
+      "assertions": [
+        "win resets streak and returns ACTIVE",
+        "loss increments the unsaturated true streak and pauses from the finalization session",
+        "flat preserves the true streak and pauses from the finalization session"
+      ],
+      "required_before": "Option_D_run",
+      "current_status": "passing"
+    },
+    {
+      "id": "OPEN005-D-ORDER-001",
+      "phase": "option_d",
+      "level": "integration",
+      "contract_refs": [
+        "OPEN005-D-T03",
+        "OPEN005-D-T04",
+        "OPEN005-D-T05",
+        "OPEN005-PERSIST-001"
+      ],
+      "scenario": "terminal order events and open trade callbacks arrive out of order",
+      "assertions": [
+        "CANCELLED and ALLTRADED with reported volume retain the probe reservation until trade reconciliation",
+        "the CTA and pre-release live paths consume the probe only on the trade callback",
+        "REJECTED with zero fill releases availability",
+        "a later open fill is ignored and marks CTA recovery required"
+      ],
+      "required_before": "Option_D_review",
+      "current_status": "passing"
+    },
+    {
+      "id": "OPEN005-D-004",
+      "phase": "option_d",
+      "level": "integration",
+      "contract_refs": [
+        "OPEN005-EXPOSURE-001",
+        "OPEN005-REV-001",
+        "OPEN005-D-T07",
+        "OPEN005-D-T08"
+      ],
+      "scenario": "a probe position receives a reversal signal and finalizes loss or flat",
+      "assertions": [
+        "the close leg is never blocked by streak or account-state entry gates",
+        "probe finalization occurs before the reversal open leg is evaluated",
+        "loss or flat cancels the reversal open leg",
+        "no opposite open order is emitted"
+      ],
+      "required_before": "Option_D_run",
+      "current_status": "passing"
+    },
+    {
+      "id": "OPEN005-D-005",
+      "phase": "option_d",
+      "level": "integration",
+      "contract_refs": [
+        "OPEN005-REV-001",
+        "OPEN005-D-T06"
+      ],
+      "scenario": "a probe position receives a reversal signal and finalizes win",
+      "assertions": [
+        "probe finalization occurs first and returns ACTIVE",
+        "the reversal open leg receives a fresh risk evaluation",
+        "a pre-close approval is never reused",
+        "the open leg is submitted only when all current checks approve"
+      ],
+      "required_before": "Option_D_run",
+      "current_status": "passing"
+    },
+    {
+      "id": "OPEN005-PARITY-001",
+      "phase": "parity",
+      "level": "full_history",
+      "contract_refs": [
+        "OPEN005-PARITY-001",
+        "OPEN005-PROFILE-CURRENT"
+      ],
+      "scenario": "2018-2026 current one-lot full-exit baseline after risk-accounting refactor",
+      "assertions": [
+        "3658 decision rows",
+        "183 execution decision rows",
+        "10 trade rows",
+        "zero decision differences",
+        "zero trade differences"
+      ],
+      "required_before": "B0_B1_run",
+      "current_status": "passing"
+    },
+    {
+      "id": "OPEN005-B0-001",
+      "phase": "B0_B1",
+      "level": "full_history",
+      "contract_refs": [
+        "OPEN005-PROFILE-B0",
+        "OPEN005-PARITY-001"
+      ],
+      "scenario": "2018-2026 B0 continuous and fold diagnostic",
+      "assertions": [
+        "decisions, fills and trades match a four-state-gates-disabled reference run",
+        "risk audit records all observed breaches",
+        "continuous and fold reports disclose every path difference"
+      ],
+      "required_before": "Option_D_run",
+      "current_status": "passing"
+    },
+    {
+      "id": "OPEN005-B1-001",
+      "phase": "B0_B1",
+      "level": "full_history",
+      "contract_refs": [
+        "OPEN005-PROFILE-B1",
+        "OPEN005-PARITY-001"
+      ],
+      "scenario": "2018-2026 B1 continuous and fold diagnostic",
+      "assertions": [
+        "only max_consecutive_losses enforcement differs from CURRENT_ENFORCED",
+        "daily, cumulative and drawdown enforced breaches are reported",
+        "continuous and fold reports disclose every path difference"
+      ],
+      "required_before": "Option_D_run",
+      "current_status": "passing"
+    },
+    {
+      "id": "OPEN005-D-EVAL-001",
+      "phase": "option_d_evaluation",
+      "level": "full_history",
+      "contract_refs": [
+        "OPEN005-PROFILE-B1",
+        "OPEN005-PROFILE-D",
+        "OPEN005-D-001",
+        "OPEN005-PARITY-001"
+      ],
+      "scenario": "2018-2026 D versus B1 continuous and fold-reset evaluation",
+      "assertions": [
+        "D and B1 use identical gate modes, config hash and bar frame",
+        "3658 structural decisions match exactly in the continuous comparison",
+        "all six folds pass right-open and end_of_data completeness checks",
+        "D identity replay is exact for decisions, execution, trades, fills and probe identities",
+        "continuous and fold outcome deltas are disclosed without approving production adoption"
+      ],
+      "required_before": "Option_D_review",
+      "current_status": "passing"
+    }
+  ]
+}

@@ -85,6 +85,7 @@ exits:
     max_bars: 192
 
 risk:
+  profile: CURRENT_ENFORCED
   max_abs_position: 1
   max_loss_points: 600.0
   daily_loss_limit: 300.0

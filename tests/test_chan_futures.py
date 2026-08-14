@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pandas as pd
 
 from Common.CEnum import BSP_TYPE, DATA_FIELD, KL_TYPE
 from chan_futures import MinimalChanTrendStrategy, row_to_klu, run_chan_trigger_backtest
-from chan_futures.backtest import ChanBacktestConfig
+from chan_futures.backtest import ChanBacktestConfig, _account_equity
 from chan_futures.execution import SimulatedExecutionEngine
 
 
@@ -54,6 +56,17 @@ def test_execution_engine_reverses_position_and_realizes_points():
     assert engine.state.position == -1
     assert engine.state.avg_price == 110.0
     assert engine.state.realized_points == 7.0
+
+
+def test_account_equity_converts_point_pnl_with_contract_multiplier():
+    engine = SimulatedExecutionEngine(fee_points=0.0, slippage_points=0.0)
+    engine.state.realized_points = -100.0
+    config = SimpleNamespace(
+        sizing=SimpleNamespace(capital=100_000.0),
+        execution=SimpleNamespace(contract_multiplier=10.0),
+    )
+
+    assert _account_equity(config, engine, 3300.0) == 99_000.0
 
 
 def test_backtest_replays_bars_through_trigger_load():

@@ -8,6 +8,15 @@ from typing import Mapping, Sequence
 from .trade_intent import DecisionTraceRecord
 
 
+_RUNTIME_PROVENANCE_FIELDS = {
+    "risk_session_observed_at",
+    "risk_session_source",
+    "equity_source",
+    "equity_scope",
+    "max_drawdown_capability",
+}
+
+
 @dataclass(frozen=True, slots=True)
 class TraceMismatch:
     runtime: str
@@ -53,7 +62,7 @@ def compare_runtime_traces(
         actual = traces[runtime_name]
         common = min(len(baseline), len(actual))
         for index in range(common):
-            if baseline[index] != actual[index]:
+            if _parity_payload(baseline[index]) != _parity_payload(actual[index]):
                 mismatches.append(
                     TraceMismatch(
                         runtime=runtime_name,
@@ -78,3 +87,11 @@ def compare_runtime_traces(
         mismatches=tuple(mismatches),
     )
 
+
+def _parity_payload(record: DecisionTraceRecord) -> dict[str, object]:
+    """Exclude provenance that is expected to name a different runtime."""
+    return {
+        key: value
+        for key, value in record.to_dict().items()
+        if key not in _RUNTIME_PROVENANCE_FIELDS
+    }

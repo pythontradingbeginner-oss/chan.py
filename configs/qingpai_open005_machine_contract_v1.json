@@ -1,0 +1,441 @@
+{
+  "contract_id": "qingpai_open005_machine_contract_v1",
+  "version": "1.2.0",
+  "status": "frozen_for_research_implementation",
+  "parent_decision": "OPEN-005",
+  "as_of": "2026-08-14",
+  "scope": [
+    "risk accounting event granularity",
+    "B0 and B1 research profiles",
+    "Option D experimental regime semantics",
+    "position transition and reversal ordering",
+    "runtime persistence and parity invariants"
+  ],
+  "production_policy_status": "unresolved",
+  "contract_errata": [
+    "v1.0.1 makes finalized_position_results required in emitted accounting state",
+    "v1.0.1 removes unimplemented Option D placeholders from v1 runtime required fields",
+    "v1.0.1 requires replay-stable backtest identities independent of random decision UUIDs",
+    "v1.2.0 clarifies atomic in-memory restore, terminal-before-trade reconciliation and canonical open-intent snapshots without changing the frozen experiment"
+  ],
+  "runtime_schema_path": "configs/qingpai_open005_runtime_schema_v1.json",
+  "option_d_runtime_schema_path": "configs/qingpai_open005_runtime_schema_v2.json",
+  "frozen_sections": [
+    "units_and_pnl_normalization",
+    "risk_accounting_events",
+    "risk_gate_modes",
+    "B0_B1_profiles",
+    "position_transition_decomposition",
+    "option_d_experiment",
+    "persistence",
+    "parity_invariants"
+  ],
+  "unresolved_sections": [
+    "max_loss_points_production_recovery",
+    "max_drawdown_pct_production_recovery",
+    "option_d_production_adoption"
+  ],
+  "units_and_pnl_normalization": {
+    "clause_id": "OPEN005-UNIT-001",
+    "pnl_raw_points": "fee-inclusive point-lots calculated from actual fill prices; adverse slippage is already represented by fill prices and must not be deducted again",
+    "realized_points": "sum of normalized close-fill point-lots",
+    "daily_realized": "sum of normalized close-fill point-lots assigned to each RB risk session",
+    "equity": "account currency",
+    "drawdown": "ratio of account-currency equity to account-currency peak equity",
+    "normalizer": {
+      "id": "python_round_1dp_v1",
+      "operation": "round(float(value), 1)",
+      "compatibility_reason": "matches the current backtest risk update boundary",
+      "raw_value_required": true
+    },
+    "fill_accounting_order": "normalize each close fill, then update realized_points and daily_realized",
+    "position_result_order": "sum raw close-fill PnL for one position, then normalize once for win/loss/flat",
+    "position_result": {
+      "win": "normalized_position_pnl > 0.0",
+      "loss": "normalized_position_pnl < 0.0",
+      "flat": "normalized_position_pnl == 0.0"
+    }
+  },
+  "identities": {
+    "clause_id": "OPEN005-ID-001",
+    "fill_id": {
+      "required": true,
+      "runtime": "vt_tradeid",
+      "backtest": "deterministic synthetic ID derived from replay-stable position_id, close leg and fill sequence; random decision UUIDs are forbidden identity inputs",
+      "idempotency_scope": "runtime state epoch"
+    },
+    "order_id": {
+      "required": true,
+      "runtime": "vt_orderid",
+      "backtest": "deterministic synthetic order ID"
+    },
+    "position_id": {
+      "required": true,
+      "rule": "created once for the logical position on its first open fill and retained through all partial fills until quantity becomes zero",
+      "backtest_derivation": "stable event, Setup, contract, entry timestamp, entry bar, fill price and direction inputs; excludes random decision_id",
+      "runtime_derivation": "first accepted open-fill identity",
+      "new_identity_events": [
+        "new flat-to-open lifecycle",
+        "reversal open leg after the prior position is finalized",
+        "rollover open on the replacement contract"
+      ]
+    },
+    "finalize_idempotency_key": "position_id"
+  },
+  "risk_accounting_events": {
+    "record_close_fill": {
+      "clause_id": "OPEN005-RA-001",
+      "required_inputs": [
+        "fill_id",
+        "order_id",
+        "position_id",
+        "pnl_raw_points",
+        "risk_session_key",
+        "observed_at",
+        "source"
+      ],
+      "ordered_effects": [
+        "reject duplicate fill_id without mutation",
+        "advance risk session before PnL mutation",
+        "normalize fill PnL with python_round_1dp_v1",
+        "update realized_points and daily_realized",
+        "append raw and normalized PnL to the active position aggregator",
+        "persist the accepted fill ID and accounting state in the same runtime-state commit"
+      ],
+      "must_not_update": [
+        "true_consecutive_losses",
+        "option_d_regime_state"
+      ]
+    },
+    "finalize_position": {
+      "clause_id": "OPEN005-RA-002",
+      "trigger": "position quantity after applying an accepted close fill is exactly zero",
+      "required_inputs": [
+        "position_id",
+        "finalized_at",
+        "reason"
+      ],
+      "ordered_effects": [
+        "reject a duplicate finalized position_id without mutation",
+        "read completed raw PnL from the internal active position aggregator",
+        "normalize the aggregate once with python_round_1dp_v1",
+        "classify win, loss or flat",
+        "update true_consecutive_losses exactly once",
+        "apply an Option D transition when the position belongs to a probe epoch",
+        "move position_id to finalized tombstones and persist in the same runtime-state commit"
+      ],
+      "streak_transition": {
+        "win": "set to 0",
+        "loss": "increment by 1",
+        "flat": "unchanged"
+      }
+    },
+    "observe_equity": {
+      "clause_id": "OPEN005-RA-003",
+      "required_inputs": [
+        "value",
+        "observed_at",
+        "source",
+        "scope"
+      ],
+      "rules": [
+        "preserve the existing first authoritative oms_balance observation rebasing behavior",
+        "update peak only from valid positive finite account-currency values",
+        "scope is audit metadata and is not itself a gate input",
+        "do not mutate realized PnL, daily PnL, position aggregates or streak"
+      ]
+    }
+  },
+  "runtime_state": {
+    "clause_id": "OPEN005-PERSIST-001",
+    "schema_version": "open005-risk-runtime-v1",
+    "required_fields": [
+      "processed_close_fill_ids",
+      "active_position_aggregators",
+      "finalized_position_ids",
+      "finalized_position_results",
+      "true_consecutive_losses",
+      "realized_points",
+      "daily_realized",
+      "current_risk_session",
+      "last_session_observed_at",
+      "session_source",
+      "peak_equity",
+      "equity_source",
+      "equity_scope",
+      "has_authoritative_oms_equity"
+    ],
+    "position_aggregator_required_fields": [
+      "position_id",
+      "raw_close_pnl_points",
+      "normalized_close_pnl_points",
+      "close_fill_ids",
+      "remaining_quantity"
+    ],
+    "option_d_v2_fields": [
+      "regime_state",
+      "paused_at_session",
+      "eligible_from_session",
+      "probe_epoch_id",
+      "probe_order_ids",
+      "probe_position_id",
+      "reserved_intent_id"
+    ],
+    "option_d_reserved_intent_order_fields": [
+      "order_ids",
+      "terminal_order_ids",
+      "reported_fill_order_ids",
+      "filled_volume"
+    ],
+    "option_d_schema_policy": "the accounting-only profiles continue to emit open005-risk-runtime-v1 without option_d fields; D_EXPERIMENT emits open005-risk-runtime-v2 with option_d and reserved_intents",
+    "atomicity": "accepted fill accounting, position finalization, Option D transition and the versioned runtime snapshot form one logical commit; an implementation without transactional storage must fail closed and reconcile broker fill IDs on recovery",
+    "restore_atomicity": "a rejected or invalid runtime snapshot must leave the already-running in-memory RiskManager state unchanged",
+    "storage_boundary": "vn.py variable persistence is not an operating-system transactional file commit; a crash during persistence must block new exposure and require OMS plus broker fill-ID reconciliation",
+    "canonical_probe_intent_snapshot": "backtest, CTA and pre-release live paths persist the post-transition open-order intent view: action is open_long or open_short and signed target_position equals the open-leg quantity"
+  },
+  "risk_gate_evaluation": {
+    "clause_id": "OPEN005-GATE-001",
+    "gate_mode_enum": [
+      "enforce",
+      "observe",
+      "disabled"
+    ],
+    "state_gate_order": [
+      "max_loss_points",
+      "daily_loss_limit",
+      "max_consecutive_losses",
+      "max_drawdown_pct"
+    ],
+    "hard_prerequisites": [
+      "risk_session_initialized_when_required",
+      "account_equity_available_when_drawdown_is_evaluated",
+      "position_transition_is_valid",
+      "max_abs_position"
+    ],
+    "semantics": {
+      "enforce": "evaluate, emit an enforced breach when breached, and block the exposure-increasing leg",
+      "observe": "evaluate and emit an observed breach when breached, but do not block",
+      "disabled": "do not evaluate the gate and do not emit a breach"
+    },
+    "evaluation_rule": "evaluate every enabled state gate without first-breach short-circuit",
+    "approved_rule": "approved only when every hard prerequisite passes and enforced_breaches is empty",
+    "compatibility_reason": "the legacy reason string is the first hard failure or first enforced breach in stable order",
+    "required_result_fields": [
+      "approved",
+      "reason",
+      "hard_failures",
+      "enforced_breaches",
+      "observed_breaches"
+    ],
+    "reserved_name": "shadow_mode",
+    "naming_rule": "risk gate observe mode must never be named shadow mode"
+  },
+  "experiment_profiles": {
+    "CURRENT_ENFORCED": {
+      "clause_id": "OPEN005-PROFILE-CURRENT",
+      "purpose": "legacy behavior parity anchor",
+      "gate_modes": {
+        "max_loss_points": "enforce",
+        "daily_loss_limit": "enforce",
+        "max_consecutive_losses": "enforce",
+        "max_drawdown_pct": "enforce"
+      }
+    },
+    "B0_UNINTERRUPTED_STRATEGY_PATH": {
+      "clause_id": "OPEN005-PROFILE-B0",
+      "purpose": "diagnose the strategy path without account-state gate truncation; this is not pure alpha",
+      "gate_modes": {
+        "max_loss_points": "observe",
+        "daily_loss_limit": "observe",
+        "max_consecutive_losses": "observe",
+        "max_drawdown_pct": "observe"
+      },
+      "hard_prerequisites_remain_enforced": true
+    },
+    "B1_CONSECUTIVE_LOSS_ABLATION": {
+      "clause_id": "OPEN005-PROFILE-B1",
+      "purpose": "single-gate causal control for Option D",
+      "gate_modes": {
+        "max_loss_points": "enforce",
+        "daily_loss_limit": "enforce",
+        "max_consecutive_losses": "disabled",
+        "max_drawdown_pct": "enforce"
+      },
+      "hard_prerequisites_remain_enforced": true
+    },
+    "D_EXPERIMENT": {
+      "clause_id": "OPEN005-PROFILE-D",
+      "purpose": "evaluate Option D against B1 while keeping every non-consecutive-loss gate identical",
+      "gate_modes": {
+        "max_loss_points": "enforce",
+        "daily_loss_limit": "enforce",
+        "max_consecutive_losses": "disabled",
+        "max_drawdown_pct": "enforce"
+      },
+      "consecutive_loss_policy": "OPEN005-D-001",
+      "direct_control_profile": "B1_CONSECUTIVE_LOSS_ABLATION",
+      "hard_prerequisites_remain_enforced": true
+    }
+  },
+  "position_transition": {
+    "clause_id": "OPEN005-EXPOSURE-001",
+    "shared_function": "decompose_position_transition(before_position, target_position)",
+    "output_legs": [
+      "close_leg",
+      "open_leg"
+    ],
+    "rules": [
+      "flat to nonzero produces only an open leg",
+      "nonzero to flat produces only a close leg",
+      "same-sign lower absolute target produces only a close leg",
+      "same-sign higher absolute target produces only an open leg",
+      "opposite-sign target produces a close-to-zero leg followed by a separately approved open-from-zero leg"
+    ],
+    "approval_boundary": "state gates apply only to the open or exposure-increasing leg; a close or exposure-reducing leg bypasses account-state entry gates but still obeys execution integrity checks",
+    "forbidden_shortcut": "the sign of order quantity alone must not classify an entire reversal as risk reducing"
+  },
+  "option_d": {
+    "clause_id": "OPEN005-D-001",
+    "status": "experimental_frozen_for_evaluation",
+    "runtime_implementation_status": "implemented_for_research_evaluation",
+    "runtime_schema_when_implemented": "open005-risk-runtime-v2",
+    "production_default": false,
+    "threshold_source": "active max_consecutive_losses configuration value",
+    "regime_states": [
+      "ACTIVE",
+      "PAUSED_UNTIL_NEXT_SESSION",
+      "PROBE_AVAILABLE",
+      "PROBE_IN_FLIGHT"
+    ],
+    "derived_audit_states": [
+      "PROBE_PENDING_ENTRY"
+    ],
+    "order_lifecycle_source_of_truth": "existing runtime order state machine",
+    "reservation_rule": "one active probe reservation per probe_epoch_id; bind existing order IDs to a persisted recoverable intent identity; when any terminal order report, including ALLTRADED, advertises traded volume before trade callbacks arrive, persist reported_fill_order_ids and retain the reservation until fill reconciliation",
+    "late_fill_rule": "an open fill arriving after a zero-fill terminal rejection is not applied to strategy or risk state; it must mark recovery required and be reconciled against broker and OMS state before new exposure",
+    "availability_rule": "after eligible_from_session is reached, unused probe availability persists across later sessions until a first open fill or an explicit policy reset",
+    "transitions": [
+      {
+        "id": "OPEN005-D-T01",
+        "from": "ACTIVE",
+        "event": "finalize_position_loss_reaches_threshold",
+        "to": "PAUSED_UNTIL_NEXT_SESSION",
+        "effects": [
+          "set paused_at_session to the finalization risk session",
+          "set eligible_from_session to the next valid RB trading session"
+        ]
+      },
+      {
+        "id": "OPEN005-D-T02",
+        "from": "PAUSED_UNTIL_NEXT_SESSION",
+        "event": "risk_session_reaches_eligible_from_session",
+        "to": "PROBE_AVAILABLE",
+        "effects": [
+          "create one probe_epoch_id if none exists"
+        ]
+      },
+      {
+        "id": "OPEN005-D-T03",
+        "from": "PROBE_AVAILABLE",
+        "event": "probe_order_submitted",
+        "to": "PROBE_AVAILABLE",
+        "derived_audit_state": "PROBE_PENDING_ENTRY",
+        "effects": [
+          "reserve intent identity",
+          "bind probe order IDs",
+          "reject a second reservation"
+        ]
+      },
+      {
+        "id": "OPEN005-D-T04",
+        "from": "PROBE_AVAILABLE",
+        "event": "all_probe_orders_terminal_with_zero_open_fill",
+        "to": "PROBE_AVAILABLE",
+        "effects": [
+          "release reservation",
+          "retain probe_epoch_id and availability"
+        ]
+      },
+      {
+        "id": "OPEN005-D-T05",
+        "from": "PROBE_AVAILABLE",
+        "event": "first_probe_open_fill",
+        "to": "PROBE_IN_FLIGHT",
+        "effects": [
+          "bind probe_position_id",
+          "consume availability",
+          "retain in-flight state after partial fill and cancellation of the remainder"
+        ]
+      },
+      {
+        "id": "OPEN005-D-T06",
+        "from": "PROBE_IN_FLIGHT",
+        "event": "finalize_position_win",
+        "to": "ACTIVE",
+        "effects": [
+          "close probe epoch"
+        ]
+      },
+      {
+        "id": "OPEN005-D-T07",
+        "from": "PROBE_IN_FLIGHT",
+        "event": "finalize_position_loss",
+        "to": "PAUSED_UNTIL_NEXT_SESSION",
+        "effects": [
+          "set paused_at_session to the finalization risk session",
+          "set eligible_from_session to the next valid RB trading session",
+          "cancel an unsubmitted reversal open leg",
+          "close probe epoch"
+        ]
+      },
+      {
+        "id": "OPEN005-D-T08",
+        "from": "PROBE_IN_FLIGHT",
+        "event": "finalize_position_flat",
+        "to": "PAUSED_UNTIL_NEXT_SESSION",
+        "effects": [
+          "set paused_at_session to the finalization risk session",
+          "set eligible_from_session to the next valid RB trading session",
+          "cancel an unsubmitted reversal open leg",
+          "close probe epoch"
+        ]
+      }
+    ]
+  },
+  "reversal_ordering": {
+    "clause_id": "OPEN005-REV-001",
+    "steps": [
+      "decompose reversal into close-to-zero and open-from-zero legs",
+      "allow the close leg regardless of state-gate breaches",
+      "record every accepted close fill",
+      "after quantity becomes zero, finalize the old position",
+      "apply the resulting streak and Option D state transition",
+      "re-evaluate the pending reversal open leg against the new risk state",
+      "submit the open leg only if the new evaluation approves it"
+    ],
+    "must_not_reuse": "a risk approval made before the close leg",
+    "market_intent_rule": "OPEN-005 does not redefine the existing signal expiry or structural validity policy; the stored reversal intent must still pass all existing non-risk validity checks"
+  },
+  "parity_invariants": {
+    "clause_id": "OPEN005-PARITY-001",
+    "legacy_one_lot": {
+      "dataset": "RB 15m 2018-03-23 through 2026-08-03",
+      "decision_rows": 3658,
+      "execution_decision_rows": 183,
+      "trade_rows": 10,
+      "required_decision_differences": 0,
+      "required_trade_differences": 0
+    },
+    "B0": "risk audit fields may differ, but decisions, fills and trades must exactly match a reference run with the same four state gates disabled",
+    "B1": "all inputs and behavior except max_consecutive_losses enforcement must match CURRENT_ENFORCED",
+    "runtime": "backtest, CTA and live must share event ordering, PnL normalization and position-transition decomposition"
+  },
+  "implementation_order": [
+    "validate this contract and its test matrix",
+    "implement risk accounting events and persistence with legacy exact parity",
+    "implement risk gate modes and B0/B1",
+    "run B0/B1 without changing Option D",
+    "implement the frozen experimental Option D",
+    "compare Option D only against B1"
+  ]
+}

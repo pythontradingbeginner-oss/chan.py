@@ -12,8 +12,8 @@ with every input needed to reproduce the run:
   - per-trade entry/exit/direction/gross/net/reason
   - cost-pressure results (1.0x / 1.5x / 2.0x)
 
-Output goes to a timestamped file under %TEMP%/p7_holdout/ so it never
-overwrites existing reports.
+Output goes to a timestamped file under reports/p7_holdout/ by default, plus
+an updated latest.json convenience copy for downstream review tools.
 
 Does NOT tune strategy parameters on the result.
 """
@@ -27,7 +27,6 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -36,6 +35,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 GIT = os.environ.get("GIT_EXECUTABLE") or shutil.which("git") or "git"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "reports" / "p7_holdout"
 
 import pandas as pd
 
@@ -205,6 +205,11 @@ def main() -> int:
     parser.add_argument("--config", default="configs/rb_15m_qingpai_strict.yaml")
     parser.add_argument("--oos-start", default="2026-06-01")
     parser.add_argument("--output-dir", default=None)
+    parser.add_argument(
+        "--latest-name",
+        default="latest.json",
+        help="Stable copy name written beside the timestamped report; set empty to disable.",
+    )
     args = parser.parse_args()
 
     config_path = Path(args.config)
@@ -245,15 +250,22 @@ def main() -> int:
         "note": "Read-only; no data overwritten. Parameters NOT tuned on this result.",
     }
 
-    # Write to TEMP, never overwrite existing
-    output_dir = Path(args.output_dir) if args.output_dir else (
-        Path(tempfile.gettempdir()) / "p7_holdout"
-    )
+    # Keep timestamped reports immutable; latest.json is a convenience pointer.
+    output_dir = Path(args.output_dir) if args.output_dir else DEFAULT_OUTPUT_DIR
+    if not output_dir.is_absolute():
+        output_dir = PROJECT_ROOT / output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     output = output_dir / f"holdout_r10_{ts}.json"
-    output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    payload = json.dumps(report, ensure_ascii=False, indent=2)
+    output.write_text(payload, encoding="utf-8")
+    latest = None
+    if args.latest_name:
+        latest = output_dir / args.latest_name
+        latest.write_text(payload, encoding="utf-8")
     print(f"Wrote holdout report to: {output}")
+    if latest:
+        print(f"Updated latest holdout copy: {latest}")
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
 

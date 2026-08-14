@@ -70,6 +70,12 @@ class RuntimeDecisionKernel:
         available_funds: float | None = None,
         atr: float | None = None,
         price_adjustment: float = 0.0,
+        risk_session_key: str | None = None,
+        risk_session_observed_at: object | None = None,
+        risk_session_source: str = "",
+        equity_source: str = "",
+        equity_scope: str = "",
+        max_drawdown_capability: str = "",
     ) -> TradeIntent | None:
         if self.multi_level is not None:
             self.multi_level.advance_to(timestamp)
@@ -110,7 +116,17 @@ class RuntimeDecisionKernel:
                 )
                 if was_accepted and not intent.accepted:
                     self.strategy.release_signal(intent.signal)
-            self._decision_trace.append(intent.to_trace_record())
+            self._decision_trace.append(
+                intent.to_trace_record(
+                    risk_session_key=risk_session_key,
+                    risk_session_observed_at=risk_session_observed_at,
+                    risk_session_source=risk_session_source,
+                    equity_value=account_equity,
+                    equity_source=equity_source,
+                    equity_scope=equity_scope,
+                    max_drawdown_capability=max_drawdown_capability,
+                )
+            )
         return intent
 
     def observe_parent_bar(self, klu, *, available_at: object | None = None) -> None:

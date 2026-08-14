@@ -229,6 +229,18 @@
       "owner_phase": "P6",
       "question": "保本止损、分批止盈和对立中枢目标位是否增加净收益",
       "default_until_resolved": "关闭"
+    },
+    {
+      "id": "OPEN-005",
+      "owner_phase": "P0-RISK",
+      "question": "连续亏损、累计亏损和最大回撤门控分别采用自动恢复、人工复位还是永久停机",
+      "default_until_resolved": "只修复 daily_loss_limit 的交易日日切；其余门控保持当前行为并同时报告连续状态与 fold-reset"
+    },
+    {
+      "id": "OPEN-006",
+      "owner_phase": "P1-SETUP",
+      "question": "Canonical SetupID、有效期、保护止损后重新武装条件和最大尝试次数如何定义",
+      "default_until_resolved": "P0 只记录 setup candidate，不改变消费、释放、重评或成交行为"
     }
   ],
   "resolved_decisions": [

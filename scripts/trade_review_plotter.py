@@ -70,11 +70,28 @@ GIT = os.environ.get("GIT_EXECUTABLE") or shutil.which("git") or "git"
 
 
 # ── 默认路径 ────────────────────────────────────────────────────────────────
-DEFAULT_HOLDOUT = (
+DEFAULT_HOLDOUT_REPORT = PROJECT_ROOT / "reports" / "p7_holdout" / "latest.json"
+DEFAULT_HOLDOUT_FIXTURE = (
+    PROJECT_ROOT / "tests" / "fixtures" / "p7_holdout" / "holdout_r10_baseline.json"
+)
+LEGACY_TEMP_HOLDOUT = (
     Path(os.environ.get("TEMP", tempfile.gettempdir()))
     / "p7_holdout"
     / "holdout_r10_20260806_032914.json"
 )
+
+
+def _default_holdout_path() -> Path:
+    env_path = os.environ.get("P7_HOLDOUT_JSON")
+    if env_path:
+        return Path(env_path)
+    for candidate in (DEFAULT_HOLDOUT_REPORT, DEFAULT_HOLDOUT_FIXTURE):
+        if candidate.exists():
+            return candidate
+    return LEGACY_TEMP_HOLDOUT
+
+
+DEFAULT_HOLDOUT = _default_holdout_path()
 DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "rb_15m_qingpai_strict.yaml"
 DEFAULT_DATA_15M = PROJECT_ROOT / "data" / "processed" / "RB_15m_continuous_raw.parquet"
 DEFAULT_DATA_60M = PROJECT_ROOT / "data" / "processed" / "RB_60m_continuous_raw.parquet"

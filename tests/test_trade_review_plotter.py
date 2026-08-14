@@ -26,6 +26,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+import scripts.trade_review_plotter as plotter  # noqa: E402
 from scripts.trade_review_plotter import (  # noqa: E402
     DEFAULT_CONFIG,
     DEFAULT_DATA_15M,
@@ -55,6 +56,19 @@ from scripts.trade_review_plotter import (  # noqa: E402
     scenario_name,
     select_scenario,
 )
+
+
+def test_default_holdout_path_prefers_env_then_project_fixture(monkeypatch, tmp_path):
+    custom = tmp_path / "custom_holdout.json"
+    monkeypatch.setenv("P7_HOLDOUT_JSON", str(custom))
+    assert plotter._default_holdout_path() == custom
+
+    fixture = tmp_path / "fixture_holdout.json"
+    fixture.write_text("{}", encoding="utf-8")
+    monkeypatch.delenv("P7_HOLDOUT_JSON", raising=False)
+    monkeypatch.setattr(plotter, "DEFAULT_HOLDOUT_REPORT", tmp_path / "missing_latest.json")
+    monkeypatch.setattr(plotter, "DEFAULT_HOLDOUT_FIXTURE", fixture)
+    assert plotter._default_holdout_path() == fixture
 
 
 @pytest.fixture(scope="module")

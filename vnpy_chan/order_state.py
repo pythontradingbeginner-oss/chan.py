@@ -11,6 +11,7 @@ TERMINAL_STATUSES = {"ALLTRADED", "CANCELLED", "REJECTED", "TRIGGERED", "TIMEDOU
 CANCELLING_STATUS = "CANCELLING"
 EMPTY_ORDER_ID = ""
 RISK_REJECTED_ROLE = "risk_rejected_or_submit_failed"
+TERMINAL_PENDING_TRADES_STATUS = "TERMINAL_PENDING_TRADES"
 
 
 class TradeDisposition(StrEnum):
@@ -52,6 +53,8 @@ class CtaTrackedOrder:
     updated_at: str = field(default_factory=_now_text)
     timeout_at: str = ""
     trade_ids: list[str] = field(default_factory=list)
+    reported_traded_target: float = 0.0
+    reported_status: str = ""
 
     @property
     def active(self) -> bool:
@@ -150,7 +153,12 @@ class CtaOrderStatusMachine:
         )
         self.history.append(entry)
 
-    def on_order(self, order: Any) -> CtaTrackedOrder:
+    def on_order(
+        self,
+        order: Any,
+        *,
+        defer_reported_trades: bool = False,
+    ) -> CtaTrackedOrder:
         vt_orderid = str(getattr(order, "vt_orderid", ""))
         if not vt_orderid:
             return self._record_empty_order_update()
@@ -158,12 +166,22 @@ class CtaOrderStatusMachine:
         if tracked is None:
             tracked = CtaTrackedOrder(vt_orderid=vt_orderid, role="recovered")
             self.active[vt_orderid] = tracked
+        processed_traded = tracked.traded
+        reported_traded = float(getattr(order, "traded", tracked.traded) or 0)
         tracked.price = float(getattr(order, "price", tracked.price) or 0)
         tracked.volume = float(getattr(order, "volume", tracked.volume) or 0)
-        tracked.traded = float(getattr(order, "traded", tracked.traded) or 0)
-        tracked.status = _enum_name(getattr(order, "status", tracked.status))
+        reported_status = _enum_name(getattr(order, "status", tracked.status))
+        tracked.traded = reported_traded
+        tracked.status = reported_status
         tracked.updated_at = _now_text()
-        if not _is_order_active(order, tracked.status):
+        if defer_reported_trades and reported_traded > processed_traded:
+            tracked.traded = processed_traded
+            tracked.reported_traded_target = reported_traded
+            tracked.reported_status = reported_status
+            if not _is_order_active(order, reported_status):
+                tracked.status = TERMINAL_PENDING_TRADES_STATUS
+            return tracked
+        if not _is_order_active(order, reported_status):
             self._archive(vt_orderid)
         return tracked
 
@@ -224,6 +242,18 @@ class CtaOrderStatusMachine:
         if vt_tradeid:
             tracked.trade_ids.append(vt_tradeid)
             self.consumed_trade_ids.add(vt_tradeid)
+        if (
+            tracked.reported_traded_target > 0
+            and tracked.traded >= tracked.reported_traded_target
+        ):
+            reported_status = tracked.reported_status
+            tracked.reported_traded_target = 0.0
+            tracked.reported_status = ""
+            if reported_status in TERMINAL_STATUSES:
+                tracked.status = reported_status
+                self._archive(vt_orderid)
+                return TradeDispositionResult(TradeDisposition.ACCEPTED, tracked)
+            tracked.status = reported_status
         if tracked.volume > 0 and tracked.traded >= tracked.volume:
             tracked.status = "ALLTRADED"
             self._archive(vt_orderid)

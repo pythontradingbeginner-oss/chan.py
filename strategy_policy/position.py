@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, replace
+from datetime import date, datetime, timezone
 
 from signal_core.models import (
     SignalAssessment,
@@ -22,6 +24,7 @@ class PositionContext:
     entry_bar: int | None
     volume: int
 
+    position_id: str = ""
     entry_grade: str = "standard"
     event_id: str = ""
     signal_key: str = ""
@@ -35,12 +38,39 @@ class PositionContext:
     zs_low: float | None = None
     setup_invalidation_price: float | None = None
     execution_stop_price: float | None = None
+    setup_candidate_schema_version: str = ""
+    setup_candidate_id: str = ""
+    setup_contract_epoch: str = ""
+    setup_timeframe: str = ""
+    setup_direction: str = ""
+    setup_root_bi_idx: int | None = None
+    setup_family: str = ""
+    setup_state: str = "observed_only"
 
     def __post_init__(self) -> None:
         if self.volume < 1:
             raise ValueError("position volume must be >= 1")
         if self.entry_price <= 0:
             raise ValueError("entry_price must be positive")
+        if not self.position_id:
+            object.__setattr__(self, "position_id", self._derived_position_id())
+
+    def _derived_position_id(self) -> str:
+        """Derive a replay-stable identity without the random decision UUID."""
+        payload = "|".join(
+            (
+                "position-identity-v2",
+                self.event_id,
+                self.signal_key,
+                self.setup_candidate_id,
+                str(self.active_symbol or ""),
+                _canonical_identity_time(self.entry_time),
+                "" if self.entry_bar is None else str(self.entry_bar),
+                float(self.entry_price).hex(),
+                self.direction.value,
+            )
+        )
+        return "position_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     @classmethod
     def from_decision_fill(
@@ -56,6 +86,15 @@ class PositionContext:
         entry_bar: int | None = None,
         bsp_type: str = "",
         active_symbol: str | None = None,
+        position_id: str = "",
+        setup_candidate_schema_version: str = "",
+        setup_candidate_id: str = "",
+        setup_contract_epoch: str = "",
+        setup_timeframe: str = "",
+        setup_direction: str = "",
+        setup_root_bi_idx: int | None = None,
+        setup_family: str = "",
+        setup_state: str = "observed_only",
     ) -> PositionContext:
         if not decision.accepted:
             raise ValueError("rejected decision cannot create a position")
@@ -81,6 +120,7 @@ class PositionContext:
             entry_time=fill_time,
             entry_bar=entry_bar,
             volume=int(fill_volume),
+            position_id=position_id,
             entry_grade=(
                 assessment.grade.value if assessment is not None else "standard"
             ),
@@ -95,6 +135,14 @@ class PositionContext:
             zs_low=event.zs_low if event is not None else None,
             setup_invalidation_price=setup,
             execution_stop_price=execution_stop,
+            setup_candidate_schema_version=setup_candidate_schema_version,
+            setup_candidate_id=setup_candidate_id,
+            setup_contract_epoch=setup_contract_epoch,
+            setup_timeframe=setup_timeframe,
+            setup_direction=setup_direction,
+            setup_root_bi_idx=setup_root_bi_idx,
+            setup_family=setup_family,
+            setup_state=setup_state,
         )
 
     @classmethod
@@ -145,6 +193,7 @@ class PositionContext:
             entry_time=self.entry_time if self.entry_time is not None else fill_time,
             entry_bar=self.entry_bar,
             volume=total_volume,
+            position_id=self.position_id,
             entry_grade=self.entry_grade,
             event_id=self.event_id,
             signal_key=self.signal_key,
@@ -157,6 +206,14 @@ class PositionContext:
             zs_low=self.zs_low,
             setup_invalidation_price=self.setup_invalidation_price,
             execution_stop_price=self.execution_stop_price,
+            setup_candidate_schema_version=self.setup_candidate_schema_version,
+            setup_candidate_id=self.setup_candidate_id,
+            setup_contract_epoch=self.setup_contract_epoch,
+            setup_timeframe=self.setup_timeframe,
+            setup_direction=self.setup_direction,
+            setup_root_bi_idx=self.setup_root_bi_idx,
+            setup_family=self.setup_family,
+            setup_state=self.setup_state,
         )
 
     def pnl_points(
@@ -187,3 +244,36 @@ class PositionContext:
     @property
     def invalidation_price(self) -> float | None:
         return self.setup_invalidation_price
+
+
+def position_id_from_open_fill_id(fill_id: str) -> str:
+    """Create the runtime position identity from the first accepted open fill."""
+    normalized = str(fill_id).strip()
+    if not normalized:
+        raise ValueError("open fill identity is required for position_id")
+    payload = f"runtime-open-fill-v1|{normalized}"
+    return "position_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _canonical_identity_time(value: object) -> str:
+    if value is None:
+        return ""
+    if hasattr(value, "to_pydatetime"):
+        value = value.to_pydatetime()
+    if isinstance(value, datetime):
+        if value.tzinfo is not None:
+            value = value.astimezone(timezone.utc)
+        return value.isoformat(timespec="microseconds")
+    if isinstance(value, date):
+        return value.isoformat()
+
+    text = str(value).strip()
+    if not text:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc)
+    return parsed.isoformat(timespec="microseconds")

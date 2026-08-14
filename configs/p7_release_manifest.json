@@ -56,7 +56,7 @@
   "artifacts": {
     "strategy_source": {
       "path": "vnpy_chan/chan_bsp_strategy.py",
-      "sha256": "b682672871900552ddac61c2e04dc0c85c44464d1d75d6ab0a66d7ddf7d5a373"
+      "sha256": "f3b3af64d3ec191fdf03d14522ed76711704c5b35671a41adb48cffc084cc7d6"
     },
     "strategy_deployed": {
       "path": "~/strategies/chan_bsp_strategy.py",
@@ -64,7 +64,7 @@
     },
     "strategy_config": {
       "path": "configs/rb_15m_qingpai_strict.yaml",
-      "sha256": "1f6c6ad0ec589524eaa7bdf5cb52deae49739248df1b6aae67a46accc0501fbf"
+      "sha256": "75dd9d813e6b5dc255db3eaaf5ad8cecdc874634319c95f90eeefd9ec6ffec9d"
     },
     "risk_manager_profile": {
       "path": "configs/veighna_risk_manager_setting.p7.json",

@@ -17,8 +17,10 @@ Ensure chan.py project is in PYTHONPATH.
 
 from __future__ import annotations
 
-import sys
 import json
+import math
+import sys
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 import pandas as pd
@@ -46,13 +48,17 @@ for _cp in _CHAN_CANDIDATES:
 
 from chan_futures.trade_intent import DecisionTraceRecord, PendingEntry, TradeIntent
 from chan_futures.execution import adverse_fill_price
+from chan_futures.risk import CloseFillRecord
+from chan_futures.risk_session import RbRiskSessionResolver
+from chan_futures.position_transition import decompose_position_transition
+from chan_futures.option_d import probe_intent_identity
 from data_foundation import (
     CalendarCoverageError,
     RBTradingCalendar,
     aggregate_continuous_1m_to_Nm,
 )
 from signal_core import SignalDirection, SignalState
-from strategy_policy.position import PositionContext
+from strategy_policy.position import PositionContext, position_id_from_open_fill_id
 from vnpy_chan.converter import bars_to_ohlc_frame
 from vnpy_chan.hard_risk import HardRiskState, OpenDecision, evaluate_open_guard
 from vnpy_chan.order_state import CtaOrderStatusMachine
@@ -208,6 +214,7 @@ class ChanBspStrategy(CtaTemplate):
         # BarGenerator is used only for tick -> 1m.  N-minute aggregation is
         # session-aware and mirrors data_foundation historical replay rules.
         self._calendar = RBTradingCalendar.load_default()
+        self._risk_session_resolver = RbRiskSessionResolver(self._calendar)
         self.bg = BarGenerator(self._on_realtime_minute_bar)
         self._kl_aggregator = self._make_session_aggregator(self.kl_window)
         self._parent_aggregator = None
@@ -531,6 +538,22 @@ class ChanBspStrategy(CtaTemplate):
 
         # 1. Feed bar to CChan
         timestamp = self._window_end_time(bar, self._current_kl_type())
+        risk_session = None
+        equity_value, equity_source, equity_scope = (
+            self._account_equity_observation()
+        )
+        if allow_execution and self._risk is not None:
+            risk_session = self._advance_risk_session(timestamp, source="cta_bar")
+            self._risk.observe_equity(
+                equity_value,
+                source=equity_source,
+                scope=equity_scope,
+                max_drawdown_capability=(
+                    "enabled"
+                    if self._config.risk.max_drawdown_pct is not None
+                    else "disabled_by_design"
+                ),
+            )
         klu = self._bar_to_klu(bar, timestamp=timestamp)
         self._chan.trigger_load({klu.kl_type: [klu]})
         self._record_level_bar(int(self.kl_window), bar)
@@ -554,9 +577,21 @@ class ChanBspStrategy(CtaTemplate):
             timestamp=timestamp,
             active_symbol=bar.symbol,
             lv_idx=0,
-            account_equity=self._account_equity(),
+            account_equity=equity_value,
             available_funds=self._account_available_funds(),
             atr=atr,
+            risk_session_key=(risk_session.session_key if risk_session else None),
+            risk_session_observed_at=(
+                risk_session.observed_at if risk_session else None
+            ),
+            risk_session_source=(risk_session.source if risk_session else ""),
+            equity_source=equity_source,
+            equity_scope=equity_scope,
+            max_drawdown_capability=(
+                "enabled"
+                if self._config.risk.max_drawdown_pct is not None
+                else "disabled_by_design"
+            ),
         )
 
         # 4. Check exit rules, including confirmed opposite BSP and chan momentum.
@@ -583,28 +618,24 @@ class ChanBspStrategy(CtaTemplate):
                 return
 
             signal = intent.signal
-            if self._risk is not None:
-                risk_decision = self._risk.approve(
-                    signal,
-                    current_equity=self._account_equity(),
-                )
-                if not risk_decision.approved:
-                    self.write_log(f"Risk rejected: {risk_decision.reason}")
-                    self.risk_status = risk_decision.reason
-                    self.put_event()
-                    return
-                self.risk_status = "approved"
-
-            if self.pos == 0:
-                self._submit_open_intent(intent)
-            elif signal.target_position == 0:
-                self._pending_reversal = None
-                self.exit_reason = "strategy_close"
-                self._close_existing(bar, "strategy_close")
-            elif (self.pos > 0) != (signal.target_position > 0):
+            transition = decompose_position_transition(
+                int(self.pos),
+                signal.target_position,
+            )
+            if transition.is_reversal:
                 self._pending_reversal = PendingEntry(intent)
                 self.exit_reason = "strategy_reverse"
                 self._close_existing(bar, "strategy_reverse")
+            elif transition.close_leg is not None:
+                self._pending_reversal = None
+                self.exit_reason = "strategy_close"
+                self._close_existing(
+                    bar,
+                    "strategy_close",
+                    volume=transition.close_leg.quantity,
+                )
+            elif transition.open_leg is not None:
+                self._approve_and_submit_open_intent(intent, before_position=int(self.pos))
 
         if allow_execution:
             self.put_event()
@@ -621,9 +652,28 @@ class ChanBspStrategy(CtaTemplate):
         state, so a restart replay or out-of-order report cannot double-count.
         """
         self._ensure_runtime_state_helpers()
+        if trade.offset == Offset.CLOSE:
+            try:
+                _trade_fill_id(trade)
+                _trade_order_id(trade)
+            except ValueError as exc:
+                self.write_log(f"CLOSE FILL REJECTED: {exc}")
+                self.put_event()
+                return
         result = self._order_state.on_trade(trade)
         self.order_status = self._order_state.summary
         if not result.accepted:
+            if (
+                trade.offset == Offset.OPEN
+                and result.disposition.value in {"late", "unknown"}
+            ):
+                self._accumulate_recovery(
+                    "unreconciled_open_fill:"
+                    f"{result.disposition.value}:"
+                    f"{getattr(trade, 'vt_orderid', '')}:"
+                    f"{getattr(trade, 'vt_tradeid', '')}"
+                )
+                self._sync_runtime_state_checkpoint()
             self.write_log(
                 f"Trade ignored disposition={result.disposition.value} "
                 f"vt_tradeid={getattr(trade, 'vt_tradeid', '')}"
@@ -646,6 +696,9 @@ class ChanBspStrategy(CtaTemplate):
                     fill_time=getattr(trade, "datetime", None) or datetime.now(),
                     entry_bar=self.bars_processed,
                     active_symbol=getattr(trade, "symbol", None),
+                    position_id=position_id_from_open_fill_id(
+                        _runtime_open_fill_id(trade)
+                    ),
                 )
             else:
                 self._position_context = self._position_context.merge_open_fill(
@@ -653,8 +706,19 @@ class ChanBspStrategy(CtaTemplate):
                     fill_volume=fill_volume,
                     fill_time=getattr(trade, "datetime", None),
                 )
+            if pending.probe_intent_id and self._risk is not None:
+                self._risk.record_probe_open_fill(
+                    intent_id=pending.probe_intent_id,
+                    position_id=self._position_context.position_id,
+                    fill_volume=fill_volume,
+                    order_id=str(getattr(trade, "vt_orderid", "")),
+                )
             self._pending_entry = pending.apply_fill(fill_volume)
-            if self._pending_entry.complete:
+            active_open_orders = any(
+                order.role.startswith("open")
+                for order in self._order_state.active.values()
+            )
+            if self._pending_entry.complete or not active_open_orders:
                 self._pending_entry = None
             if self._exit_manager is not None:
                 if opening_position:
@@ -664,28 +728,76 @@ class ChanBspStrategy(CtaTemplate):
             self.write_log(
                 f"OPEN FILLED: @ {trade.price:.1f} volume={fill_volume}"
             )
-            self._persist_runtime_state()
+            if pending.probe_intent_id:
+                self._sync_runtime_state_checkpoint()
+            else:
+                self._persist_runtime_state()
             self.put_event()
             return
 
         if self._position_context is not None and trade.offset == Offset.CLOSE:
             fill_volume = int(trade.volume)
             fee = self._config.execution.fee_points if self._config else 1.0
-            pnl = self._position_context.pnl_points(
+            closing_position = self._position_context
+            if fill_volume < 1 or fill_volume > closing_position.volume:
+                raise ValueError(
+                    "invalid close fill volume: "
+                    f"fill={fill_volume}, position={closing_position.volume}"
+                )
+            pnl = closing_position.pnl_points(
                 exit_price=float(trade.price),
                 fee_points=fee,
                 volume=fill_volume,
             )
+            remaining_quantity = max(0, closing_position.volume - fill_volume)
+            fill_time = getattr(trade, "datetime", None) or datetime.now()
+
+            if self._risk is not None:
+                risk_session = self._risk_session_resolver.resolve(
+                    fill_time,
+                    source="cta_fill",
+                )
+                equity_value, equity_source, equity_scope = (
+                    self._account_equity_observation()
+                )
+                accepted = self._risk.record_close_fill(
+                    CloseFillRecord(
+                        fill_id=_trade_fill_id(trade),
+                        order_id=_trade_order_id(trade),
+                        position_id=closing_position.position_id,
+                        pnl_raw_points=pnl,
+                        risk_session_key=risk_session.session_key,
+                        observed_at=fill_time,
+                        source="cta_fill",
+                        current_equity=equity_value,
+                        equity_source=equity_source,
+                        equity_scope=equity_scope,
+                        max_drawdown_capability=(
+                            "enabled"
+                            if self._config.risk.max_drawdown_pct is not None
+                            else "disabled_by_design"
+                        ),
+                    ),
+                    remaining_quantity=remaining_quantity,
+                )
+                if not accepted:
+                    self.write_log(
+                        "CLOSE FILL IGNORED: duplicate risk fill identity "
+                        f"{_trade_fill_id(trade)}"
+                    )
+                    self._persist_runtime_state()
+                    self.put_event()
+                    return
+
             self.total_pnl += pnl
             self.total_trades += 1
             self._trade_pnl_batch.append(pnl)
-            self._position_context = self._position_context.reduce_volume(fill_volume)
-
-            if self._risk is not None:
-                self._risk.on_fill(
-                    pnl_points=pnl,
-                    fill_time=getattr(trade, "datetime", None) or datetime.now(),
-                    current_equity=self._account_equity(),
+            self._position_context = closing_position.reduce_volume(fill_volume)
+            if self._position_context is None and self._risk is not None:
+                self._risk.finalize_position(
+                    closing_position.position_id,
+                    finalized_at=fill_time,
+                    reason=self.exit_reason or "cta_close",
                 )
 
             self.write_log(
@@ -699,8 +811,27 @@ class ChanBspStrategy(CtaTemplate):
                     self._exit_manager.on_close()
                 pending_reversal = self._pending_reversal
                 self._pending_reversal = None
+                # Force vn.py's strategy-data checkpoint before submitting an
+                # opposite leg. The underlying vn.py JSON write is synchronous
+                # but is not an atomic filesystem transaction.
+                self._sync_runtime_state_checkpoint()
                 if pending_reversal is not None:
-                    self._submit_open_intent(pending_reversal.intent)
+                    option_state = (
+                        self._risk.get_state().get("option_d", {})
+                        if self._risk is not None
+                        else {}
+                    )
+                    if option_state.get("regime_state") == (
+                        "PAUSED_UNTIL_NEXT_SESSION"
+                    ):
+                        self.write_log(
+                            "Reversal open leg cancelled by Option D pause"
+                        )
+                    else:
+                        self._approve_and_submit_open_intent(
+                            pending_reversal.intent,
+                            before_position=0,
+                        )
             elif self._exit_manager is not None:
                 self._exit_manager.on_position_updated(self._position_context)
 
@@ -709,17 +840,56 @@ class ChanBspStrategy(CtaTemplate):
 
     def on_order(self, order: OrderData):
         self._ensure_runtime_state_helpers()
-        tracked = self._order_state.on_order(order)
-        self.order_status = self._order_state.summary
         vt_orderid = str(getattr(order, "vt_orderid", ""))
-        if not tracked.active:
-            if tracked.role.startswith("open") and tracked.traded <= 0:
+        pending = self._pending_entry
+        tracked_before = self._order_state.active.get(vt_orderid)
+        defer_probe_trades = bool(
+            pending is not None
+            and getattr(pending, "probe_intent_id", "")
+            and tracked_before is not None
+            and float(getattr(order, "traded", 0) or 0) > pending.filled_volume
+        )
+        tracked = self._order_state.on_order(
+            order,
+            defer_reported_trades=defer_probe_trades,
+        )
+        self.order_status = self._order_state.summary
+        probe_terminal = False
+        if (
+            defer_probe_trades
+            and tracked.reported_status in self._order_state.TERMINAL_STATUSES
+        ):
+            self._risk.mark_probe_order_terminal(
+                vt_orderid,
+                has_reported_fill=True,
+            )
+            probe_terminal = True
+        elif not tracked.active:
+            if (
+                tracked.role.startswith("open")
+                and pending is not None
+                and getattr(pending, "probe_intent_id", "")
+                and getattr(self, "_risk", None) is not None
+            ):
+                self._risk.mark_probe_order_terminal(
+                    vt_orderid,
+                    has_reported_fill=int(getattr(order, "traded", 0) or 0) > 0,
+                )
+                probe_terminal = True
+            active_open_orders = any(
+                item.role.startswith("open")
+                for item in self._order_state.active.values()
+            )
+            if tracked.role.startswith("open") and not active_open_orders:
                 self._pending_entry = None
             if (
                 self._order_state.close_intent_orderid == vt_orderid
             ):
                 self._order_state.clear_close_intent()
-        self._persist_runtime_state()
+        if probe_terminal:
+            self._sync_runtime_state_checkpoint()
+        else:
+            self._persist_runtime_state()
         self.put_event()
 
     def on_stop_order(self, stop_order: StopOrder):
@@ -1130,6 +1300,9 @@ class ChanBspStrategy(CtaTemplate):
         self._exit_manager = make_exit_manager(cfg)
 
         # RiskManager
+        initial_equity, equity_source, equity_scope = (
+            self._account_equity_observation()
+        )
         self._risk = RiskManager(
             RiskConfig(
                 max_abs_position=cfg.risk.max_abs_position,
@@ -1137,7 +1310,21 @@ class ChanBspStrategy(CtaTemplate):
                 daily_loss_limit=cfg.risk.daily_loss_limit,
                 max_consecutive_losses=cfg.risk.max_consecutive_losses,
                 max_drawdown_pct=cfg.risk.max_drawdown_pct,
-            )
+                require_session_key=cfg.risk.daily_loss_limit is not None,
+                profile=cfg.risk.profile,
+                max_loss_points_mode=cfg.risk.max_loss_points_mode,
+                daily_loss_limit_mode=cfg.risk.daily_loss_limit_mode,
+                max_consecutive_losses_mode=cfg.risk.max_consecutive_losses_mode,
+                max_drawdown_pct_mode=cfg.risk.max_drawdown_pct_mode,
+            ),
+            initial_equity=initial_equity,
+            initial_equity_source=equity_source,
+            equity_scope=equity_scope,
+            max_drawdown_capability=(
+                "enabled"
+                if cfg.risk.max_drawdown_pct is not None
+                else "disabled_by_design"
+            ),
         )
 
     # ============================================================
@@ -1247,7 +1434,12 @@ class ChanBspStrategy(CtaTemplate):
         )
 
     def _close_existing(
-        self, bar: BarData, reason: str, *, price: float | None = None
+        self,
+        bar: BarData,
+        reason: str,
+        *,
+        price: float | None = None,
+        volume: int | None = None,
     ):
         """Close current position.
 
@@ -1262,21 +1454,26 @@ class ChanBspStrategy(CtaTemplate):
             return
         order_price = float(bar.close_price) if price is None else float(price)
         order_price = self._execution_price(order_price, -int(self.pos))
+        close_volume = abs(self.pos) if volume is None else int(volume)
+        if close_volume < 1 or close_volume > abs(self.pos):
+            raise ValueError(
+                f"invalid close volume: {close_volume} for position {self.pos}"
+            )
         if self.pos > 0:
             order_ids = self._send_live_or_shadow(
                 "close",
-                lambda: self.sell(order_price, abs(self.pos)),
+                lambda: self.sell(order_price, close_volume),
                 price=order_price,
-                volume=abs(self.pos),
+                volume=close_volume,
                 closing=True,
                 reason=reason,
             )
         elif self.pos < 0:
             order_ids = self._send_live_or_shadow(
                 "close",
-                lambda: self.cover(order_price, abs(self.pos)),
+                lambda: self.cover(order_price, close_volume),
                 price=order_price,
-                volume=abs(self.pos),
+                volume=close_volume,
                 closing=True,
                 reason=reason,
             )
@@ -1287,7 +1484,7 @@ class ChanBspStrategy(CtaTemplate):
                 order_ids,
                 role="close",
                 price=order_price,
-                volume=abs(self.pos),
+                volume=close_volume,
                 reason=reason,
             )
             if order_ids:
@@ -1295,7 +1492,12 @@ class ChanBspStrategy(CtaTemplate):
             self.order_status = "pending_close"
             self._persist_runtime_state()
 
-    def _submit_open_intent(self, intent: TradeIntent) -> None:
+    def _submit_open_intent(
+        self,
+        intent: TradeIntent,
+        *,
+        probe_intent_id: str = "",
+    ) -> None:
         signal = intent.signal
         planned_size = abs(signal.target_position)
         if planned_size <= 0:
@@ -1303,6 +1505,8 @@ class ChanBspStrategy(CtaTemplate):
             return
 
         if self._pending_entry is not None:
+            if probe_intent_id and self._risk is not None:
+                self._risk.release_probe_reservation(probe_intent_id)
             self.write_log(
                 "Decision rejected: one_active_open_intent (pending entry exists)"
             )
@@ -1312,12 +1516,20 @@ class ChanBspStrategy(CtaTemplate):
             for order in self._order_state.active.values()
         )
         if active_open:
+            if probe_intent_id and self._risk is not None:
+                self._risk.release_probe_reservation(probe_intent_id)
             self.write_log(
                 "Decision rejected: one_active_open_intent (active open order exists)"
             )
             return
 
-        self._pending_entry = PendingEntry(intent)
+        self._pending_entry = PendingEntry(
+            intent,
+            probe_intent_id=probe_intent_id,
+        )
+        if probe_intent_id:
+            # Persist the full recoverable intent before any broker submission.
+            self._sync_runtime_state_checkpoint()
         direction_str = self._get_signal_direction(signal)
         order_price = self._execution_price(signal.price, signal.target_position)
         if direction_str == "long":
@@ -1340,6 +1552,9 @@ class ChanBspStrategy(CtaTemplate):
             )
         if not order_ids:
             self._pending_entry = None
+            if probe_intent_id and self._risk is not None:
+                self._risk.release_probe_reservation(probe_intent_id)
+                self._sync_runtime_state_checkpoint()
             return
         self._order_state.submit(
             order_ids,
@@ -1349,11 +1564,63 @@ class ChanBspStrategy(CtaTemplate):
             reason=intent.event_id,
             timeout_at=self._order_timeout_at(),
         )
+        if probe_intent_id and self._risk is not None:
+            self._risk.bind_probe_orders(probe_intent_id, list(order_ids))
         self.order_status = "pending_open"
-        self._persist_runtime_state()
+        if probe_intent_id:
+            self._sync_runtime_state_checkpoint()
+        else:
+            self._persist_runtime_state()
         self.write_log(
             f"ENTRY: {intent.bsp_type} grade={intent.grade} "
             f"dir={direction_str} @ {order_price:.1f}"
+        )
+
+    def _approve_and_submit_open_intent(
+        self,
+        intent: TradeIntent,
+        *,
+        before_position: int,
+    ) -> None:
+        risk = getattr(self, "_risk", None)
+        transition = decompose_position_transition(
+            before_position,
+            intent.signal.target_position,
+        )
+        if transition.open_leg is None:
+            return
+        if risk is not None:
+            equity_value, _, _ = self._account_equity_observation()
+            decision = risk.approve(
+                intent.signal,
+                current_equity=equity_value,
+                before_position=before_position,
+            )
+            if not decision.approved:
+                self.risk_status = decision.reason
+                self.write_log(f"Risk rejected: {decision.reason}")
+                self._persist_runtime_state()
+                return
+            self.risk_status = "approved"
+        open_intent = intent.for_open_leg(transition.open_leg.quantity)
+        probe_intent_id = ""
+        if risk is not None and risk.option_d_probe_available:
+            option_state = risk.get_state()["option_d"]
+            probe_intent_id = probe_intent_identity(
+                option_state["probe_epoch_id"],
+                open_intent.event_id,
+            )
+            risk.reserve_probe_intent(
+                intent_id=probe_intent_id,
+                decision_id=open_intent.decision.decision_id,
+                event_id=open_intent.event_id,
+                target_position=open_intent.signal.target_position,
+                planned_volume=transition.open_leg.quantity,
+                intent_snapshot=open_intent.to_runtime_snapshot(),
+            )
+        self._submit_open_intent(
+            open_intent,
+            probe_intent_id=probe_intent_id,
         )
 
     def _send_live_or_shadow(
@@ -1512,6 +1779,9 @@ class ChanBspStrategy(CtaTemplate):
         return (datetime.now() + timedelta(seconds=seconds)).isoformat(timespec="seconds")
 
     def _account_equity(self) -> float | None:
+        return self._account_equity_observation()[0]
+
+    def _account_equity_observation(self) -> tuple[float | None, str, str]:
         config = getattr(self, "_config", None)
         sizing = getattr(config, "sizing", None) if config is not None else None
         fallback = (
@@ -1519,14 +1789,32 @@ class ChanBspStrategy(CtaTemplate):
         )
         main_engine = getattr(getattr(self, "cta_engine", None), "main_engine", None)
         if main_engine is None:
-            return fallback
+            return fallback, "config_fallback", "oms_all_accounts"
         try:
             oms = main_engine.get_engine("oms")
             accounts = oms.get_all_accounts() if oms is not None else []
             balances = [float(account.balance) for account in accounts]
-            return sum(balances) if balances else fallback
+            if balances:
+                value = sum(balances)
+                if math.isfinite(value) and value > 0:
+                    return value, "oms_balance", "oms_all_accounts"
+                return None, "oms_balance", "oms_all_accounts"
+            return fallback, "config_fallback", "oms_all_accounts"
         except Exception:
-            return fallback
+            return fallback, "config_fallback", "oms_all_accounts"
+
+    def _advance_risk_session(self, timestamp: object, *, source: str):
+        context = self._risk_session_resolver.resolve(
+            timestamp,
+            source=source,
+        )
+        if self._risk is not None:
+            self._risk.advance_session(
+                context.session_key,
+                observed_at=context.observed_at,
+                source=context.source,
+            )
+        return context
 
     def _account_available_funds(self) -> float | None:
         fallback = self._account_equity()
@@ -1632,6 +1920,12 @@ class ChanBspStrategy(CtaTemplate):
         self.runtime_state_json = self._build_runtime_state_package(
             position_payload
         ).to_json()
+
+    def _sync_runtime_state_checkpoint(self) -> None:
+        """Build and synchronously ask vn.py to save the current variables."""
+        self._persist_runtime_state()
+        if bool(getattr(self, "trading", False)):
+            self.sync_data()
 
     def _build_runtime_state_package(
         self,
@@ -1767,6 +2061,33 @@ class ChanBspStrategy(CtaTemplate):
                 self.risk_status = "restore_error"
                 self._accumulate_recovery(f"risk_state_invalid:{type(exc).__name__}")
                 self.write_log(f"Risk state restore failed: {exc}")
+        if self._risk is not None:
+            reserved = self._risk.current_reserved_probe_intent()
+            if reserved is not None:
+                try:
+                    order_ids = [str(value) for value in reserved.get("order_ids", [])]
+                    active_ids = [
+                        order_id
+                        for order_id in order_ids
+                        if order_id in self._order_state.active
+                    ]
+                    if active_ids or not order_ids:
+                        self._pending_entry = PendingEntry(
+                            TradeIntent.from_runtime_snapshot(
+                                dict(reserved["intent_snapshot"])
+                            ),
+                            filled_volume=int(reserved.get("filled_volume", 0)),
+                            probe_intent_id=str(reserved["intent_id"]),
+                        )
+                    if not active_ids:
+                        self._accumulate_recovery(
+                            "probe_reservation_order_reconciliation_required"
+                        )
+                except Exception as exc:
+                    self._accumulate_recovery(
+                        f"probe_intent_invalid:{type(exc).__name__}"
+                    )
+                    self.write_log(f"Probe intent restore failed: {exc}")
         if self.position_state_json:
             try:
                 restored = _position_context_from_dict(
@@ -2024,6 +2345,7 @@ def _position_context_to_dict(context: PositionContext | None) -> dict:
         "entry_time": str(context.entry_time) if context.entry_time is not None else "",
         "entry_bar": context.entry_bar,
         "volume": context.volume,
+        "position_id": context.position_id,
         "entry_grade": context.entry_grade,
         "event_id": context.event_id,
         "signal_key": context.signal_key,
@@ -2036,6 +2358,14 @@ def _position_context_to_dict(context: PositionContext | None) -> dict:
         "zs_low": context.zs_low,
         "setup_invalidation_price": context.setup_invalidation_price,
         "execution_stop_price": context.execution_stop_price,
+        "setup_candidate_schema_version": context.setup_candidate_schema_version,
+        "setup_candidate_id": context.setup_candidate_id,
+        "setup_contract_epoch": context.setup_contract_epoch,
+        "setup_timeframe": context.setup_timeframe,
+        "setup_direction": context.setup_direction,
+        "setup_root_bi_idx": context.setup_root_bi_idx,
+        "setup_family": context.setup_family,
+        "setup_state": context.setup_state,
     }
 
 
@@ -2048,6 +2378,7 @@ def _position_context_from_dict(data: dict) -> PositionContext | None:
         entry_time=data.get("entry_time") or None,
         entry_bar=data.get("entry_bar"),
         volume=int(data["volume"]),
+        position_id=str(data.get("position_id", "")),
         entry_grade=str(data.get("entry_grade", "standard")),
         event_id=str(data.get("event_id", "")),
         signal_key=str(data.get("signal_key", "")),
@@ -2060,4 +2391,49 @@ def _position_context_from_dict(data: dict) -> PositionContext | None:
         zs_low=data.get("zs_low"),
         setup_invalidation_price=data.get("setup_invalidation_price"),
         execution_stop_price=data.get("execution_stop_price"),
+        setup_candidate_schema_version=str(
+            data.get("setup_candidate_schema_version", "")
+        ),
+        setup_candidate_id=str(data.get("setup_candidate_id", "")),
+        setup_contract_epoch=str(data.get("setup_contract_epoch", "")),
+        setup_timeframe=str(data.get("setup_timeframe", "")),
+        setup_direction=str(data.get("setup_direction", "")),
+        setup_root_bi_idx=data.get("setup_root_bi_idx"),
+        setup_family=str(data.get("setup_family", "")),
+        setup_state=str(data.get("setup_state", "observed_only")),
     )
+
+
+def _trade_fill_id(trade: TradeData) -> str:
+    value = str(
+        getattr(trade, "vt_tradeid", "")
+        or getattr(trade, "tradeid", "")
+        or ""
+    ).strip()
+    if not value:
+        raise ValueError("close fill is missing vt_tradeid/tradeid")
+    return value
+
+
+def _runtime_open_fill_id(trade: TradeData) -> str:
+    value = str(
+        getattr(trade, "vt_tradeid", "")
+        or getattr(trade, "tradeid", "")
+        or getattr(trade, "vt_orderid", "")
+        or getattr(trade, "orderid", "")
+        or ""
+    ).strip()
+    if not value:
+        raise ValueError("open_fill_identity_missing")
+    return value
+
+
+def _trade_order_id(trade: TradeData) -> str:
+    value = str(
+        getattr(trade, "vt_orderid", "")
+        or getattr(trade, "orderid", "")
+        or ""
+    ).strip()
+    if not value:
+        raise ValueError("close fill is missing vt_orderid/orderid")
+    return value

@@ -14,10 +14,12 @@
 
 from __future__ import annotations
 
+import json
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -31,7 +33,10 @@ from .execution import Fill, SimulatedExecutionEngine
 from .feed import prepare_ohlc_frame, row_to_klu
 from .multi_level import MultiLevelDecisionContext
 from .runtime_kernel import RuntimeDecisionKernel
-from .risk import RiskConfig, RiskManager
+from .risk import CloseFillRecord, RiskConfig, RiskManager
+from .position_transition import PositionTransition, decompose_position_transition
+from .option_d import probe_intent_identity
+from .risk_session import RbRiskSessionResolver
 from .strategy import StrategySignal
 from signal_core.models import (
     SignalDecision,
@@ -84,6 +89,7 @@ class BacktestResult:
     decision_trace: list[DecisionTraceRecord] = field(default_factory=list)
     decomposition_transitions: list[DecompositionTransition] = field(default_factory=list)
     multi_level_audit: list[MultiLevelDecisionContext] = field(default_factory=list)
+    execution_decisions: list[dict[str, Any]] = field(default_factory=list)
 
     def save(self, output_dir: Path | str) -> None:
         """保存标准化报告。"""
@@ -106,6 +112,11 @@ class BacktestResult:
                 "exit_rules": " + ".join(e.type for e in self.config.exits),
                 "fee_points": self.config.execution.fee_points,
                 "slippage_points": self.config.execution.slippage_points,
+                "risk_profile": self.config.risk.profile.value,
+                "risk_gate_modes": {
+                    gate: mode.value
+                    for gate, mode in self.config.risk.gate_modes().items()
+                },
             },
             metrics=metrics,
         )
@@ -130,6 +141,12 @@ class BacktestResult:
                 [context.to_dict() for context in self.multi_level_audit]
             ).to_csv(
                 output_dir / "multi_level_decisions.csv",
+                index=False,
+                encoding="utf-8-sig",
+            )
+        if self.execution_decisions:
+            pd.DataFrame(self.execution_decisions).to_csv(
+                output_dir / "execution_decisions.csv",
                 index=False,
                 encoding="utf-8-sig",
             )
@@ -210,13 +227,29 @@ def run_backtest(
     use_exit_rules = len(config.exits) > 0
 
     # ── 风控 + 执行 + 仓位 ──
-    risk = RiskManager(RiskConfig(
-        max_abs_position=config.risk.max_abs_position,
-        max_loss_points=config.risk.max_loss_points,
-        daily_loss_limit=config.risk.daily_loss_limit,
-        max_consecutive_losses=config.risk.max_consecutive_losses,
-        max_drawdown_pct=config.risk.max_drawdown_pct,
-    ))
+    risk = RiskManager(
+        RiskConfig(
+            max_abs_position=config.risk.max_abs_position,
+            max_loss_points=config.risk.max_loss_points,
+            daily_loss_limit=config.risk.daily_loss_limit,
+            max_consecutive_losses=config.risk.max_consecutive_losses,
+            max_drawdown_pct=config.risk.max_drawdown_pct,
+            require_session_key=config.risk.daily_loss_limit is not None,
+            profile=config.risk.profile,
+            max_loss_points_mode=config.risk.max_loss_points_mode,
+            daily_loss_limit_mode=config.risk.daily_loss_limit_mode,
+            max_consecutive_losses_mode=config.risk.max_consecutive_losses_mode,
+            max_drawdown_pct_mode=config.risk.max_drawdown_pct_mode,
+        ),
+        initial_equity=config.sizing.capital,
+        initial_equity_source="backtest_mark_to_market",
+        equity_scope="simulated_account",
+        max_drawdown_capability=(
+            "enabled"
+            if config.risk.max_drawdown_pct is not None
+            else "disabled_by_design"
+        ),
+    )
     execution = SimulatedExecutionEngine(
         fee_points=config.execution.fee_points,
         slippage_points=config.execution.slippage_points,
@@ -247,6 +280,7 @@ def run_backtest(
         decision_trace,
         decomposition_transitions,
         multi_level_audit,
+        execution_decisions,
     ) = _run_loop(
         bars=bars,
         chan=chan,
@@ -278,6 +312,7 @@ def run_backtest(
         decision_trace=decision_trace,
         decomposition_transitions=decomposition_transitions,
         multi_level_audit=multi_level_audit,
+        execution_decisions=execution_decisions,
     )
 
 
@@ -310,6 +345,7 @@ def _run_loop(
     list[DecisionTraceRecord],
     list[DecompositionTransition],
     list[MultiLevelDecisionContext],
+    list[dict[str, Any]],
 ]:
     """每根 K 线的主循环。"""
 
@@ -327,8 +363,228 @@ def _run_loop(
     _bar_events: list[SignalEvent] = []
     _event_ids: set[str] = set()
     _decisions: list[SignalDecision] = []
+    execution_decisions: list[dict[str, Any]] = []
+    setup_attempt_counts: dict[str, int] = {}
+    setup_prior_exit_reasons: dict[str, str] = {}
+    position_close_aggregates: dict[str, dict[str, Any]] = {}
+    probe_position_epochs: dict[str, str] = {}
     extractor = decision_kernel.extractor
     previous_active_symbol: str | None = None
+    risk_session_resolver = (
+        RbRiskSessionResolver()
+        if config.risk.daily_loss_limit is not None
+        else None
+    )
+
+    def _resolve_risk_session(
+        observed_at: object,
+        *,
+        source: str,
+        explicit_trading_day: object | None = None,
+    ):
+        if risk_session_resolver is None:
+            return None
+        return risk_session_resolver.resolve(
+            observed_at,
+            source=source,
+            explicit_trading_day=explicit_trading_day,
+        )
+
+    def _record_execution_decision(
+        *,
+        intent,
+        signal: StrategySignal,
+        row_number: int,
+        timestamp,
+        status: str,
+        rejection_stage: str = "",
+        rejection_reason: str = "",
+        risk_approved: bool | None = None,
+        risk_reason: str = "",
+        fill: Fill | None = None,
+        previous_position: int | None = None,
+        current_equity: float | None = None,
+        current_equity_points: float | None = None,
+        risk_decision=None,
+        transition: PositionTransition | None = None,
+    ) -> None:
+        before_position = (
+            execution.state.position
+            if previous_position is None
+            else previous_position
+        )
+        quantity_delta = signal.target_position - before_position
+        risk_state = risk.get_state()
+        option_d_state = risk_state.get("option_d", {}) or {}
+        execution_decisions.append(
+            {
+                "timestamp": timestamp,
+                "row_number": row_number,
+                "event_id": intent.event_id,
+                "signal_key": intent.signal_key,
+                "decision_id": intent.decision.decision_id,
+                "policy_id": intent.decision.policy_id,
+                "rule_accepted": intent.accepted,
+                "status": status,
+                "rejection_stage": rejection_stage,
+                "rejection_reason": rejection_reason,
+                "risk_approved": risk_approved,
+                "risk_reason": risk_reason,
+                "risk_profile": config.risk.profile.value,
+                "risk_gate_modes": json.dumps(
+                    {
+                        gate: mode.value
+                        for gate, mode in config.risk.gate_modes().items()
+                    },
+                    sort_keys=True,
+                ),
+                "risk_hard_failures": json.dumps(
+                    list(risk_decision.hard_failures) if risk_decision else []
+                ),
+                "risk_enforced_breaches": json.dumps(
+                    list(risk_decision.enforced_breaches) if risk_decision else []
+                ),
+                "risk_observed_breaches": json.dumps(
+                    list(risk_decision.observed_breaches) if risk_decision else []
+                ),
+                "risk_evaluated_gates": json.dumps(
+                    list(risk_decision.evaluated_gates) if risk_decision else []
+                ),
+                "transition_is_reversal": (
+                    transition.is_reversal if transition is not None else False
+                ),
+                "transition_has_close_leg": (
+                    transition.close_leg is not None if transition is not None else False
+                ),
+                "transition_has_open_leg": (
+                    transition.open_leg is not None if transition is not None else False
+                ),
+                "action": signal.action,
+                "direction": _signal_direction(signal),
+                "bsp_type": signal.bsp_type,
+                "active_symbol": signal.active_symbol or active_symbol_str or "",
+                "signal_price": signal.price,
+                "previous_position": before_position,
+                "target_position": signal.target_position,
+                "quantity_delta": quantity_delta,
+                "fill_price": fill.fill_price if fill is not None else None,
+                "fill_target_position": fill.target_position if fill is not None else None,
+                "fill_quantity_delta": fill.quantity_delta if fill is not None else None,
+                "fill_realized_points": fill.realized_points if fill is not None else None,
+                "fill_equity_points": fill.equity_points if fill is not None else None,
+                "current_equity": current_equity,
+                "current_account_equity": current_equity,
+                "current_equity_points": current_equity_points,
+                "risk_realized_points": risk_state.get("realized_points"),
+                "risk_daily_realized": risk_state.get("daily_realized"),
+                "risk_consecutive_losses": risk_state.get("consecutive_losses"),
+                "risk_peak_equity": risk_state.get("peak_equity"),
+                "risk_total_fills": risk_state.get("total_fills"),
+                "option_d_regime_state": option_d_state.get("regime_state", ""),
+                "option_d_audit_state": (
+                    "PROBE_PENDING_ENTRY"
+                    if option_d_state.get("regime_state") == "PROBE_AVAILABLE"
+                    and option_d_state.get("reserved_intent_id")
+                    else option_d_state.get("regime_state", "")
+                ),
+                "option_d_probe_epoch_id": option_d_state.get(
+                    "probe_epoch_id", ""
+                ),
+                "option_d_probe_position_id": option_d_state.get(
+                    "probe_position_id", ""
+                ),
+                "risk_session_key": risk_state.get("current_session_key"),
+                "risk_session_observed_at": risk_state.get("last_session_observed_at"),
+                "risk_session_source": risk_state.get("session_source"),
+                "equity_unit": "account_currency",
+                "equity_source": "backtest_mark_to_market",
+                "equity_scope": "simulated_account",
+                "max_drawdown_capability": (
+                    "enabled"
+                    if config.risk.max_drawdown_pct is not None
+                    else "disabled_by_design"
+                ),
+                **intent.audit_identity_fields(),
+            }
+        )
+
+    def _record_risk_close_fill(
+        *,
+        context: PositionContext,
+        pnl: float,
+        exit_bar: int,
+        exit_time: object,
+        exit_price: float,
+        remaining_quantity: int,
+        identity_suffix: str | None = None,
+    ) -> dict[str, str]:
+        close_identity = _backtest_close_identity_fields(
+            context.position_id,
+            exit_bar,
+            identity_suffix=identity_suffix,
+        )
+        risk_session = _resolve_risk_session(
+            exit_time,
+            source="backtest_fill",
+        )
+        risk.record_close_fill(
+            CloseFillRecord(
+                fill_id=close_identity["close_fill_id"],
+                order_id=close_identity["close_order_id"],
+                position_id=context.position_id,
+                pnl_raw_points=pnl,
+                risk_session_key=(
+                    risk_session.session_key if risk_session is not None else None
+                ),
+                observed_at=exit_time,
+                source="backtest_fill",
+                current_equity=_account_equity(config, execution, exit_price),
+                equity_source="backtest_mark_to_market",
+                equity_scope="simulated_account",
+                max_drawdown_capability=(
+                    "enabled"
+                    if config.risk.max_drawdown_pct is not None
+                    else "disabled_by_design"
+                ),
+            ),
+            remaining_quantity=remaining_quantity,
+        )
+        return close_identity
+
+    def _record_partial_close(
+        *,
+        context: PositionContext,
+        fill_volume: int,
+        exit_bar: int,
+        exit_price: float,
+        exit_time: object,
+    ) -> None:
+        position_id = context.position_id
+        aggregate = position_close_aggregates.setdefault(
+            position_id,
+            {
+                "raw_pnl_points": 0.0,
+                "close_fill_ids": [],
+                "closed_volume": 0,
+            },
+        )
+        pnl = context.pnl_points(
+            exit_price=exit_price,
+            fee_points=fee_points,
+            volume=fill_volume,
+        )
+        close_identity = _record_risk_close_fill(
+            context=context,
+            pnl=pnl,
+            exit_bar=exit_bar,
+            exit_time=exit_time,
+            exit_price=exit_price,
+            remaining_quantity=context.volume - fill_volume,
+            identity_suffix=f"partial-{len(aggregate['close_fill_ids']) + 1}",
+        )
+        aggregate["raw_pnl_points"] += pnl
+        aggregate["close_fill_ids"].append(close_identity["close_fill_id"])
+        aggregate["closed_volume"] += fill_volume
 
     def _close_trade(
         exit_bar: int, exit_price: float, exit_time,
@@ -338,23 +594,62 @@ def _run_loop(
         if position_context is None:
             return
         entry_bar = position_context.entry_bar
-        pnl = position_context.pnl_points(
+        final_fill_pnl = position_context.pnl_points(
             exit_price=exit_price,
             fee_points=fee_points,
         )
+        setup_candidate_id = position_context.setup_candidate_id
+        attempt_sequence = setup_attempt_counts.get(setup_candidate_id, 0) + 1
+        prior_exit_reason = setup_prior_exit_reasons.get(setup_candidate_id)
+        position_id = position_context.position_id
+        aggregate = position_close_aggregates.pop(
+            position_id,
+            {
+                "raw_pnl_points": 0.0,
+                "close_fill_ids": [],
+                "closed_volume": 0,
+            },
+        )
+        pnl = float(aggregate["raw_pnl_points"]) + final_fill_pnl
+        close_identity = _record_risk_close_fill(
+            context=position_context,
+            pnl=final_fill_pnl,
+            exit_bar=exit_bar,
+            exit_time=exit_time,
+            exit_price=exit_price,
+            remaining_quantity=0,
+        )
+        close_fill_ids = [
+            *aggregate["close_fill_ids"],
+            close_identity["close_fill_id"],
+        ]
         trade = {
             "entry_bar": entry_bar,
             "entry_price": position_context.entry_price,
             "entry_time": position_context.entry_time,
             "direction": position_context.direction.value,
-            "lots": position_context.volume,
+            "lots": int(aggregate["closed_volume"]) + position_context.volume,
             "grade": position_context.entry_grade,
             "active_symbol": position_context.active_symbol or "",
             "event_id": position_context.event_id,
             "signal_key": position_context.signal_key,
             "decision_id": position_context.decision_id,
+            **close_identity,
+            "close_fill_ids": json.dumps(close_fill_ids),
             "setup_invalidation_price": position_context.setup_invalidation_price,
             "execution_stop_price": position_context.execution_stop_price,
+            "setup_candidate_schema_version": position_context.setup_candidate_schema_version,
+            "setup_candidate_id": setup_candidate_id,
+            "setup_contract_epoch": position_context.setup_contract_epoch,
+            "setup_timeframe": position_context.setup_timeframe,
+            "setup_direction": position_context.setup_direction,
+            "setup_root_bi_idx": position_context.setup_root_bi_idx,
+            "setup_family": position_context.setup_family,
+            "setup_state": position_context.setup_state,
+            "attempt_sequence": attempt_sequence,
+            "prior_exit_reason": prior_exit_reason,
+            "is_option_d_probe": position_id in probe_position_epochs,
+            "option_d_probe_epoch_id": probe_position_epochs.pop(position_id, ""),
             "exit_bar": exit_bar, "exit_price": exit_price,
             "exit_time": exit_time,
             "hold_bars": exit_bar - (entry_bar if entry_bar is not None else exit_bar),
@@ -362,11 +657,12 @@ def _run_loop(
             "exit_reason": reason, "exit_rule": rule_id,
         }
         trades.append(trade)
-        # 通知风控系统
-        risk.on_fill(
-            pnl_points=round(pnl, 1),
-            fill_time=exit_time,
-            current_equity=execution.mark_to_market(exit_price),
+        setup_attempt_counts[setup_candidate_id] = attempt_sequence
+        setup_prior_exit_reasons[setup_candidate_id] = reason
+        risk.finalize_position(
+            position_id,
+            finalized_at=exit_time,
+            reason=reason,
         )
         position_context = None
 
@@ -442,6 +738,11 @@ def _run_loop(
                             "avg_price": None,
                             "realized_points": execution.state.realized_points,
                             "equity_points": execution.mark_to_market(rollover_price),
+                            "account_equity": _account_equity(
+                                config,
+                                execution,
+                                rollover_price,
+                            ),
                             "exit_reason": "contract_rollover",
                         }
                     )
@@ -455,6 +756,18 @@ def _run_loop(
         if config.production.enabled and active_symbol_str is not None:
             extractor.contract = active_symbol_str
 
+        current_risk_session = _resolve_risk_session(
+            timestamp,
+            source="backtest_bar",
+            explicit_trading_day=row.get("trading_day"),
+        )
+        if current_risk_session is not None:
+            risk.advance_session(
+                current_risk_session.session_key,
+                observed_at=current_risk_session.observed_at,
+                source=current_risk_session.source,
+            )
+
         klu = row_to_klu(row, kl_type=kl_type)
         chan.trigger_load({kl_type: [klu]})
         adjusted_price = float(row["close"])
@@ -466,10 +779,17 @@ def _run_loop(
             lv_idx=0,
         )
 
-        equity_cash = (
-            config.sizing.capital
-            + execution.mark_to_market(price)
-            * config.execution.contract_multiplier
+        equity_points = execution.mark_to_market(price)
+        equity_cash = _account_equity(config, execution, price)
+        risk.observe_equity(
+            equity_cash,
+            source="backtest_mark_to_market",
+            scope="simulated_account",
+            max_drawdown_capability=(
+                "enabled"
+                if config.risk.max_drawdown_pct is not None
+                else "disabled_by_design"
+            ),
         )
         used_margin = (
             abs(execution.state.position)
@@ -497,6 +817,28 @@ def _run_loop(
                 available_funds=available_funds,
                 atr=_finite_or_none(atr_values.iloc[row_number]),
                 price_adjustment=price_adjustment,
+                risk_session_key=(
+                    current_risk_session.session_key
+                    if current_risk_session is not None
+                    else None
+                ),
+                risk_session_observed_at=(
+                    current_risk_session.observed_at
+                    if current_risk_session is not None
+                    else None
+                ),
+                risk_session_source=(
+                    current_risk_session.source
+                    if current_risk_session is not None
+                    else ""
+                ),
+                equity_source="backtest_mark_to_market",
+                equity_scope="simulated_account",
+                max_drawdown_capability=(
+                    "enabled"
+                    if config.risk.max_drawdown_pct is not None
+                    else "disabled_by_design"
+                ),
             )
             if evaluated is not None:
                 _decisions.append(evaluated.decision)
@@ -567,11 +909,36 @@ def _run_loop(
                 })
 
         # ── 2. 仅在样本外决策窗口内执行新入场/反转 ──
-        if exit_signal is None and in_decision_window:
+        if exit_signal is not None and evaluated is not None and evaluated.accepted:
+            _record_execution_decision(
+                intent=evaluated,
+                signal=evaluated.signal,
+                row_number=row_number,
+                timestamp=timestamp,
+                status="blocked_by_exit_priority",
+                rejection_stage="exit_priority",
+                rejection_reason=exit_signal.reason_code,
+                current_equity=equity_cash,
+                current_equity_points=equity_points,
+            )
+        elif not in_decision_window and evaluated is not None and evaluated.accepted:
+            _record_execution_decision(
+                intent=evaluated,
+                signal=evaluated.signal,
+                row_number=row_number,
+                timestamp=timestamp,
+                status="outside_decision_window",
+                rejection_stage="decision_window",
+                rejection_reason="outside_decision_window",
+                current_equity=equity_cash,
+                current_equity_points=equity_points,
+            )
+        elif in_decision_window:
             graded = evaluated if evaluated is not None and evaluated.accepted else None
             signal = graded.signal if graded is not None else None
 
             if signal is not None:
+                original_signal = signal
                 # ── 0. 过滤器检查 (DC + OBV + Volume) ──
                 if filter_ctx is not None and use_filters:
                     action = signal.action
@@ -580,42 +947,236 @@ def _run_loop(
                         from .filters import FilterPipeline
                         pipeline = FilterPipeline()
                         if not pipeline.check_long(filter_ctx, row_number):
+                            _record_execution_decision(
+                                intent=graded,
+                                signal=original_signal,
+                                row_number=row_number,
+                                timestamp=timestamp,
+                                status="filter_rejected",
+                                rejection_stage="filter",
+                                rejection_reason="long_filter_rejected",
+                                current_equity=equity_cash,
+                                current_equity_points=equity_points,
+                            )
                             signal = None  # 过滤掉做多信号
                     elif action in ("open_short", "reverse_long_to_short"):
                         from .filters import FilterPipeline
                         pipeline = FilterPipeline()
                         if not pipeline.check_short(filter_ctx, row_number):
+                            _record_execution_decision(
+                                intent=graded,
+                                signal=original_signal,
+                                row_number=row_number,
+                                timestamp=timestamp,
+                                status="filter_rejected",
+                                rejection_stage="filter",
+                                rejection_reason="short_filter_rejected",
+                                current_equity=equity_cash,
+                                current_equity_points=equity_points,
+                            )
                             signal = None  # 过滤掉做空信号
 
                 if signal is not None:
-                    # 风控审批 + 执行
-                    decision = risk.approve(
-                        signal,
-                        current_equity=execution.mark_to_market(price),
+                    previous_position = execution.state.position
+                    transition = decompose_position_transition(
+                        previous_position,
+                        signal.target_position,
                     )
-                    if decision.approved:
-                        previous_position = execution.state.position
-                        fill = execution.execute(signal)
-                        closed_existing = previous_position != 0 and signal.action in (
-                            "close_long", "close_short",
-                            "reverse_long_to_short", "reverse_short_to_long",
+                    close_fill = None
+                    if transition.close_leg is not None:
+                        close_signal = replace(
+                            signal,
+                            action=(
+                                "close_long"
+                                if previous_position > 0
+                                else "close_short"
+                            ),
+                            target_position=transition.close_leg.target_position,
                         )
-                        if fill is not None and closed_existing:
+                        close_fill = execution.execute(close_signal)
+                        if transition.close_leg.target_position == 0:
+                            close_price = (
+                                close_fill.fill_price
+                                if close_fill is not None
+                                else signal.price
+                            )
                             _close_trade(
-                                exit_bar=row_number, exit_price=fill.fill_price,
-                                exit_time=timestamp, reason="strategy_reverse",
-                                rule_id="strategy_reversal",
+                                exit_bar=row_number,
+                                exit_price=close_price,
+                                exit_time=timestamp,
+                                reason=(
+                                    "strategy_reverse"
+                                    if transition.is_reversal
+                                    else "strategy_close"
+                                ),
+                                rule_id=(
+                                    "strategy_reversal"
+                                    if transition.is_reversal
+                                    else "strategy_close"
+                                ),
                             )
                             exit_manager.on_close()
-                        if fill is not None and fill.target_position != 0:
-                            position_context = graded.position_from_fill(
-                                fill_price=fill.fill_price,
-                                fill_volume=abs(fill.target_position),
-                                fill_time=timestamp,
-                                entry_bar=row_number,
-                                active_symbol=active_symbol_str,
+                        elif position_context is not None:
+                            partial_price = (
+                                close_fill.fill_price
+                                if close_fill is not None
+                                else signal.price
                             )
-                            exit_manager.on_position_opened(position_context)
+                            _record_partial_close(
+                                context=position_context,
+                                fill_volume=transition.close_leg.quantity,
+                                exit_bar=row_number,
+                                exit_price=partial_price,
+                                exit_time=timestamp,
+                            )
+                            position_context = position_context.reduce_volume(
+                                transition.close_leg.quantity
+                            )
+                            if position_context is not None:
+                                exit_manager.on_position_updated(position_context)
+
+                    post_close_equity_points = execution.mark_to_market(price)
+                    post_close_equity = _account_equity(config, execution, price)
+                    approval_signal = (
+                        replace(
+                            signal,
+                            action=(
+                                "open_long"
+                                if signal.target_position > 0
+                                else "open_short"
+                            ),
+                        )
+                        if transition.open_leg is not None
+                        else signal
+                    )
+                    decision = risk.approve(
+                        approval_signal,
+                        current_equity=post_close_equity,
+                        before_position=(
+                            transition.open_leg.before_position
+                            if transition.open_leg is not None
+                            else previous_position
+                        ),
+                    )
+                    if not decision.approved:
+                        _record_execution_decision(
+                            intent=graded,
+                            signal=signal,
+                            row_number=row_number,
+                            timestamp=timestamp,
+                            status="risk_rejected",
+                            rejection_stage="risk",
+                            rejection_reason=decision.reason,
+                            risk_approved=False,
+                            risk_reason=decision.reason,
+                            previous_position=previous_position,
+                            current_equity=post_close_equity,
+                            current_equity_points=post_close_equity_points,
+                            risk_decision=decision,
+                            transition=transition,
+                        )
+                    else:
+                        probe_intent_id = ""
+                        probe_epoch_id = ""
+                        if (
+                            transition.open_leg is not None
+                            and risk.option_d_probe_available
+                        ):
+                            open_order_intent = graded.with_signal(
+                                approval_signal
+                            ).for_open_leg(transition.open_leg.quantity)
+                            open_order_signal = open_order_intent.signal
+                            option_state = risk.get_state()["option_d"]
+                            probe_epoch_id = str(option_state["probe_epoch_id"])
+                            probe_intent_id = probe_intent_identity(
+                                probe_epoch_id,
+                                graded.event_id,
+                            )
+                            risk.reserve_probe_intent(
+                                intent_id=probe_intent_id,
+                                decision_id=graded.decision.decision_id,
+                                event_id=graded.event_id,
+                                target_position=open_order_signal.target_position,
+                                planned_volume=transition.open_leg.quantity,
+                                intent_snapshot=open_order_intent.to_runtime_snapshot(),
+                            )
+                        fill = (
+                            execution.execute(approval_signal)
+                            if transition.open_leg is not None
+                            else close_fill
+                        )
+                        if fill is None:
+                            if probe_intent_id:
+                                risk.release_probe_reservation(probe_intent_id)
+                            _record_execution_decision(
+                                intent=graded,
+                                signal=signal,
+                                row_number=row_number,
+                                timestamp=timestamp,
+                                status="no_position_change",
+                                rejection_stage="execution",
+                                rejection_reason="quantity_delta_zero",
+                                risk_approved=True,
+                                risk_reason=decision.reason,
+                                previous_position=previous_position,
+                                current_equity=post_close_equity,
+                                current_equity_points=post_close_equity_points,
+                                risk_decision=decision,
+                                transition=transition,
+                            )
+                        else:
+                            if transition.open_leg is not None and fill.target_position != 0:
+                                fill_volume = abs(fill.quantity_delta)
+                                if position_context is None:
+                                    position_context = graded.position_from_fill(
+                                        fill_price=fill.fill_price,
+                                        fill_volume=fill_volume,
+                                        fill_time=timestamp,
+                                        entry_bar=row_number,
+                                        active_symbol=active_symbol_str,
+                                    )
+                                    exit_manager.on_position_opened(position_context)
+                                else:
+                                    position_context = position_context.merge_open_fill(
+                                        fill_price=fill.fill_price,
+                                        fill_volume=fill_volume,
+                                        fill_time=timestamp,
+                                    )
+                                    exit_manager.on_position_updated(position_context)
+                                if probe_intent_id:
+                                    probe_order_id = f"backtest-open-{position_context.position_id}"
+                                    risk.bind_probe_orders(
+                                        probe_intent_id,
+                                        [probe_order_id],
+                                    )
+                                    risk.record_probe_open_fill(
+                                        intent_id=probe_intent_id,
+                                        position_id=position_context.position_id,
+                                        fill_volume=fill_volume,
+                                        order_id=probe_order_id,
+                                    )
+                                    probe_position_epochs[
+                                        position_context.position_id
+                                    ] = probe_epoch_id
+                            _record_execution_decision(
+                                intent=graded,
+                                signal=signal,
+                                row_number=row_number,
+                                timestamp=timestamp,
+                                status=(
+                                    "executed_reversal"
+                                    if transition.is_reversal
+                                    else _executed_status(previous_position, fill)
+                                ),
+                                risk_approved=True,
+                                risk_reason=decision.reason,
+                                fill=fill,
+                                previous_position=previous_position,
+                                current_equity=post_close_equity,
+                                current_equity_points=post_close_equity_points,
+                                risk_decision=decision,
+                                transition=transition,
+                            )
 
         # ── 3. 记录 bar-level 快照 ──
         records.append({
@@ -627,6 +1188,8 @@ def _run_loop(
             "avg_price": execution.state.avg_price,
             "realized_points": execution.state.realized_points,
             "equity_points": execution.mark_to_market(price),
+            "account_equity": _account_equity(config, execution, price),
+            "risk_session_key": risk.get_state().get("current_session_key"),
             "exit_reason": exit_signal.reason_code if exit_signal else None,
             "decomposition_id": (
                 decomposition.decomposition_id if decomposition else None
@@ -690,6 +1253,7 @@ def _run_loop(
                 "avg_price": execution.state.avg_price,
                 "realized_points": execution.state.realized_points,
                 "equity_points": execution.mark_to_market(exit_price),
+                "account_equity": _account_equity(config, execution, exit_price),
                 "exit_reason": "end_of_data",
             }
         )
@@ -704,6 +1268,7 @@ def _run_loop(
         list(decision_kernel.decision_trace),
         list(decision_kernel.decomposition_transitions),
         list(decision_kernel.multi_level_audit),
+        execution_decisions,
     )
 
 
@@ -775,6 +1340,25 @@ def _finite_or_none(value: object) -> float | None:
     return float(value)
 
 
+def _backtest_close_identity_fields(
+    position_id: str,
+    exit_bar: int,
+    *,
+    identity_suffix: str | None = None,
+) -> dict[str, str]:
+    normalized_position_id = str(position_id).strip()
+    if not normalized_position_id:
+        raise ValueError("position_id is required for backtest close identity")
+    suffix = f"{normalized_position_id}:{int(exit_bar)}"
+    if identity_suffix:
+        suffix = f"{suffix}:{identity_suffix}"
+    return {
+        "position_id": normalized_position_id,
+        "close_fill_id": f"backtest-fill:{suffix}",
+        "close_order_id": f"backtest-order:{suffix}",
+    }
+
+
 def _execution_ohlc(
     row: pd.Series,
     config: StrategyConfig,
@@ -809,8 +1393,38 @@ def _in_decision_window(
     value = pd.Timestamp(timestamp)
     return not (
         (start is not None and value < pd.Timestamp(start))
-        or (end is not None and value > pd.Timestamp(end))
+        or (end is not None and value >= pd.Timestamp(end))
     )
+
+
+def _signal_direction(signal: StrategySignal) -> str:
+    if signal.target_position > 0:
+        return "long"
+    if signal.target_position < 0:
+        return "short"
+    return "flat"
+
+
+def _account_equity(
+    config: StrategyConfig,
+    execution: SimulatedExecutionEngine,
+    mark_price: float,
+) -> float:
+    """Convert point PnL into absolute account equity in currency units."""
+    return float(config.sizing.capital) + (
+        execution.mark_to_market(mark_price)
+        * float(config.execution.contract_multiplier)
+    )
+
+
+def _executed_status(previous_position: int, fill: Fill) -> str:
+    if fill.target_position == 0:
+        return "executed_close"
+    if previous_position == 0:
+        return "executed_open"
+    if previous_position * fill.target_position < 0:
+        return "executed_reversal"
+    return "executed_position_adjustment"
 
 
 def _is_confirmed_opposite(intent, current_position: int) -> bool:

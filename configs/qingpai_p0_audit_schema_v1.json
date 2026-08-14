@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.chan.py/schemas/qingpai-p0-audit-v1.json",
+  "title": "Qingpai P0 audit records",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "decision"],
+  "properties": {
+    "schema_version": {
+      "const": "qingpai-p0-audit-v1"
+    },
+    "decision": {
+      "$ref": "#/$defs/decisionAudit"
+    },
+    "execution": {
+      "$ref": "#/$defs/executionAudit"
+    },
+    "trade": {
+      "$ref": "#/$defs/tradeAudit"
+    },
+    "risk_state": {
+      "$ref": "#/$defs/riskState"
+    }
+  },
+  "$defs": {
+    "rawSignalIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bi_idx", "klu_idx", "bsp_type", "is_buy"],
+      "properties": {
+        "bi_idx": {"type": "integer"},
+        "klu_idx": {"type": "integer"},
+        "bsp_type": {"type": "string", "minLength": 1},
+        "is_buy": {"type": "boolean"}
+      }
+    },
+    "setupCandidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "candidate_id",
+        "contract_epoch",
+        "timeframe",
+        "direction",
+        "root_bi_idx",
+        "setup_family"
+      ],
+      "properties": {
+        "schema_version": {"const": "setup-candidate-v1"},
+        "candidate_id": {"type": "string", "minLength": 1},
+        "contract_epoch": {"type": "string", "minLength": 1},
+        "timeframe": {"type": "string", "minLength": 1},
+        "direction": {"enum": ["long", "short"]},
+        "root_bi_idx": {"type": "integer", "minimum": 0},
+        "setup_family": {"type": "string", "minLength": 1}
+      }
+    },
+    "riskSession": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_key", "observed_at", "source"],
+      "properties": {
+        "session_key": {"type": "string", "format": "date"},
+        "observed_at": {"type": "string", "format": "date-time"},
+        "source": {"type": "string", "minLength": 1},
+        "market_session": {"type": ["string", "null"]},
+        "calendar_id": {"type": ["string", "null"]}
+      }
+    },
+    "equityObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["value", "unit", "source", "scope", "max_drawdown_capability"],
+      "properties": {
+        "value": {"type": "number"},
+        "unit": {"const": "account_currency"},
+        "source": {"enum": ["backtest_mark_to_market", "oms_balance", "config_fallback"]},
+        "scope": {"enum": ["simulated_account", "oms_all_accounts"]},
+        "max_drawdown_capability": {"enum": ["enabled", "disabled_by_design"]}
+      }
+    },
+    "decisionAudit": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["event_id", "signal_key", "raw_signal_identity", "setup_candidate"],
+      "properties": {
+        "event_id": {"type": "string"},
+        "signal_key": {"type": "string"},
+        "raw_signal_identity": {"$ref": "#/$defs/rawSignalIdentity"},
+        "setup_candidate": {"$ref": "#/$defs/setupCandidate"},
+        "setup_state": {"enum": ["observed_only", "pending", "eligible", "consumed", "expired", "invalidated"]},
+        "risk_session": {"$ref": "#/$defs/riskSession"}
+      }
+    },
+    "executionAudit": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["event_id", "status", "risk_session", "risk_state"],
+      "properties": {
+        "event_id": {"type": "string"},
+        "status": {"type": "string"},
+        "setup_candidate": {"$ref": "#/$defs/setupCandidate"},
+        "risk_session": {"$ref": "#/$defs/riskSession"},
+        "risk_state": {"$ref": "#/$defs/riskState"}
+      }
+    },
+    "tradeAudit": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["signal_key", "attempt_sequence"],
+      "properties": {
+        "signal_key": {"type": "string"},
+        "setup_candidate": {"$ref": "#/$defs/setupCandidate"},
+        "attempt_sequence": {"type": "integer", "minimum": 1},
+        "prior_exit_reason": {"type": ["string", "null"]}
+      }
+    },
+    "riskState": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["daily_realized", "consecutive_losses", "peak_equity"],
+      "properties": {
+        "current_session_key": {"type": ["string", "null"], "format": "date"},
+        "last_session_observed_at": {"type": ["string", "null"], "format": "date-time"},
+        "session_source": {"type": ["string", "null"]},
+        "daily_realized": {"type": "number"},
+        "realized_points": {"type": "number"},
+        "consecutive_losses": {"type": "integer", "minimum": 0},
+        "peak_equity": {"type": "number"},
+        "equity_observation": {"$ref": "#/$defs/equityObservation"}
+      }
+    }
+  }
+}

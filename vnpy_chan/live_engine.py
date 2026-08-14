@@ -1,4 +1,4 @@
-"""实盘交易引擎 —— 从 vnpy bar 驱动完整策略管线。
+"""预发布事件引擎 —— 从 vn.py bar 驱动完整策略管线。
 
 与回测 _run_loop 共享同一套:
   - GradedChanStrategy (入场信号 + grade 过滤)
@@ -11,7 +11,7 @@
 状态机:
   idle → waiting_signal → pending_open → in_position → closing → idle
 
-用法:
+研究/联调用法（不得作为当前生产宿主）:
     engine = LiveTradingEngine(main_engine, event_engine)
     engine.init_strategy(config)
     engine.start()  # 订阅 EVENT_BAR
@@ -19,8 +19,9 @@
 
 from __future__ import annotations
 
+import math
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -55,9 +56,13 @@ from chan_futures.config_loader import (
     make_runtime_decision_kernel,
 )
 from chan_futures.graded_strategy import GradedChanStrategy
-from chan_futures.risk import RiskConfig, RiskManager
+from chan_futures.risk import CloseFillRecord, RiskConfig, RiskManager
+from chan_futures.risk_session import RbRiskSessionResolver
+from chan_futures.position_transition import decompose_position_transition
+from chan_futures.option_d import probe_intent_identity
 from chan_futures.trade_intent import DecisionTraceRecord, PendingEntry, TradeIntent
-from strategy_policy.position import PositionContext
+from data_foundation import RBTradingCalendar
+from strategy_policy.position import PositionContext, position_id_from_open_fill_id
 
 from .converter import bar_to_klu, window_to_kl_type
 from .snapshot import ChanSnapshotManager
@@ -105,7 +110,11 @@ class _SignalContext:
 
 
 class LiveTradingEngine(BaseEngine):
-    """有状态的实盘缠论交易引擎。
+    """预发布的有状态缠论事件引擎，不是当前生产下单宿主。
+
+    当前生产宿主是 ``ChanBspStrategy``。本类保留信号接线和订单生命周期
+    对照实现；在补齐与 CTA 相同的持久化、OMS 对账和恢复门禁前，不得用于
+    生产下单。
 
     每根 bar 的决策流程:
       1. SnapshotManager 更新 CChan
@@ -127,6 +136,8 @@ class LiveTradingEngine(BaseEngine):
         self._risk: RiskManager | None = None
         self._journal: SignalJournal | None = None
         self._tracker: SignalLifecycleTracker | None = None
+        self._calendar = RBTradingCalendar.load_default()
+        self._risk_session_resolver = RbRiskSessionResolver(self._calendar)
 
         # ── 状态 ──
         self._position: PositionContext | None = None
@@ -137,6 +148,7 @@ class LiveTradingEngine(BaseEngine):
         # ── 订单追踪 ──
         self._pending_order_ids: set[str] = set()
         self._pending_entries: dict[str, PendingEntry] = {}
+        self._terminal_reported_traded: dict[str, int] = {}
         self._pending_reversal: PendingEntry | None = None
         self._current_order_ref: str = ""
         self._previous_close: float | None = None
@@ -199,13 +211,28 @@ class LiveTradingEngine(BaseEngine):
         self._exit_manager = make_exit_manager(cfg)
 
         # ── RiskManager ──
-        self._risk = RiskManager(RiskConfig(
-            max_abs_position=cfg.risk.max_abs_position,
-            max_loss_points=cfg.risk.max_loss_points,
-            daily_loss_limit=cfg.risk.daily_loss_limit,
-            max_consecutive_losses=cfg.risk.max_consecutive_losses,
-            max_drawdown_pct=None,  # 实盘中由 vnpy 账户权益驱动
-        ))
+        initial_equity, equity_source, equity_scope = (
+            self._account_equity_observation()
+        )
+        self._risk = RiskManager(
+            RiskConfig(
+                max_abs_position=cfg.risk.max_abs_position,
+                max_loss_points=cfg.risk.max_loss_points,
+                daily_loss_limit=cfg.risk.daily_loss_limit,
+                max_consecutive_losses=cfg.risk.max_consecutive_losses,
+                max_drawdown_pct=None,
+                require_session_key=cfg.risk.daily_loss_limit is not None,
+                profile=cfg.risk.profile,
+                max_loss_points_mode=cfg.risk.max_loss_points_mode,
+                daily_loss_limit_mode=cfg.risk.daily_loss_limit_mode,
+                max_consecutive_losses_mode=cfg.risk.max_consecutive_losses_mode,
+                max_drawdown_pct_mode=cfg.risk.max_drawdown_pct_mode,
+            ),
+            initial_equity=initial_equity,
+            initial_equity_source=equity_source,
+            equity_scope=equity_scope,
+            max_drawdown_capability="disabled_by_design",
+        )
 
         # ── SignalJournal ──
         self._journal = SignalJournal(journal_dir, format="csv")
@@ -273,6 +300,18 @@ class LiveTradingEngine(BaseEngine):
         price = float(bar.close_price)
         atr = self._update_atr(bar)
         timestamp = bar.datetime if isinstance(bar.datetime, datetime) else pd.Timestamp(bar.datetime)
+        risk_session = None
+        equity_value, equity_source, equity_scope = (
+            self._account_equity_observation()
+        )
+        if self._risk is not None:
+            risk_session = self._advance_risk_session(timestamp, source="live_bar")
+            self._risk.observe_equity(
+                equity_value,
+                source=equity_source,
+                scope=equity_scope,
+                max_drawdown_capability="disabled_by_design",
+            )
         chan_snap = self._snapshot.current
         if chan_snap is None:
             return
@@ -295,9 +334,17 @@ class LiveTradingEngine(BaseEngine):
             timestamp=timestamp,
             active_symbol=bar.symbol,
             lv_idx=0,
-            account_equity=self._account_equity(),
+            account_equity=equity_value,
             available_funds=self._account_available_funds(),
             atr=atr,
+            risk_session_key=(risk_session.session_key if risk_session else None),
+            risk_session_observed_at=(
+                risk_session.observed_at if risk_session else None
+            ),
+            risk_session_source=(risk_session.source if risk_session else ""),
+            equity_source=equity_source,
+            equity_scope=equity_scope,
+            max_drawdown_capability="disabled_by_design",
         )
 
         # ── 2. 按统一优先级检查出场规则 ──
@@ -324,20 +371,23 @@ class LiveTradingEngine(BaseEngine):
                 return
 
             signal = intent.signal
-            if self._risk is not None:
-                risk_decision = self._risk.approve(signal)
-                if not risk_decision.approved:
-                    self._log(f"风控拒绝: {risk_decision.reason}")
-                    return
-
-            if self._position is None:
-                self._open_position(intent)
-            elif signal.target_position == 0:
-                self._pending_reversal = None
-                self._close_position(signal.price, "strategy_close", "策略平仓")
-            elif (current_position > 0) != (signal.target_position > 0):
+            transition = decompose_position_transition(
+                current_position,
+                signal.target_position,
+            )
+            if transition.is_reversal:
                 self._pending_reversal = PendingEntry(intent)
                 self._close_position(signal.price, "strategy_reverse", "策略反转")
+            elif transition.close_leg is not None:
+                self._pending_reversal = None
+                self._close_position(
+                    signal.price,
+                    "strategy_close",
+                    "策略平仓",
+                    volume=transition.close_leg.quantity,
+                )
+            elif transition.open_leg is not None:
+                self._approve_and_open_position(intent, before_position=current_position)
 
         # ── 3. 信号状态更新 (pending signals → confirmed/invalidated) ──
         self._update_pending_signals(timestamp)
@@ -373,9 +423,38 @@ class LiveTradingEngine(BaseEngine):
         if order.vt_orderid not in self._pending_order_ids:
             return
         self._log(f"订单状态: {order.vt_orderid} → {order.status.value}")
-        if order.status in {Status.CANCELLED, Status.REJECTED}:
-            self._pending_order_ids.discard(order.vt_orderid)
-            self._pending_entries.pop(order.vt_orderid, None)
+        pending = self._pending_entries.get(order.vt_orderid)
+        reported_fill_pending = bool(
+            pending is not None
+            and pending.probe_intent_id
+            and int(getattr(order, "traded", 0) or 0) > pending.filled_volume
+        )
+        is_terminal = not bool(order.is_active())
+        if is_terminal:
+            if (
+                pending is not None
+                and pending.probe_intent_id
+                and self._risk is not None
+            ):
+                self._risk.mark_probe_order_terminal(
+                    order.vt_orderid,
+                    has_reported_fill=int(getattr(order, "traded", 0) or 0) > 0,
+                )
+            if reported_fill_pending:
+                terminal_reported = getattr(
+                    self,
+                    "_terminal_reported_traded",
+                    None,
+                )
+                if terminal_reported is None:
+                    terminal_reported = {}
+                    self._terminal_reported_traded = terminal_reported
+                terminal_reported[order.vt_orderid] = int(
+                    getattr(order, "traded", 0) or 0
+                )
+            if not reported_fill_pending:
+                self._pending_order_ids.discard(order.vt_orderid)
+                self._pending_entries.pop(order.vt_orderid, None)
 
     def _on_trade(self, event: Event) -> None:
         trade: TradeData = event.data
@@ -384,6 +463,13 @@ class LiveTradingEngine(BaseEngine):
             and trade.vt_orderid not in self._pending_entries
         ):
             return
+        if trade.offset != Offset.OPEN:
+            try:
+                _trade_fill_id(trade)
+                _trade_order_id(trade)
+            except ValueError as exc:
+                self._log(f"拒绝无法审计的平仓成交: {exc}")
+                return
 
         # ── 开仓成交 → 记录持仓 ──
         if trade.offset == Offset.OPEN:
@@ -405,6 +491,9 @@ class LiveTradingEngine(BaseEngine):
                     fill_time=getattr(trade, "datetime", None) or datetime.now(),
                     entry_bar=self._bar_count,
                     active_symbol=getattr(trade, "symbol", None),
+                    position_id=position_id_from_open_fill_id(
+                        _runtime_open_fill_id(trade)
+                    ),
                 )
             else:
                 if self._position.direction != direction:
@@ -415,6 +504,13 @@ class LiveTradingEngine(BaseEngine):
                     fill_volume=fill_volume,
                     fill_time=getattr(trade, "datetime", None),
                 )
+            if pending.probe_intent_id and self._risk is not None:
+                self._risk.record_probe_open_fill(
+                    intent_id=pending.probe_intent_id,
+                    position_id=self._position.position_id,
+                    fill_volume=fill_volume,
+                    order_id=trade.vt_orderid,
+                )
             if opening_position:
                 self._exit_manager.on_position_opened(self._position)
             else:
@@ -423,30 +519,95 @@ class LiveTradingEngine(BaseEngine):
                 f"开仓成交: {direction.value} @ {trade.price} volume={fill_volume}"
             )
             pending = pending.apply_fill(fill_volume)
-            if pending.complete:
+            reported_target = getattr(
+                self,
+                "_terminal_reported_traded",
+                {},
+            ).get(
+                trade.vt_orderid,
+                0,
+            )
+            if pending.complete or (
+                reported_target > 0 and pending.filled_volume >= reported_target
+            ):
                 self._pending_order_ids.discard(trade.vt_orderid)
                 self._pending_entries.pop(trade.vt_orderid, None)
+                getattr(self, "_terminal_reported_traded", {}).pop(
+                    trade.vt_orderid,
+                    None,
+                )
             else:
                 self._pending_entries[trade.vt_orderid] = pending
 
         # ── 平仓成交 → 清理持仓 ──
         elif self._position is not None:
             fill_volume = int(trade.volume)
+            closing_position = self._position
+            if fill_volume < 1 or fill_volume > closing_position.volume:
+                raise ValueError(
+                    "invalid close fill volume: "
+                    f"fill={fill_volume}, position={closing_position.volume}"
+                )
             pnl = self._calc_pnl(float(trade.price), volume=fill_volume)
-            self._risk.on_fill(pnl_points=pnl, fill_time=datetime.now())
+            remaining_quantity = max(0, closing_position.volume - fill_volume)
+            fill_time = getattr(trade, "datetime", None) or datetime.now()
+            risk_session = self._risk_session_resolver.resolve(
+                fill_time,
+                source="live_fill",
+            )
+            equity_value, equity_source, equity_scope = (
+                self._account_equity_observation()
+            )
+            accepted = self._risk.record_close_fill(
+                CloseFillRecord(
+                    fill_id=_trade_fill_id(trade),
+                    order_id=_trade_order_id(trade),
+                    position_id=closing_position.position_id,
+                    pnl_raw_points=pnl,
+                    risk_session_key=risk_session.session_key,
+                    observed_at=fill_time,
+                    source="live_fill",
+                    current_equity=equity_value,
+                    equity_source=equity_source,
+                    equity_scope=equity_scope,
+                    max_drawdown_capability="disabled_by_design",
+                ),
+                remaining_quantity=remaining_quantity,
+            )
+            if not accepted:
+                self._log(f"忽略重复平仓成交: {_trade_fill_id(trade)}")
+                return
             self._log(
                 f"平仓成交: @ {trade.price} "
                 f"PnL={pnl:.0f} pts "
                 f"累计已实现={self._risk._realized_points:.0f} pts"
             )
-            self._position = self._position.reduce_volume(fill_volume)
+            self._position = closing_position.reduce_volume(fill_volume)
             if self._position is None:
+                self._risk.finalize_position(
+                    closing_position.position_id,
+                    finalized_at=fill_time,
+                    reason="live_close",
+                )
                 self._exit_manager.on_close()
                 self._pending_order_ids.discard(trade.vt_orderid)
                 pending_reversal = self._pending_reversal
                 self._pending_reversal = None
                 if pending_reversal is not None:
-                    self._open_position(pending_reversal.intent)
+                    option_state = (
+                        self._risk.get_state().get("option_d", {})
+                        if self._risk is not None
+                        else {}
+                    )
+                    if option_state.get("regime_state") == (
+                        "PAUSED_UNTIL_NEXT_SESSION"
+                    ):
+                        self._log("反手开仓腿被 Option D 暂停态取消")
+                    else:
+                        self._approve_and_open_position(
+                            pending_reversal.intent,
+                            before_position=0,
+                        )
             else:
                 self._exit_manager.on_position_updated(self._position)
 
@@ -457,6 +618,8 @@ class LiveTradingEngine(BaseEngine):
     def _open_position(
         self,
         intent: TradeIntent,
+        *,
+        probe_intent_id: str = "",
     ) -> None:
         """向 vnpy 发送开仓订单。"""
         signal = intent.signal
@@ -477,7 +640,14 @@ class LiveTradingEngine(BaseEngine):
             entries = getattr(self, "_pending_entries", None)
             if entries is None:
                 self._pending_entries = {}
-            self._pending_entries[vt_orderid] = PendingEntry(intent)
+            self._pending_entries[vt_orderid] = PendingEntry(
+                intent,
+                probe_intent_id=probe_intent_id,
+            )
+            if probe_intent_id and self._risk is not None:
+                self._risk.bind_probe_orders(probe_intent_id, [vt_orderid])
+        elif probe_intent_id and self._risk is not None:
+            self._risk.release_probe_reservation(probe_intent_id)
         self._last_accepted_grade = intent.grade
         self._last_event_id = intent.event_id
         self._log(
@@ -486,7 +656,64 @@ class LiveTradingEngine(BaseEngine):
             f"grade={intent.grade} bsp={intent.bsp_type}"
         )
 
-    def _close_position(self, price: float, reason: str, description: str) -> None:
+    def _approve_and_open_position(
+        self,
+        intent: TradeIntent,
+        *,
+        before_position: int,
+    ) -> None:
+        if self._risk is not None:
+            transition = decompose_position_transition(
+                before_position,
+                intent.signal.target_position,
+            )
+            if transition.open_leg is None:
+                return
+            equity_value, _, _ = self._account_equity_observation()
+            decision = self._risk.approve(
+                intent.signal,
+                current_equity=equity_value,
+                before_position=before_position,
+            )
+            if not decision.approved:
+                self._log(f"风控拒绝: {decision.reason}")
+                return
+        else:
+            transition = decompose_position_transition(
+                before_position,
+                intent.signal.target_position,
+            )
+            if transition.open_leg is None:
+                return
+        open_intent = intent.for_open_leg(transition.open_leg.quantity)
+        probe_intent_id = ""
+        if self._risk is not None and self._risk.option_d_probe_available:
+            option_state = self._risk.get_state()["option_d"]
+            probe_intent_id = probe_intent_identity(
+                option_state["probe_epoch_id"],
+                open_intent.event_id,
+            )
+            self._risk.reserve_probe_intent(
+                intent_id=probe_intent_id,
+                decision_id=open_intent.decision.decision_id,
+                event_id=open_intent.event_id,
+                target_position=open_intent.signal.target_position,
+                planned_volume=transition.open_leg.quantity,
+                intent_snapshot=open_intent.to_runtime_snapshot(),
+            )
+        self._open_position(
+            open_intent,
+            probe_intent_id=probe_intent_id,
+        )
+
+    def _close_position(
+        self,
+        price: float,
+        reason: str,
+        description: str,
+        *,
+        volume: int | None = None,
+    ) -> None:
         """向 vnpy 发送平仓订单。"""
         if self._position is None:
             return
@@ -497,13 +724,19 @@ class LiveTradingEngine(BaseEngine):
             else self._position.volume
         )
         order_price = self._execution_price(price, quantity_delta)
+        close_volume = self._position.volume if volume is None else int(volume)
+        if close_volume < 1 or close_volume > self._position.volume:
+            raise ValueError(
+                "invalid close volume: "
+                f"{close_volume} for position {self._position.volume}"
+            )
         order_req = OrderRequest(
             symbol=self._vt_symbol.split(".")[0] if "." in self._vt_symbol else self._vt_symbol,
             exchange=getattr(self, "_exchange", None) or Exchange.SHFE,
             direction=direction,
             type=OrderType.LIMIT,
             price=order_price,
-            volume=self._position.volume,
+            volume=close_volume,
             offset=Offset.CLOSE,
         )
         vt_orderid = self._send_order(order_req)
@@ -649,14 +882,35 @@ class LiveTradingEngine(BaseEngine):
         )
 
     def _account_equity(self) -> float | None:
+        return self._account_equity_observation()[0]
+
+    def _account_equity_observation(self) -> tuple[float | None, str, str]:
         fallback = self._config.sizing.capital if self._config else None
         try:
             oms = self.main_engine.get_engine("oms")
             accounts = oms.get_all_accounts() if oms is not None else []
             balances = [float(account.balance) for account in accounts]
-            return sum(balances) if balances else fallback
+            if balances:
+                value = sum(balances)
+                if math.isfinite(value) and value > 0:
+                    return value, "oms_balance", "oms_all_accounts"
+                return None, "oms_balance", "oms_all_accounts"
+            return fallback, "config_fallback", "oms_all_accounts"
         except Exception:
-            return fallback
+            return fallback, "config_fallback", "oms_all_accounts"
+
+    def _advance_risk_session(self, timestamp: object, *, source: str):
+        context = self._risk_session_resolver.resolve(
+            timestamp,
+            source=source,
+        )
+        if self._risk is not None:
+            self._risk.advance_session(
+                context.session_key,
+                observed_at=context.observed_at,
+                source=context.source,
+            )
+        return context
 
     def _account_available_funds(self) -> float | None:
         fallback = self._account_equity()
@@ -762,3 +1016,38 @@ def _vnpy_direction_from_target(target_position: int) -> Direction:
     if target_position < 0:
         return Direction.SHORT
     raise ValueError("开仓目标仓位不能为 0")
+
+
+def _trade_fill_id(trade: TradeData) -> str:
+    value = str(
+        getattr(trade, "vt_tradeid", "")
+        or getattr(trade, "tradeid", "")
+        or ""
+    ).strip()
+    if not value:
+        raise ValueError("close fill is missing vt_tradeid/tradeid")
+    return value
+
+
+def _runtime_open_fill_id(trade: TradeData) -> str:
+    value = str(
+        getattr(trade, "vt_tradeid", "")
+        or getattr(trade, "tradeid", "")
+        or getattr(trade, "vt_orderid", "")
+        or getattr(trade, "orderid", "")
+        or ""
+    ).strip()
+    if not value:
+        raise ValueError("open_fill_identity_missing")
+    return value
+
+
+def _trade_order_id(trade: TradeData) -> str:
+    value = str(
+        getattr(trade, "vt_orderid", "")
+        or getattr(trade, "orderid", "")
+        or ""
+    ).strip()
+    if not value:
+        raise ValueError("close fill is missing vt_orderid/orderid")
+    return value

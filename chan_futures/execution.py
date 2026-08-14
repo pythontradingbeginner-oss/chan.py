@@ -93,13 +93,28 @@ class SimulatedExecutionEngine:
         previous_avg = self.state.avg_price
         if previous_position != 0 and previous_avg is not None:
             if target_position == 0 or _sign(target_position) != _sign(previous_position):
-                self.state.realized_points += previous_position * (fill_price - previous_avg)
+                self.state.realized_points += previous_position * (
+                    fill_price - previous_avg
+                )
+            elif abs(target_position) < abs(previous_position):
+                closed_quantity = abs(previous_position) - abs(target_position)
+                self.state.realized_points += (
+                    _sign(previous_position)
+                    * closed_quantity
+                    * (fill_price - previous_avg)
+                )
 
         self.state.position = target_position
         if target_position == 0:
             self.state.avg_price = None
         elif previous_position == 0 or _sign(target_position) != _sign(previous_position):
             self.state.avg_price = fill_price
+        elif abs(target_position) > abs(previous_position) and previous_avg is not None:
+            added_quantity = abs(target_position) - abs(previous_position)
+            self.state.avg_price = (
+                previous_avg * abs(previous_position)
+                + fill_price * added_quantity
+            ) / abs(target_position)
 
 
 def _sign(value: int) -> int:

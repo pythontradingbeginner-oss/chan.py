@@ -1,0 +1,40 @@
+{
+  "evaluation_id": "qingpai_open005_option_d_evaluation_v1",
+  "as_of": "2026-08-13",
+  "status": "research_evaluation_complete_not_approved_for_production",
+  "contract_id": "qingpai_open005_machine_contract_v1",
+  "direct_control": "B1_CONSECUTIVE_LOSS_ABLATION",
+  "experimental_profile": "D_EXPERIMENT",
+  "config_path": "configs/rb_15m_qingpai_strict.yaml",
+  "config_sha256": "75dd9d813e6b5dc255db3eaaf5ad8cecdc874634319c95f90eeefd9ec6ffec9d",
+  "frame": {
+    "start": "2018-03-23 21:15:00+08:00",
+    "end": "2026-08-03 23:00:00+08:00",
+    "rows": 44826
+  },
+  "gate_modes_exact": true,
+  "structural_trace_exact": true,
+  "identity_replay_exact": true,
+  "folds_complete_without_window_end_of_data": true,
+  "continuous": {
+    "b1_trade_count": 63,
+    "d_trade_count": 60,
+    "b1_net_pnl_points": -442.0,
+    "d_net_pnl_points": -422.0,
+    "delta_net_pnl_points": 20.0,
+    "d_probe_trade_count": 5,
+    "d_additional_risk_rejections": 3
+  },
+  "fold_reset_oos": {
+    "b1_trade_count": 103,
+    "d_trade_count": 102,
+    "b1_net_pnl_points": 479.0,
+    "d_net_pnl_points": 478.0,
+    "delta_net_pnl_points": -1.0,
+    "d_probe_trade_count": 5,
+    "d_additional_risk_rejections": 1
+  },
+  "machine_artifact": "reports/open005_option_d/20260813_d_vs_b1_final/option_d_evaluation.json",
+  "implementation_report": "docs/qingpai_open005_option_d_implementation_report_20260813.md",
+  "production_adoption": "not_approved"
+}

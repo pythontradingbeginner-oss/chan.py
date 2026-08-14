@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.chan.py/schemas/qingpai-open005-risk-runtime-v2.json",
+  "title": "Qingpai OPEN-005 Option D risk runtime state",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "processed_close_fill_ids", "active_position_aggregators",
+    "finalized_position_ids", "finalized_position_results",
+    "true_consecutive_losses", "realized_points", "daily_realized",
+    "current_risk_session", "last_session_observed_at", "session_source",
+    "peak_equity", "equity_source", "equity_scope",
+    "has_authoritative_oms_equity", "option_d", "reserved_intents"
+  ],
+  "properties": {
+    "schema_version": {"const": "open005-risk-runtime-v2"},
+    "processed_close_fill_ids": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+    "active_position_aggregators": {"type": "object", "additionalProperties": {"$ref": "#/$defs/positionAggregator"}},
+    "finalized_position_ids": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+    "finalized_position_results": {"type": "object", "additionalProperties": {"$ref": "#/$defs/finalizedPositionResult"}},
+    "true_consecutive_losses": {"type": "integer", "minimum": 0},
+    "realized_points": {"type": "number"},
+    "daily_realized": {"type": "number"},
+    "total_fills": {"type": "integer", "minimum": 0},
+    "consecutive_losses": {"type": "integer", "minimum": 0},
+    "legacy_fill_sequence": {"type": "integer", "minimum": 0},
+    "current_risk_session": {"type": ["string", "null"], "format": "date"},
+    "current_session_key": {"type": ["string", "null"], "format": "date"},
+    "current_date": {"type": ["string", "null"], "format": "date"},
+    "last_session_observed_at": {"type": ["string", "null"], "format": "date-time"},
+    "session_source": {"type": ["string", "null"]},
+    "peak_equity": {"type": "number"},
+    "equity_unit": {"type": "string"},
+    "equity_source": {"type": ["string", "null"]},
+    "equity_scope": {"type": ["string", "null"]},
+    "max_drawdown_capability": {"type": ["string", "null"]},
+    "has_authoritative_oms_equity": {"type": "boolean"},
+    "option_d": {"$ref": "#/$defs/optionDState"},
+    "reserved_intents": {"type": "object", "additionalProperties": {"$ref": "#/$defs/reservedProbeIntent"}}
+  },
+  "$defs": {
+    "finalizedPositionResult": {
+      "type": "object", "additionalProperties": false,
+      "required": ["position_id", "raw_close_pnl_points", "normalized_position_pnl_points", "result", "close_fill_ids", "finalized_at", "reason"],
+      "properties": {
+        "position_id": {"type": "string", "minLength": 1},
+        "raw_close_pnl_points": {"type": "number"},
+        "normalized_position_pnl_points": {"type": "number"},
+        "result": {"enum": ["win", "loss", "flat"]},
+        "close_fill_ids": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "finalized_at": {"type": ["string", "null"], "format": "date-time"},
+        "reason": {"type": "string"}
+      }
+    },
+    "positionAggregator": {
+      "type": "object", "additionalProperties": false,
+      "required": ["position_id", "raw_close_pnl_points", "normalized_close_pnl_points", "close_fill_ids", "remaining_quantity"],
+      "properties": {
+        "position_id": {"type": "string", "minLength": 1},
+        "raw_close_pnl_points": {"type": "number"},
+        "normalized_close_pnl_points": {"type": "number"},
+        "close_fill_ids": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "remaining_quantity": {"type": "integer", "minimum": 0}
+      }
+    },
+    "optionDState": {
+      "type": "object", "additionalProperties": false,
+      "required": ["regime_state", "paused_at_session", "eligible_from_session", "probe_epoch_id", "probe_order_ids", "probe_position_id", "reserved_intent_id", "epoch_sequence"],
+      "properties": {
+        "regime_state": {"enum": ["ACTIVE", "PAUSED_UNTIL_NEXT_SESSION", "PROBE_AVAILABLE", "PROBE_IN_FLIGHT"]},
+        "paused_at_session": {"type": ["string", "null"], "format": "date"},
+        "eligible_from_session": {"type": ["string", "null"], "format": "date"},
+        "probe_epoch_id": {"type": ["string", "null"]},
+        "probe_order_ids": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "probe_position_id": {"type": ["string", "null"]},
+        "reserved_intent_id": {"type": ["string", "null"]},
+        "epoch_sequence": {"type": "integer", "minimum": 0}
+      }
+    },
+    "reservedProbeIntent": {
+      "type": "object", "additionalProperties": false,
+      "required": ["intent_id", "decision_id", "event_id", "target_position", "planned_volume", "filled_volume", "order_ids", "terminal_order_ids", "reported_fill_order_ids", "probe_epoch_id", "intent_snapshot"],
+      "properties": {
+        "intent_id": {"type": "string", "minLength": 1},
+        "decision_id": {"type": "string", "minLength": 1},
+        "event_id": {"type": "string", "minLength": 1},
+        "target_position": {"type": "integer"},
+        "planned_volume": {"type": "integer", "minimum": 1},
+        "filled_volume": {"type": "integer", "minimum": 0},
+        "order_ids": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "terminal_order_ids": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "reported_fill_order_ids": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "probe_epoch_id": {"type": "string", "minLength": 1},
+        "intent_snapshot": {
+          "type": "object", "additionalProperties": false,
+          "required": ["schema_version", "signal", "decision"],
+          "properties": {
+            "schema_version": {"const": "trade-intent-runtime-v1"},
+            "signal": {"type": "object"}, "decision": {"type": "object"},
+            "event": {"type": ["object", "null"]}, "assessment": {"type": ["object", "null"]},
+            "decomposition": {"type": ["object", "null"]}, "multi_level": {"type": ["object", "null"]},
+            "momentum": {"type": ["object", "null"]}
+          }
+        }
+      }
+    }
+  }
+}
